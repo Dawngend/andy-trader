@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from typing import Mapping, Sequence
 
-from andy_trader.baselines import Baseline, default_baselines
+from andy_trader.baselines import Baseline, PredictionContext, Predictor, default_baselines
 from andy_trader.calibration import CalibrationReport, evaluate
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.predict import load_closes
@@ -71,10 +71,15 @@ def _minimum_history(predictor: object) -> int:
     return value
 
 
-def _call(predictor: object, closes: Sequence[float]) -> float:
+def _call(
+    predictor: Predictor,
+    closes: Sequence[float],
+    *,
+    context: PredictionContext,
+) -> float:
     if not callable(predictor):
         raise BacktestError(f"{_name(predictor)} is not callable")
-    probability = float(predictor(closes))
+    probability = float(predictor(closes, context=context))
     if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
         raise BacktestError(f"{_name(predictor)} produced invalid probability {probability!r}")
     return probability
@@ -109,7 +114,7 @@ def run_backtest(
     instrument: str,
     interval: str = "1h",
     horizon: str = "1h",
-    predictors: Sequence[object],
+    predictors: Sequence[Predictor],
     fee_bps: float = 10.0,
     slippage_bps: float = 5.0,
     window: str = "expanding",
@@ -171,7 +176,15 @@ def run_backtest(
             fit = getattr(predictor, "fit", None)
             if callable(fit):
                 fit(train)
-            probability = _call(predictor, visible)
+            probability = _call(
+                predictor,
+                visible,
+                context=PredictionContext(
+                    connection=connection,
+                    instrument=instrument,
+                    at_or_before=history[current_index][0],
+                ),
+            )
             run = runs[_name(predictor)]
             run.probabilities.append(probability)
             run.outcomes.append(outcome)
@@ -267,6 +280,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Evaluate the experimental PyTorch candidate alongside the baselines",
     )
+    parser.add_argument(
+        "--include-signals",
+        action="store_true",
+        help="Evaluate positioning and sentiment predictors alongside the baselines",
+    )
     parser.add_argument("--model-seed", type=int, default=1729)
     parser.add_argument("--json", action="store_true", help="Machine-readable output")
     args = parser.parse_args(argv)
@@ -280,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         environ, "CRYPTO_BACKTEST_SLIPPAGE_BPS", 5.0
     )
     database_path = Path(args.database) if args.database else default_database_path(environ)
-    predictors: tuple[object, ...] = default_baselines()
+    predictors: tuple[Predictor, ...] = default_baselines()
     if args.include_model:
         # CT-05 remains opt-in until its out-of-sample result clears CT-03. The
         # import stays lazy so collectors, storage, scoring, and baseline
@@ -288,6 +306,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from andy_trader.model import TorchPredictor
 
         predictors += (TorchPredictor(seed=args.model_seed),)
+    if args.include_signals:
+        from andy_trader.signal_predictors import default_signal_predictors
+
+        predictors += default_signal_predictors()
 
     with connect(database_path) as connection:
         results = run_backtest(

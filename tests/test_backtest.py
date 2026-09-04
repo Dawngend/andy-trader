@@ -4,7 +4,7 @@ from typing import Sequence
 import pytest
 
 from andy_trader.backtest import BacktestError, run_backtest
-from andy_trader.baselines import Baseline
+from andy_trader.baselines import Baseline, PredictionContext
 from andy_trader.store import Candle, connect, record_observations
 
 
@@ -103,7 +103,16 @@ class _FitRecorder:
     def fit(self, closes: Sequence[float]) -> None:
         self.fit_lengths.append(len(closes))
 
-    def __call__(self, closes: Sequence[float]) -> float:
+    @property
+    def prediction_name(self) -> str:
+        return self.name
+
+    def __call__(
+        self,
+        closes: Sequence[float],
+        *,
+        context: PredictionContext,
+    ) -> float:
         self.predict_lengths.append(len(closes))
         return 0.5
 

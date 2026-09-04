@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import random
-from typing import Callable, Sequence
+import sqlite3
+from typing import Callable, Protocol, Sequence
 
 # Confidence ceiling for the heuristic baselines. A baseline that emits 0.0 or
 # 1.0 is a strawman: Brier punishes certainty so hard that beating it proves
@@ -18,6 +19,33 @@ class BaselineError(ValueError):
 
 
 @dataclass(frozen=True)
+class PredictionContext:
+    """Information knowable when any predictor is asked for a probability."""
+
+    connection: sqlite3.Connection
+    instrument: str
+    at_or_before: str
+    features: dict[str, object] = field(default_factory=dict)
+
+
+class Predictor(Protocol):
+    """Shared contract for price-only and context-aware predictors."""
+
+    name: str
+    minimum_history: int
+
+    @property
+    def prediction_name(self) -> str: ...
+
+    def __call__(
+        self,
+        closes: Sequence[float],
+        *,
+        context: PredictionContext,
+    ) -> float: ...
+
+
+@dataclass(frozen=True)
 class Baseline:
     """A named function from price history to P(next close > current close)."""
 
@@ -25,7 +53,16 @@ class Baseline:
     predict: Callable[[Sequence[float]], float]
     minimum_history: int = 2
 
-    def __call__(self, closes: Sequence[float]) -> float:
+    @property
+    def prediction_name(self) -> str:
+        return f"baseline:{self.name}"
+
+    def __call__(
+        self,
+        closes: Sequence[float],
+        *,
+        context: PredictionContext | None = None,
+    ) -> float:
         if len(closes) < self.minimum_history:
             raise BaselineError(
                 f"{self.name} needs at least {self.minimum_history} closes, got {len(closes)}"

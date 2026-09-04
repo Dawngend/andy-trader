@@ -11,7 +11,12 @@ import sqlite3
 import sys
 from typing import Mapping, Sequence
 
-from andy_trader.baselines import Baseline, BaselineError, default_baselines
+from andy_trader.baselines import (
+    BaselineError,
+    PredictionContext,
+    Predictor,
+    default_baselines,
+)
 from andy_trader.calibration import CalibrationError, evaluate, format_report
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.store import (
@@ -68,11 +73,12 @@ def predict_once(
     instruments: Sequence[str],
     horizons: Sequence[str],
     interval: str = "1h",
-    baselines: Sequence[Baseline] | None = None,
+    baselines: Sequence[Predictor] | None = None,
+    predictors: Sequence[Predictor] | None = None,
     now_iso: str | None = None,
     mode: str = "advisory",
 ) -> dict[str, object]:
-    """Write one prediction per baseline per instrument per horizon.
+    """Write one prediction per configured predictor, instrument, and horizon.
 
     Every call is written before its outcome exists. Nothing here reads a future
     price, and the settlement job is what fills the outcome later.
@@ -86,7 +92,10 @@ def predict_once(
     of each simulated bar rather than calling this function.
     """
 
-    active = tuple(baselines) if baselines is not None else default_baselines()
+    if baselines is not None and predictors is not None:
+        raise ValueError("Pass predictors or the legacy baselines argument, not both")
+    configured = predictors if predictors is not None else baselines
+    active = tuple(configured) if configured is not None else default_baselines()
     now = now_iso or utc_now_iso()
     written = 0
     skipped: list[dict[str, str]] = []
@@ -100,14 +109,19 @@ def predict_once(
         reference_price = closes[-1]
         for horizon in horizons:
             resolves_at = (datetime.fromisoformat(now) + horizon_delta(horizon)).isoformat()
-            for baseline in active:
+            for predictor in active:
+                context = PredictionContext(
+                    connection=connection,
+                    instrument=instrument,
+                    at_or_before=now,
+                )
                 try:
-                    probability = baseline(closes)
+                    probability = predictor(closes, context=context)
                 except BaselineError as exc:
                     skipped.append(
                         {
                             "instrument": instrument,
-                            "baseline": baseline.name,
+                            "baseline": predictor.name,
                             "reason": str(exc),
                         }
                     )
@@ -115,7 +129,7 @@ def predict_once(
                 record_prediction(
                     connection,
                     Prediction(
-                        predictor=f"baseline:{baseline.name}",
+                        predictor=predictor.prediction_name,
                         instrument=instrument,
                         horizon=horizon,
                         probability_up=probability,
@@ -127,6 +141,7 @@ def predict_once(
                             "interval": interval,
                             "history_bars": len(closes),
                             "last_close_at": history[-1][0],
+                            **context.features,
                         },
                     ),
                 )

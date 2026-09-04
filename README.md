@@ -123,8 +123,9 @@ columns filled in. Any other update to that table is a bug.
 | CT-03 dumb baselines | done |
 | CT-04 walk-forward backtest, fees and slippage | done |
 | CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
+| Positioning and sentiment predictors | evaluated, none beat the base rate |
 
-90 tests. `python -m pytest tests/ -q`.
+143 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -158,6 +159,40 @@ for continued evaluation and is not part of the default backtest or live call.
 ```bash
 python -m andy_trader.backtest --instrument BTC-USD --horizon 1h
 python -m andy_trader.backtest --instrument BTC-USD --horizon 1h --include-model
+```
+
+## Signal predictor result
+
+Signal predictors use a rolling percentile over their own instrument and abstain
+outside the outer quartiles. A signal also abstains when it is missing, has fewer
+than 20 historical observations, or is older than its source-specific freshness
+limit. These rules were fixed before running the comparisons.
+
+The existing database produced 112 BTC-USD windows and 103 DOGE-USD windows at
+the 1h horizon. Ten bps fee and five bps slippage were charged on both entry and
+exit.
+
+| Instrument | Signal predictor | Brier skill | Gross return | Net return | Trades |
+| --- | --- | ---: | ---: | ---: | ---: |
+| BTC-USD | fear_greed_contrarian | -0.0231 | +2.08% | -3.00% | 17 |
+| BTC-USD | funding_contrarian | -0.0243 | -4.21% | -15.07% | 40 |
+| BTC-USD | crowd_contrarian | -0.0334 | -5.40% | -25.17% | 78 |
+| BTC-USD | crowd_momentum | -0.0485 | +5.52% | -16.51% | 78 |
+| DOGE-USD | crowd_momentum | -0.0088 | +7.46% | -14.71% | 77 |
+| DOGE-USD | funding_contrarian | -0.0111 | -0.06% | -17.55% | 64 |
+| DOGE-USD | fear_greed_contrarian | -0.0360 | +2.36% | -2.14% | 15 |
+| DOGE-USD | crowd_contrarian | -0.0633 | -7.20% | -26.39% | 77 |
+
+Every signal predictor had negative Brier skill, so none beat the hindsight base
+rate used by the calibration report. None beat the zero-trade coin flip net of
+costs either. DOGE crowd momentum ranked above its walk-forward base-rate
+predictor on Brier skill, but remained below zero skill and lost 14.71% after
+costs. The 77.7% DOGE long ratio is therefore not treated as an edge: against
+DOGE's own history it carries different information than BTC near 53.2%.
+
+```bash
+python -m andy_trader.backtest --instrument BTC-USD --horizon 1h --include-signals
+python -m andy_trader.backtest --instrument DOGE-USD --horizon 1h --include-signals
 ```
 
 ## Honest expectations

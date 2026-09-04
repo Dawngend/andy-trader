@@ -12,6 +12,7 @@ import sqlite3
 import sys
 from typing import Any, Sequence
 
+from andy_trader.baselines import PredictionContext
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.predict import load_closes
 from andy_trader.store import (
@@ -128,6 +129,10 @@ class TorchPredictor:
         return self.lookback + 10
 
     @property
+    def prediction_name(self) -> str:
+        return self.name
+
+    @property
     def temperature(self) -> float:
         return self._temperature
 
@@ -212,7 +217,12 @@ class TorchPredictor:
         self._network = network
         self._temperature = float(torch.exp(log_temperature.detach()).clamp(0.1, 10.0).item())
 
-    def __call__(self, closes: Sequence[float]) -> float:
+    def __call__(
+        self,
+        closes: Sequence[float],
+        *,
+        context: PredictionContext | None = None,
+    ) -> float:
         if self._network is None:
             raise ModelError("TorchPredictor must be fitted before prediction")
         rows = engineer_features(closes, lookback=self.lookback)
