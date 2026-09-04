@@ -1,0 +1,6 @@
+# Runtime has no third-party dependencies. Collectors use urllib and the store
+# uses sqlite3, both from the standard library, which keeps the project runnable
+# anywhere Python 3.11+ is installed.
+
+# Development only.
+pytest>=8.0

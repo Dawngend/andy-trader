@@ -1,0 +1,28 @@
+# Collected market data and the prediction log. Regenerable, and the prediction
+# audit record is personal to a run, so it is not committed.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
