@@ -121,10 +121,39 @@ columns filled in. Any other update to that table is a bug.
 | CT-01 collectors, append-only observations | done |
 | CT-02 prediction log and calibration harness | done |
 | CT-03 dumb baselines | done |
-| CT-04 walk-forward backtest, fees and slippage | next |
-| CT-05 PyTorch predictor | after CT-04, ships only if it beats CT-03 |
+| CT-04 walk-forward backtest, fees and slippage | done |
+| CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
 
-77 tests. `python -m pytest tests/ -q`.
+89 tests. `python -m pytest tests/ -q`.
+
+## Walk-forward result
+
+Run on the existing BTC-USD 1h history with a 100-bar minimum expanding window,
+1h horizon, 10 bps fee and 5 bps slippage on both entry and exit. This produced
+100 genuinely out-of-sample windows. The series uses the same deterministic
+one-row-per-open-time venue selection as live prediction; it does not erase the
+small Bybit USDT/USD basis.
+
+| Predictor | Brier skill | Reliability | Gross return | Net return | Trades | Max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| EMA crossover 12/26 | -0.0051 | 0.0027 | +0.56% | -25.54% | 100 | 25.54% |
+| Base rate | -0.0088 | 0.0005 | +4.52% | -22.59% | 100 | 22.59% |
+| Coin flip | -0.0101 | 0.0025 | 0.00% | 0.00% | 0 | 0.00% |
+| Momentum | -0.0420 | 0.0152 | +1.25% | -25.02% | 100 | 25.02% |
+| **PyTorch MLP, seed 1729** | **-0.0434** | **0.0218** | **-6.79%** | **-31.00%** | **100** | **31.00%** |
+| Random, seed 1729 | -0.4541 | 0.1227 | -4.38% | -29.21% | 100 | 29.21% |
+
+The PyTorch candidate lost honestly. Its 0.0218 reliability term and 0.1367
+expected calibration error show material miscalibration despite chronological
+temperature scaling; its 38% hit rate is not the headline. It trails the best
+calibration baseline (EMA crossover), the base-rate baseline, and the no-trade
+coin flip after costs. It is therefore available only with `--include-model`
+for continued evaluation and is not part of the default backtest or live call.
+
+```bash
+python -m andy_trader.backtest --instrument BTC-USD --horizon 1h
+python -m andy_trader.backtest --instrument BTC-USD --horizon 1h --include-model
+```
 
 ## Honest expectations
 

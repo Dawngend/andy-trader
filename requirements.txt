@@ -4,3 +4,7 @@
 
 # Development only.
 pytest>=8.0
+
+# Optional CT-05 model. Every collector, store, scorer, and baseline backtest
+# remains importable and runnable when PyTorch is not installed.
+torch>=2.0

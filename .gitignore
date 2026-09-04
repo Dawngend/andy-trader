@@ -16,6 +16,9 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+# Windows refuses to unlink pytest's default temp symlink, so runs here use
+# --basetemp=.pytest-tmp instead of the system temp directory.
+.pytest-tmp/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
