@@ -18,9 +18,10 @@ from datetime import UTC, datetime
 import sys
 from typing import Sequence
 
-from andy_trader.collector import FetchSettings, collect
+from andy_trader.collector import FetchSettings, _http_json as _raw_http, collect
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.predict import predict_once
+from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
 
 DEFAULT_INSTRUMENTS = (
@@ -29,6 +30,14 @@ DEFAULT_INSTRUMENTS = (
 )
 DEFAULT_INTERVALS = ("1h", "4h")
 DEFAULT_HORIZONS = ("1h", "4h")
+
+
+def _http_json(url: str) -> object:
+    """Adapter: the signal collector passes only a URL."""
+
+    return _raw_http(url, FetchSettings())
+
+
 # Bybit alone on the schedule, deliberately. It returns full OHLCV for every
 # instrument here, while CoinGecko's free tier starts answering 429 at eight
 # instruments and would contribute two degraded rows every quarter of an hour,
@@ -44,6 +53,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--horizons", help="Comma-separated override")
     parser.add_argument("--venues", help="Comma-separated override")
     parser.add_argument("--quiet", action="store_true", help="Only print on a problem")
+    parser.add_argument(
+        "--skip-signals", action="store_true",
+        help="Prices only. Signals move slowly, so skipping them on a fast cadence is fine.",
+    )
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
@@ -60,12 +73,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             venues=venues,
             settings=FetchSettings(),
         )
+        signals: list = []
+        signal_problems: list = []
+        if not args.skip_signals:
+            # Funding updates 8-hourly and Fear and Greed daily, so most cycles
+            # re-observe unchanged values. That is deliberately cheap: the
+            # content hash collapses repeats onto one row and bumps times_seen,
+            # so the cost is a request rather than a duplicated series.
+            signals, signal_problems = collect_signals(instruments, http=_http_json)
+
         with connect(default_database_path()) as connection:
             inserted, seen = record_observations(connection, candles)
+            if signals:
+                record_signals(connection, signals)
             written = predict_once(
                 connection, instruments=instruments, horizons=horizons, interval=intervals[0]
             )
             settled = settle_due_predictions(connection, interval=intervals[0])
+        problems = problems + signal_problems
     except Exception as exc:  # noqa: BLE001 - the scheduler needs one clear failure signal
         print(f"{stamp} CYCLE FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -76,9 +101,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"settled={settled['settled']}/{settled['due']} degraded={len(problems)}"
         )
     for problem in problems:
+        # Price problems carry venue/interval; signal problems carry signal.
+        # Reading a fixed key set would KeyError exactly when a source fails,
+        # which is the moment the message matters most.
+        what = problem.get("venue") or problem.get("signal") or "?"
+        where = problem.get("interval") or ""
         print(
-            f"  degraded: {problem['venue']} {problem['instrument']} "
-            f"{problem['interval']}: {problem['reason'][:120]}"
+            f"  degraded: {what} {problem.get('instrument', '-')} "
+            f"{where}: {problem['reason'][:120]}".replace("  ", " ")
         )
     return 0
 
