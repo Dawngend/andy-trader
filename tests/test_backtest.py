@@ -67,6 +67,31 @@ def test_fees_and_slippage_are_charged_on_entry_and_exit(tmp_path: Path) -> None
     assert result.trades == 1
 
 
+def test_four_hour_pnl_compounds_only_non_overlapping_trades(tmp_path: Path) -> None:
+    """Five forecasts exist, but one unit of capital can take only two serial trades."""
+
+    closes = [99.0, 100.0, 102.0, 105.0, 108.0, 110.0, 112.0, 115.0, 118.0, 121.0]
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series(closes))
+        result = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            interval="1h",
+            horizon="4h",
+            predictors=(Baseline("long", lambda _closes: 0.6, minimum_history=1),),
+            minimum_train_bars=1,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+        )[0]
+
+    # Entries at indexes 1 and 5 each earn 10%. The three forecasts between
+    # them remain calibration observations but cannot reuse committed capital.
+    assert result.gross_return == pytest.approx(0.21)
+    assert result.net_return == pytest.approx(0.21)
+    assert result.trades == 2
+    assert result.windows == 5
+
+
 class _FitRecorder:
     name = "fit_recorder"
     minimum_history = 1

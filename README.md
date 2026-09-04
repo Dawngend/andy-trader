@@ -124,7 +124,7 @@ columns filled in. Any other update to that table is a bug.
 | CT-04 walk-forward backtest, fees and slippage | done |
 | CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
 
-89 tests. `python -m pytest tests/ -q`.
+90 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -133,6 +133,11 @@ Run on the existing BTC-USD 1h history with a 100-bar minimum expanding window,
 100 genuinely out-of-sample windows. The series uses the same deterministic
 one-row-per-open-time venue selection as live prediction; it does not erase the
 small Bybit USDT/USD basis.
+
+Calibration scores every forecast window. PnL uses one capital unit and only
+compounds non-overlapping positions, so a 4h trade opened from 1h bars must
+settle before that equity can enter another trade. This prevents four adjacent
+4h forecasts from multiplying the same capital four times.
 
 | Predictor | Brier skill | Reliability | Gross return | Net return | Trades | Max drawdown |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

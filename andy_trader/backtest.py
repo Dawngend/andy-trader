@@ -54,6 +54,7 @@ class _Run:
     net_peak: float = 1.0
     max_drawdown: float = 0.0
     trades: int = 0
+    next_available_index: int = 0
 
 
 def _name(predictor: object) -> str:
@@ -121,9 +122,12 @@ def run_backtest(
     the existing argument doubles as the rolling length because the public CT-04
     signature has no separate window-size parameter.
 
-    Returns are compounded from fixed-size long or short positions. A probability
-    of exactly 0.5 is no trade. Fee and slippage are each charged once on entry
-    and once on exit, so net period return is gross less two round trips in bps.
+    Calibration scores every forecast window, including overlapping horizons.
+    Equity uses one fixed-size long or short position at a time: when a trade
+    spans multiple bars, accounting advances by that many bars before deploying
+    the same capital again. A probability of exactly 0.5 is no trade. Fee and
+    slippage are each charged once on entry and once on exit, so net period
+    return is gross less two round trips in bps.
     """
 
     if window not in {"expanding", "rolling"}:
@@ -173,8 +177,13 @@ def run_backtest(
             run.outcomes.append(outcome)
 
             direction = 1 if probability > 0.5 else -1 if probability < 0.5 else 0
-            if direction:
+            # The 4h incident originally compounded every hourly 4h forecast as
+            # though four overlapping positions could each reuse 100% of the
+            # same equity. Keep those forecasts for calibration, but execute
+            # only the serial trade schedule that one unit of capital can fund.
+            if direction and current_index >= run.next_available_index:
                 run.trades += 1
+                run.next_available_index = current_index + step
                 asset_return = (settle_price - reference_price) / reference_price
                 gross_period = direction * asset_return
                 net_period = gross_period - cost
