@@ -29,7 +29,16 @@ DEFAULT_INTERVALS = ("1h", "4h")
 # in a feature layer and not in this table.
 _COINBASE_GRANULARITY = {"1h": 3600, "1d": 86400}
 _KRAKEN_INTERVAL_MINUTES = {"1h": 60, "4h": 240, "1d": 1440}
-_KRAKEN_PAIRS = {"BTC-USD": "XBTUSD", "ETH-USD": "ETHUSD"}
+_KRAKEN_PAIRS = {
+    "BTC-USD": "XBTUSD",
+    "ETH-USD": "ETHUSD",
+    "SOL-USD": "SOLUSD",
+    "XRP-USD": "XRPUSD",
+    "DOGE-USD": "XDGUSD",
+    "ADA-USD": "ADAUSD",
+    "AVAX-USD": "AVAXUSD",
+    "LINK-USD": "LINKUSD",
+}
 
 # Exchange domains are INTERMITTENTLY blocked on Dawn's PLDT connection. On
 # 2026-09-04 api.kraken.com and api.bybit.com resolved to 10.158.4.12, a
@@ -41,7 +50,24 @@ _KRAKEN_PAIRS = {"BTC-USD": "XBTUSD", "ETH-USD": "ETHUSD"}
 # exception: over a long collection window some passes will simply lose DNS,
 # and the record has to show that honestly rather than silently thinning out.
 # CoinGecko has never been blocked in testing and is the reliable fallback.
-_COINGECKO_IDS = {"BTC-USD": "bitcoin", "ETH-USD": "ethereum"}
+_COINGECKO_IDS = {
+    "BTC-USD": "bitcoin",
+    "ETH-USD": "ethereum",
+    # Higher-volatility instruments, added 2026-09-04, for a real mechanism
+    # rather than a hunch: trading costs are proportional to position size in
+    # basis points, while the move being captured is not. A 30 bps round trip is
+    # trivial against a 3% hourly move and impossible against a 0.3% one, which
+    # is exactly how BTC hourly turned +4.52% gross into -22.59% net. Whether
+    # that advantage survives the wider spreads and worse fills on thinner books
+    # is the open question these instruments exist to answer. The calibration
+    # harness settles it; do not assume either way in the meantime.
+    "SOL-USD": "solana",
+    "XRP-USD": "ripple",
+    "DOGE-USD": "dogecoin",
+    "ADA-USD": "cardano",
+    "AVAX-USD": "avalanche-2",
+    "LINK-USD": "chainlink",
+}
 # market_chart returns hourly points for a 2 to 90 day window, which is the only
 # CoinGecko endpoint that yields a clean 1h series. Its /ohlc endpoint picks
 # granularity for you and cannot be pinned to an hour.
@@ -50,7 +76,16 @@ _COINGECKO_DAYS = {"1h": 7, "1d": 90}
 # Bybit v5 spot klines. Keyless, and the only venue here that returns a full
 # OHLCV bar at both 1h and 4h, which is why it leads the default order.
 _BYBIT_INTERVALS = {"1h": "60", "4h": "240", "1d": "D"}
-_BYBIT_SYMBOLS = {"BTC-USD": "BTCUSDT", "ETH-USD": "ETHUSDT"}
+_BYBIT_SYMBOLS = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+    "SOL-USD": "SOLUSDT",
+    "XRP-USD": "XRPUSDT",
+    "DOGE-USD": "DOGEUSDT",
+    "ADA-USD": "ADAUSDT",
+    "AVAX-USD": "AVAXUSDT",
+    "LINK-USD": "LINKUSDT",
+}
 
 
 class CollectorError(RuntimeError):
