@@ -64,7 +64,7 @@ def test_kraken_raises_on_an_api_error_rather_than_returning_empty() -> None:
 
 
 def test_kraken_returns_nothing_for_an_unknown_instrument() -> None:
-    assert fetch_kraken("DOGE-USD", "1h", SETTINGS, http=_http({})) == []
+    assert fetch_kraken("NOTACOIN-USD", "1h", SETTINGS, http=_http({})) == []
 
 
 def test_coingecko_pairs_prices_with_volumes_and_leaves_ohl_null() -> None:
@@ -89,7 +89,7 @@ def test_coingecko_tolerates_a_missing_volume_point() -> None:
 
 
 def test_coingecko_returns_nothing_for_an_unmapped_instrument() -> None:
-    assert fetch_coingecko("SOL-USD", "1h", SETTINGS, http=_http({})) == []
+    assert fetch_coingecko("NOTACOIN-USD", "1h", SETTINGS, http=_http({})) == []
 
 
 def test_bybit_parses_a_full_ohlcv_bar_from_string_fields() -> None:
@@ -128,7 +128,7 @@ def test_bybit_raises_on_a_non_zero_return_code() -> None:
 
 
 def test_bybit_returns_nothing_for_an_unmapped_instrument() -> None:
-    assert fetch_bybit("SOL-USD", "1h", SETTINGS, http=_http({})) == []
+    assert fetch_bybit("NOTACOIN-USD", "1h", SETTINGS, http=_http({})) == []
 
 
 def test_collect_records_a_source_failure_as_a_degraded_row() -> None:
