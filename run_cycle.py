@@ -26,6 +26,7 @@ from andy_trader.portfolio import paper_trade_once
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, predict_once
 from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
+from andy_trader.training import predict_with_promoted_model, run_retrain_window, should_retrain
 
 DEFAULT_INSTRUMENTS = (
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
@@ -76,6 +77,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "paper-trades unless explicitly listed here or in CRYPTO_PAPER_TRADE_PAIRS."
         ),
     )
+    parser.add_argument(
+        "--retrain-instruments",
+        help=(
+            "Comma-separated instruments to check/run CT-07 retraining for this cycle, e.g. "
+            "'BTC-USD,ETH-USD'. Opt-in only -- retraining spends real compute, so nothing "
+            "retrains unless explicitly listed here or in CRYPTO_RETRAIN_INSTRUMENTS. Unlike "
+            "retraining, checking whether a promoted model exists and logging its live call is "
+            "always on for every scheduled instrument -- that's the actual release mechanism: "
+            "a model starts being scored the moment it earns promotion, with no flag to flip."
+        ),
+    )
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
@@ -98,6 +110,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         predictor_name, _, instrument_name = chunk.partition("=")
         paper_trade_pairs.append((predictor_name.strip(), instrument_name.strip()))
+
+    retrain_spec = args.retrain_instruments or os.environ.get("CRYPTO_RETRAIN_INSTRUMENTS", "")
+    retrain_instruments = tuple(i.strip() for i in retrain_spec.split(",") if i.strip())
 
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     _journal(
@@ -173,6 +188,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             settled = settle_due_predictions(connection, interval=reference_interval)
 
+            # Opt-in, since retraining spends real compute: only the
+            # instruments explicitly configured get a new training pass
+            # attempted, and only when should_retrain() says enough fresh
+            # settled history has accumulated since the last attempt.
+            retrain_results: list[dict[str, object]] = []
+            for instrument in retrain_instruments:
+                if not should_retrain(connection, instrument=instrument, horizon=reference_interval, interval=reference_interval):
+                    continue
+                try:
+                    entry = run_retrain_window(connection, instrument=instrument, interval=reference_interval, horizon=reference_interval)
+                    retrain_results.append(
+                        {
+                            "instrument": instrument,
+                            "model_id": entry.model_id,
+                            "promoted": entry.promoted,
+                            "holdout_brier_skill": entry.holdout_brier_skill,
+                            "base_rate_brier_skill": entry.base_rate_brier_skill,
+                            "reason": entry.promotion_reason,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 - one bad retrain must not kill the cycle
+                    retrain_results.append({"instrument": instrument, "error": str(exc)})
+            if retrain_results:
+                _journal("retrain_completed", attempts=retrain_results)
+
+            # Always on, for every scheduled instrument, regardless of the
+            # retrain opt-in above: this is the actual release mechanism. A
+            # model starts being scored under the stable "model:promoted"
+            # name the moment it clears the gate, with no flag to flip and
+            # no human needing to notice. Cheap when nothing is promoted --
+            # one registry lookup that returns immediately.
+            live_model_results: list[dict[str, object]] = []
+            for instrument in instruments:
+                result = predict_with_promoted_model(connection, instrument=instrument, interval=reference_interval, horizon=reference_interval)
+                if result.get("predicted"):
+                    live_model_results.append({"instrument": instrument, **result})
+            if live_model_results:
+                _journal("live_model_predictions", attempts=live_model_results)
+
             # Opt-in only: nothing paper-trades unless a pair was explicitly
             # configured. A prediction/price freshness check happens inside
             # paper_trade_once itself, same rule the manual CLI uses -- one
@@ -232,6 +286,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"  degraded: {what} {problem.get('instrument', '-')} "
             f"{where}: {problem['reason'][:120]}".replace("  ", " ")
+        )
+    for attempt in retrain_results:
+        if "error" in attempt:
+            print(f"  retrain: {attempt['instrument']} FAILED: {attempt['error']}")
+        else:
+            verdict = "PROMOTED" if attempt["promoted"] else "rejected"
+            print(
+                f"  retrain: {attempt['instrument']} {attempt['model_id']} {verdict} "
+                f"(skill={attempt['holdout_brier_skill']:+.4f} vs base={attempt['base_rate_brier_skill']:+.4f})"
+            )
+    for attempt in live_model_results:
+        print(
+            f"  model:promoted {attempt['instrument']} -> p(up)={attempt['probability_up']:.4f} "
+            f"(model {attempt['model_id']})"
         )
     for attempt in paper_trade_results:
         label = f"{attempt['predictor']} {attempt['instrument']}"

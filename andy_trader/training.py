@@ -39,7 +39,16 @@ from andy_trader.registry import (
     initialize_registry,
     record_registry_entry,
 )
-from andy_trader.store import connect, default_database_path, utc_now_iso
+from andy_trader.store import (
+    Prediction,
+    connect,
+    default_database_path,
+    horizon_delta,
+    record_prediction,
+    utc_now_iso,
+)
+
+LIVE_MODEL_PREDICTOR_NAME = "model:promoted"
 
 DEFAULT_SEED = 1729
 DEFAULT_LOOKBACK = 24
@@ -438,6 +447,75 @@ def load_promoted_model(
     if not weights_file.exists():
         return None
     return MultimodalTorchPredictor.load(weights_file)
+
+
+def predict_with_promoted_model(
+    connection: sqlite3.Connection,
+    *,
+    instrument: str,
+    interval: str = "1h",
+    horizon: str = "1h",
+    now_iso: str | None = None,
+    history_limit: int = 200,
+) -> dict[str, object]:
+    """The actual release mechanism: log a live call from whatever model currently
+    holds the promotion, under one stable name, every time this is called.
+
+    This is what makes promotion self-releasing rather than something a human
+    has to notice and wire up by hand. `LIVE_MODEL_PREDICTOR_NAME` ("model:promoted")
+    never changes even though the underlying model_id does every time a newer
+    candidate replaces an older one -- a `--paper-trade "model:promoted=BTC-USD"`
+    configuration keeps working forever, automatically following whichever
+    model currently holds the title, with the specific model_id it came from
+    recorded in the prediction's own features for traceability.
+
+    Returns a dict describing what happened; never raises. A cycle that calls
+    this for every scheduled instrument gets a real answer either way: nothing
+    promoted yet, not enough live history to predict from, or a logged call.
+    """
+
+    entry = fetch_latest_promoted_model(connection, instrument, horizon, interval=interval)
+    if entry is None or not entry.weights_path:
+        return {"predicted": False, "reason": "no promoted model for this pair yet"}
+
+    weights_file = Path(entry.weights_path)
+    if not weights_file.exists():
+        return {"predicted": False, "reason": f"promoted model weights missing: {weights_file}"}
+
+    predictor = MultimodalTorchPredictor.load(weights_file)
+    closes = load_closes(connection, instrument, interval=interval, limit=history_limit)
+    if len(closes) <= predictor.lookback:
+        return {
+            "predicted": False,
+            "reason": f"need more than {predictor.lookback} closes, have {len(closes)}",
+        }
+
+    now = datetime.fromisoformat(now_iso) if now_iso else datetime.now(UTC)
+    now_iso = now.isoformat()
+    signals = load_signals_for_series(connection, instrument=instrument, until_iso=now_iso)
+
+    try:
+        probability_up = predictor.predict_one(closes, signals)
+    except ModelError as exc:
+        return {"predicted": False, "reason": str(exc)}
+
+    reference_price = closes[-1][1]
+    resolves_at = (now + horizon_delta(horizon)).isoformat()
+    record_prediction(
+        connection,
+        Prediction(
+            predictor=LIVE_MODEL_PREDICTOR_NAME,
+            instrument=instrument,
+            horizon=horizon,
+            probability_up=probability_up,
+            reference_price=reference_price,
+            created_at=now_iso,
+            resolves_at=resolves_at,
+            mode="advisory",
+            features={"underlying_model_id": entry.model_id, "interval": interval},
+        ),
+    )
+    return {"predicted": True, "model_id": entry.model_id, "probability_up": probability_up}
 
 
 def run_walk_forward_retraining(

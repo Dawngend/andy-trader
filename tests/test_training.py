@@ -27,9 +27,11 @@ from andy_trader.signals import (
 )
 from andy_trader.store import Candle, connect, record_observations
 from andy_trader.training import (
+    LIVE_MODEL_PREDICTOR_NAME,
     MODELS_DIR,
     MultimodalTorchPredictor,
     load_promoted_model,
+    predict_with_promoted_model,
     run_retrain_window,
     run_walk_forward_retraining,
     should_retrain,
@@ -213,7 +215,11 @@ def test_should_retrain_schedule_evaluation(tmp_path: Path) -> None:
         assert should_retrain(conn, instrument="BTC-USD", min_new_settled_bars=24) is True
 
 
-def test_run_retrain_window_end_to_end(tmp_path: Path) -> None:
+def test_run_retrain_window_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    # This scenario can genuinely get promoted (it's the exact one that first
+    # promoted for real against live data). Must never write into the real
+    # models/ directory just because a test run happened to succeed.
+    monkeypatch.setattr("andy_trader.training.MODELS_DIR", tmp_path / "models")
     db_file = tmp_path / "train.db"
     candles = _synthetic_candles(100)
     signals = _synthetic_signals(candles)
@@ -244,7 +250,8 @@ def test_run_retrain_window_end_to_end(tmp_path: Path) -> None:
         assert rows[0].model_id == entry.model_id
 
 
-def test_walk_forward_retraining_rolls_across_history(tmp_path: Path) -> None:
+def test_walk_forward_retraining_rolls_across_history(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("andy_trader.training.MODELS_DIR", tmp_path / "models")
     db_file = tmp_path / "wf.db"
     candles = _synthetic_candles(120)
     signals = _synthetic_signals(candles)
@@ -360,3 +367,94 @@ def test_load_promoted_model_returns_none_when_weights_file_is_missing(tmp_path:
         record_registry_entry(conn, entry)
 
         assert load_promoted_model(conn, instrument="BTC-USD") is None
+
+
+def _force_promote(monkeypatch) -> None:
+    """Force the gate to promote, so the live-inference path is tested against
+    a real saved model rather than depending on whether this particular
+    random-walk run happens to beat the base rate."""
+    from andy_trader.promotion import PromotionDecision
+
+    monkeypatch.setattr(
+        "andy_trader.training.evaluate_promotion_gate",
+        lambda **kwargs: PromotionDecision(
+            promoted=True, candidate_skill=0.01, base_rate_skill=0.0,
+            candidate_brier=0.2, base_rate_brier=0.25, holdout_bars=24,
+            reason="forced for test",
+        ),
+    )
+
+
+def test_predict_with_promoted_model_logs_a_live_call(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("andy_trader.training.MODELS_DIR", tmp_path / "models")
+    _force_promote(monkeypatch)
+
+    db_file = tmp_path / "live.db"
+    candles = _synthetic_candles(100)
+    signals = _synthetic_signals(candles)
+
+    with connect(db_file) as conn:
+        record_observations(conn, candles)
+        record_signals(conn, signals)
+
+        entry = run_retrain_window(
+            conn, instrument="BTC-USD", train_bars=50, holdout_bars=24, lookback=12, epochs=5, seed=7,
+        )
+        assert entry.promoted  # the forced gate guarantees this
+
+        result = predict_with_promoted_model(
+            conn, instrument="BTC-USD", now_iso=candles[-1].open_time,
+        )
+
+        assert result["predicted"] is True
+        assert result["model_id"] == entry.model_id
+        assert 0.0 <= result["probability_up"] <= 1.0
+
+        row = conn.execute(
+            "SELECT predictor, instrument, probability_up, features_json FROM crypto_predictions "
+            "WHERE predictor = ? ORDER BY created_at DESC LIMIT 1",
+            (LIVE_MODEL_PREDICTOR_NAME,),
+        ).fetchone()
+        assert row is not None
+        assert row["instrument"] == "BTC-USD"
+        features = json.loads(row["features_json"])
+        assert features["underlying_model_id"] == entry.model_id
+
+
+def test_predict_with_promoted_model_is_a_stable_name_across_retrains(tmp_path: Path, monkeypatch) -> None:
+    """The whole point of the stable predictor name: a caller that always asks
+    for LIVE_MODEL_PREDICTOR_NAME keeps working across retrains without ever
+    needing to know the current model_id."""
+    monkeypatch.setattr("andy_trader.training.MODELS_DIR", tmp_path / "models")
+    _force_promote(monkeypatch)
+
+    db_file = tmp_path / "rolling.db"
+    candles = _synthetic_candles(150)
+    signals = _synthetic_signals(candles)
+
+    with connect(db_file) as conn:
+        record_observations(conn, candles)
+        record_signals(conn, signals)
+
+        first = run_retrain_window(
+            conn, instrument="BTC-USD", train_bars=50, holdout_bars=24, lookback=12, epochs=5, seed=1,
+        )
+        second = run_retrain_window(
+            conn, instrument="BTC-USD", train_bars=50, holdout_bars=24, lookback=12, epochs=5, seed=2,
+            end_of_holdout_iso=candles[-1].open_time,
+        )
+        assert first.model_id != second.model_id  # each retrain gets a fresh id
+
+        result = predict_with_promoted_model(conn, instrument="BTC-USD", now_iso=candles[-1].open_time)
+
+        # The later, most-recently-promoted model is the one that actually served the call.
+        assert result["model_id"] == second.model_id
+
+
+def test_predict_with_promoted_model_returns_false_when_nothing_promoted(tmp_path: Path) -> None:
+    db_file = tmp_path / "none.db"
+    candles = _synthetic_candles(30)
+    with connect(db_file) as conn:
+        record_observations(conn, candles)
+        result = predict_with_promoted_model(conn, instrument="BTC-USD", now_iso=candles[-1].open_time)
+    assert result == {"predicted": False, "reason": "no promoted model for this pair yet"}

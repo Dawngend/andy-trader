@@ -1,11 +1,21 @@
 """Tests for the unattended cycle's fallback and diagnostic journal."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
 
 from andy_trader.store import Candle
 import run_cycle
+
+
+@dataclass(frozen=True)
+class _FakeRegistryEntry:
+    model_id: str
+    promoted: bool
+    holdout_brier_skill: float
+    base_rate_brier_skill: float
+    promotion_reason: str
 
 
 def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
@@ -121,3 +131,113 @@ def test_paper_trade_malformed_entry_is_ignored_not_fatal(monkeypatch, tmp_path:
     assert "Ignoring malformed" in capsys.readouterr().err
     entries = [json.loads(line) for line in journal.read_text().splitlines()]
     assert not any(entry["event"] == "paper_trade_completed" for entry in entries)
+
+
+def _base_env(monkeypatch, tmp_path: Path) -> Path:
+    journal = tmp_path / "cycle.jsonl"
+    monkeypatch.setattr(run_cycle, "collect", _fake_price_collect)
+    monkeypatch.setattr(run_cycle, "CYCLE_LOG_PATH", journal)
+    monkeypatch.setattr(run_cycle, "default_database_path", lambda: tmp_path / "c.db")
+    monkeypatch.setattr(run_cycle, "load_env_file", lambda _path: None)
+    monkeypatch.delenv("CRYPTO_MAX_DATA_AGE_MINUTES", raising=False)
+    monkeypatch.delenv("CRYPTO_PAPER_TRADE_PAIRS", raising=False)
+    monkeypatch.delenv("CRYPTO_RETRAIN_INSTRUMENTS", raising=False)
+    return journal
+
+
+def test_retraining_is_opt_in_and_only_runs_for_configured_instruments(monkeypatch, tmp_path: Path) -> None:
+    journal = _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_cycle, "should_retrain", lambda *a, **k: True)
+    monkeypatch.setattr(
+        run_cycle, "run_retrain_window",
+        lambda conn, *, instrument, **k: _FakeRegistryEntry(
+            model_id=f"fake_{instrument}", promoted=True,
+            holdout_brier_skill=0.02, base_rate_brier_skill=0.0, promotion_reason="test",
+        ),
+    )
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD,ETH-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet", "--retrain-instruments", "BTC-USD"]
+    )
+
+    assert result == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    retrain_event = next(entry for entry in entries if entry["event"] == "retrain_completed")
+    # Only BTC-USD was configured to retrain, even though ETH-USD is also scheduled.
+    assert [a["instrument"] for a in retrain_event["attempts"]] == ["BTC-USD"]
+    assert retrain_event["attempts"][0]["promoted"] is True
+
+
+def test_retraining_skipped_when_not_due_produces_no_journal_entry(monkeypatch, tmp_path: Path) -> None:
+    journal = _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_cycle, "should_retrain", lambda *a, **k: False)
+    monkeypatch.setattr(run_cycle, "run_retrain_window", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not be called")))
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet", "--retrain-instruments", "BTC-USD"]
+    )
+
+    assert result == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert not any(entry["event"] == "retrain_completed" for entry in entries)
+
+
+def test_a_failed_retrain_does_not_crash_the_cycle(monkeypatch, tmp_path: Path) -> None:
+    journal = _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(run_cycle, "should_retrain", lambda *a, **k: True)
+
+    def _boom(*a, **k):
+        raise RuntimeError("not enough history")
+
+    monkeypatch.setattr(run_cycle, "run_retrain_window", _boom)
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet", "--retrain-instruments", "BTC-USD"]
+    )
+
+    assert result == 0  # one bad retrain must never take down the whole cycle
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    retrain_event = next(entry for entry in entries if entry["event"] == "retrain_completed")
+    assert retrain_event["attempts"][0]["error"] == "not enough history"
+    # The rest of the cycle still completed normally.
+    assert any(entry["event"] == "cycle_completed" for entry in entries)
+
+
+def test_live_model_scoring_runs_for_every_instrument_with_no_opt_in_needed(monkeypatch, tmp_path: Path) -> None:
+    """The actual release mechanism: unlike retraining, this must run for every
+    scheduled instrument with zero configuration -- that's what makes a
+    promotion self-releasing instead of something a human has to wire up."""
+    journal = _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        run_cycle, "predict_with_promoted_model",
+        lambda conn, *, instrument, **k: {"predicted": True, "model_id": f"m_{instrument}", "probability_up": 0.6},
+    )
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD,ETH-USD,SOL-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet"]  # deliberately no --retrain-instruments at all
+    )
+
+    assert result == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    live_event = next(entry for entry in entries if entry["event"] == "live_model_predictions")
+    assert {a["instrument"] for a in live_event["attempts"]} == {"BTC-USD", "ETH-USD", "SOL-USD"}
+
+
+def test_live_model_scoring_produces_no_journal_noise_when_nothing_promoted(monkeypatch, tmp_path: Path) -> None:
+    journal = _base_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        run_cycle, "predict_with_promoted_model",
+        lambda conn, *, instrument, **k: {"predicted": False, "reason": "no promoted model for this pair yet"},
+    )
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h", "--skip-signals", "--quiet"]
+    )
+
+    assert result == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert not any(entry["event"] == "live_model_predictions" for entry in entries)
