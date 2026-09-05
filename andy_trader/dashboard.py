@@ -171,6 +171,24 @@ def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
+def _portfolio_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
+    """Aggregate P&L across every coin, if andy_trader.portfolio.portfolio_summary exists yet.
+
+    Deliberately tolerant of it not existing: this dashboard should never go
+    down just because a dependent module hasn't landed yet.
+    """
+
+    try:
+        from andy_trader.portfolio import portfolio_summary
+    except ImportError:
+        return None
+    try:
+        summary = portfolio_summary(connection)
+    except Exception:  # noqa: BLE001 - a summary glitch must never take the whole page down
+        return None
+    return summary.__dict__ if hasattr(summary, "__dict__") else dict(summary)
+
+
 def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
     """One summary row per (predictor, instrument) pair that has ever paper-traded."""
 
@@ -280,6 +298,7 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
         "score_exclusions": score_exclusions,
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
+        "portfolio_summary": _portfolio_summary(connection),
     }
 
 
@@ -315,12 +334,18 @@ _PAGE = """<!doctype html>
   .bigchart-svg-wrap { position:relative; }
   .bigchart-svg-wrap svg { width:100%; height:auto; display:block; }
   .bigchart-empty { color:#5c7080; font-size:12px; padding:40px 0; text-align:center; }
+  .summary-strip { display:flex; gap:24px; flex-wrap:wrap; background:#11161d; border:1px solid #1e2833; border-radius:8px; padding:16px 20px; margin-bottom:20px; }
+  .summary-item { display:flex; flex-direction:column; gap:2px; }
+  .summary-label { font-size:11px; color:#8fa3b0; text-transform:uppercase; letter-spacing:.05em; }
+  .summary-value { font-size:22px; font-weight:700; }
+  .summary-sub { font-size:12px; color:#8fa3b0; }
 </style>
 </head>
 <body>
   <h1>Andy Trader &mdash; Live Monitor <span class="badge">PAPER &middot; SIMULATED CAPITAL &middot; REAL MARKET</span></h1>
   <div class="sub">Real prices, real predictions, real settlement, simulated cash and positions only &mdash; nothing here ever touches a real exchange account.</div>
   <div id="err"></div>
+  <div id="summary"></div>
   <div id="bigcharts"></div>
   <div class="grid">
     <div class="card" style="grid-column:1/-1;">
@@ -505,6 +530,57 @@ function bigChartCard(title, values, opts) {
   return card;
 }
 
+function summaryItem(label, valueText, valueColor, subText) {
+  const item = document.createElement("div");
+  item.className = "summary-item";
+  const lab = document.createElement("div");
+  lab.className = "summary-label"; lab.textContent = label;
+  const val = document.createElement("div");
+  val.className = "summary-value"; val.textContent = valueText;
+  if (valueColor) val.style.color = valueColor;
+  item.appendChild(lab); item.appendChild(val);
+  if (subText) {
+    const sub = document.createElement("div");
+    sub.className = "summary-sub"; sub.textContent = subText;
+    item.appendChild(sub);
+  }
+  return item;
+}
+
+function renderSummary(summary) {
+  const container = document.getElementById("summary");
+  container.innerHTML = "";
+  if (!summary || summary.total_starting_cash === 0) {
+    return;  // nothing paper-traded yet -- the per-coin section already explains that
+  }
+  const strip = document.createElement("div");
+  strip.className = "summary-strip";
+  const upColor = "#4ade80", downColor = "#f87171";
+  const pnlColor = summary.total_return_pct >= 0 ? upColor : downColor;
+
+  strip.appendChild(summaryItem(
+    "Total Equity (all coins)",
+    "$" + summary.total_equity.toFixed(2),
+    pnlColor,
+    "started at $" + summary.total_starting_cash.toFixed(2)
+  ));
+  strip.appendChild(summaryItem(
+    "Total Return",
+    (summary.total_return_pct >= 0 ? "+" : "") + summary.total_return_pct.toFixed(2) + "%",
+    pnlColor,
+    (summary.total_equity - summary.total_starting_cash >= 0 ? "+$" : "-$") +
+      Math.abs(summary.total_equity - summary.total_starting_cash).toFixed(2)
+  ));
+  strip.appendChild(summaryItem("Winners / Losers", summary.winners + " / " + summary.losers, null, summary.total_trade_count + " trades total"));
+  if (summary.best) {
+    strip.appendChild(summaryItem("Best Coin", summary.best[1], upColor, summary.best[0] + " · " + (summary.best[2] >= 0 ? "+" : "") + summary.best[2].toFixed(2) + "%"));
+  }
+  if (summary.worst) {
+    strip.appendChild(summaryItem("Worst Coin", summary.worst[1], downColor, summary.worst[0] + " · " + (summary.worst[2] >= 0 ? "+" : "") + summary.worst[2].toFixed(2) + "%"));
+  }
+  container.appendChild(strip);
+}
+
 function renderBigCharts(portfolios) {
   const container = document.getElementById("bigcharts");
   container.innerHTML = "";
@@ -542,6 +618,7 @@ async function refresh() {
     const s = await res.json();
     document.getElementById("err").style.display = "none";
 
+    renderSummary(s.portfolio_summary);
     renderBigCharts(s.portfolios);
 
     const pfBody = document.querySelector("#portfolios tbody");
