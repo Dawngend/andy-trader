@@ -9,6 +9,7 @@ import pytest
 from andy_trader.portfolio import (
     DEFAULT_FLAT_THRESHOLD,
     DEFAULT_LONG_THRESHOLD,
+    DEFAULT_SHORT_THRESHOLD,
     PortfolioError,
     decide_side,
     execute_paper_trade,
@@ -35,7 +36,13 @@ def test_decide_side_enters_long_only_above_long_threshold() -> None:
     assert decide_side(0.9, current_side="flat") == "long"
     assert decide_side(DEFAULT_LONG_THRESHOLD, current_side="flat") == "long"
     assert decide_side(DEFAULT_LONG_THRESHOLD - 0.001, current_side="flat") == "flat"
-    assert decide_side(0.1, current_side="flat") == "flat"
+
+
+def test_decide_side_enters_short_only_below_short_threshold_symmetric_to_long() -> None:
+    assert decide_side(0.1, current_side="flat") == "short"
+    assert decide_side(DEFAULT_SHORT_THRESHOLD, current_side="flat") == "short"
+    assert decide_side(DEFAULT_SHORT_THRESHOLD + 0.001, current_side="flat") == "flat"
+    assert DEFAULT_SHORT_THRESHOLD == pytest.approx(1.0 - DEFAULT_LONG_THRESHOLD)
 
 
 def test_decide_side_hysteresis_holds_long_between_the_two_thresholds() -> None:
@@ -47,6 +54,20 @@ def test_decide_side_hysteresis_holds_long_between_the_two_thresholds() -> None:
     assert decide_side(midpoint, current_side="flat") == "flat"
     assert decide_side(DEFAULT_FLAT_THRESHOLD, current_side="long") == "flat"
     assert decide_side(DEFAULT_FLAT_THRESHOLD + 0.001, current_side="long") == "long"
+
+
+def test_decide_side_hysteresis_holds_short_symmetric_to_long() -> None:
+    midpoint = (DEFAULT_SHORT_THRESHOLD + DEFAULT_FLAT_THRESHOLD) / 2
+    assert decide_side(midpoint, current_side="short") == "short"
+    assert decide_side(midpoint, current_side="flat") == "flat"
+    assert decide_side(DEFAULT_FLAT_THRESHOLD, current_side="short") == "flat"
+    assert decide_side(DEFAULT_FLAT_THRESHOLD - 0.001, current_side="short") == "short"
+
+
+def test_decide_side_never_jumps_directly_between_long_and_short() -> None:
+    """Every direction change must pass through flat first, one trade per cycle."""
+    assert decide_side(0.01, current_side="long") == "flat"  # not "short", even though 0.01 says short
+    assert decide_side(0.99, current_side="short") == "flat"  # not "long"
 
 
 def test_decide_side_rejects_out_of_range_probability() -> None:
@@ -133,6 +154,91 @@ def test_round_trip_conserves_value_minus_costs_only() -> None:
     assert state.cash == pytest.approx(expected_cash, rel=1e-9)
     assert state.cash < starting_cash  # a round trip at an unchanged price must never profit
     assert state.position_qty == 0.0
+
+
+def test_opening_short_credits_cash_and_records_a_negative_position() -> None:
+    connection = _conn()
+    trade = execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="short",
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00", reason="open short",
+        fee_bps=10.0, slippage_bps=5.0, starting_cash=10_000.0,
+    )
+    assert trade is not None
+    assert trade.side == "short"
+    # Same 15bps cost rate and same "deploy all cash" sizing as opening long,
+    # just mirrored: proceeds = 10000 * (1 - 0.0015) = 9985.0, and cash rises
+    # by that (simulated bookkeeping for the borrow, not spendable mid-position).
+    assert trade.qty == pytest.approx(10_000.0 / 100.0)
+    assert trade.cash_after == pytest.approx(9985.0 + 10_000.0)
+
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso="2026-09-05T00:00:00+00:00")
+    assert state.position_qty < 0.0
+    assert state.position_qty == pytest.approx(-trade.qty)
+
+
+def test_short_profits_when_price_falls_and_loses_when_price_rises() -> None:
+    """The whole point of shorting: P&L is the mirror image of going long."""
+    starting_cash = 10_000.0
+
+    def _round_trip(entry_price: float, exit_price: float) -> float:
+        connection = _conn()
+        execute_paper_trade(
+            connection, predictor="p", instrument="BTC-USD", target_side="short",
+            price=entry_price, now_iso="2026-09-05T00:00:00+00:00", reason="open",
+            starting_cash=starting_cash,
+        )
+        execute_paper_trade(
+            connection, predictor="p", instrument="BTC-USD", target_side="flat",
+            price=exit_price, now_iso="2026-09-05T01:00:00+00:00", reason="cover",
+            starting_cash=starting_cash,
+        )
+        state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso="2026-09-05T01:00:00+00:00")
+        return state.cash
+
+    price_fell = _round_trip(entry_price=100.0, exit_price=80.0)
+    price_rose = _round_trip(entry_price=100.0, exit_price=120.0)
+    unchanged = _round_trip(entry_price=100.0, exit_price=100.0)
+
+    assert price_fell > unchanged > price_rose  # short profits on the fall, loses on the rise
+    assert price_fell > starting_cash  # a real profit, not just "loses less"
+    assert price_rose < starting_cash
+
+
+def test_covering_a_short_costs_more_than_the_raw_notional_never_less() -> None:
+    """The sign that would be easy to get backwards: fees must always cost the
+    short money on both legs, never manufacture free money on the exit leg."""
+    connection = _conn()
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="short",
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00", reason="open",
+    )
+    cover_trade = execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="flat",
+        price=100.0, now_iso="2026-09-05T01:00:00+00:00", reason="cover",
+    )
+    assert cover_trade is not None
+    raw_notional = cover_trade.qty * 100.0
+    assert cover_trade.fee_cost > 0.0
+    assert cover_trade.slippage_cost > 0.0
+    # cash_after must reflect paying MORE than raw notional to buy back, not less.
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso="2026-09-05T01:00:00+00:00")
+    # After opening: cash = original 10000 + proceeds (10000 * (1 - 0.0015)) = 19985.
+    cash_after_open = 10_000.0 + 10_000.0 * (1 - 0.0015)
+    actual_outlay = cash_after_open - state.cash
+    assert actual_outlay > raw_notional
+
+
+def test_cannot_jump_directly_from_long_to_short_or_back() -> None:
+    connection = _conn()
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00", reason="open long",
+    )
+    with pytest.raises(PortfolioError, match="close to flat first"):
+        execute_paper_trade(
+            connection, predictor="p", instrument="BTC-USD", target_side="short",
+            price=100.0, now_iso="2026-09-05T01:00:00+00:00", reason="flip",
+        )
 
 
 def test_mark_to_market_records_equity_curve_point() -> None:

@@ -650,8 +650,8 @@ async function refresh() {
     const pfBody = document.querySelector("#portfolios tbody");
     pfBody.innerHTML = "";
     s.portfolios.forEach(p => {
-      const sideCell = td(p.position_qty > 0 ? "LONG" : "flat");
-      sideCell.className = p.position_qty > 0 ? "ok" : "muted";
+      const sideCell = td(p.position_qty > 0 ? "LONG" : p.position_qty < 0 ? "SHORT" : "flat");
+      sideCell.className = p.position_qty > 0 ? "ok" : p.position_qty < 0 ? "warn" : "muted";
       const retCell = td(p.return_pct.toFixed(2) + "%");
       retCell.className = p.return_pct > 0 ? "ok" : (p.return_pct < 0 ? "bad" : "muted");
       const curveCell = document.createElement("td");

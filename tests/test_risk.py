@@ -278,6 +278,41 @@ def test_holding_a_losing_long_now_trips_and_forces_an_exit() -> None:
     assert post_state.position_qty == 0.0
 
 
+def test_holding_a_losing_short_also_trips_and_forces_a_cover() -> None:
+    """Symmetric to the long case: a short loses when price RISES, and the
+    interlock must not have a blind spot on one direction just because the
+    original bug and fix were both first found and written against a long."""
+    from andy_trader.portfolio import get_or_create_state, run_paper_cycle
+
+    connection = _conn()
+    opening = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.1,
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+    assert opening.trade is not None and opening.trade.side == "short"
+
+    # Price rises 60% -- a short's losing direction -- past the 40% hard-halt
+    # threshold, while the predictor still says "stay short" (0.1 confidence).
+    result = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.1,
+        price=160.0, now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert result.trade is not None, "the kill switch must force the short covered, not just block new entries"
+    assert result.trade.side == "flat"
+    assert result.forced_exit is True
+    assert result.risk_allowed is False
+
+    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert state["tripped"] == 1
+    assert state["severity"] == "hard"
+
+    post_state = get_or_create_state(
+        connection, predictor="p", instrument="BTC-USD", now_iso="2026-09-05T01:00:00+00:00"
+    )
+    assert post_state.position_qty == 0.0
+
+
 def test_ordinary_hysteresis_exit_is_never_mislabeled_as_a_forced_exit() -> None:
     """A predictor exiting on its own (probability dropped, nothing was ever
     tripped) must not be confused with a risk-forced exit in the trade log."""

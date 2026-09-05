@@ -9,10 +9,22 @@ backtested ones, and records every trade and every mark-to-market snapshot as
 an append-only audit trail -- the same "write before you can lie about it"
 discipline the rest of the project follows.
 
-**Deliberately long-or-flat, no leverage, no shorting, in this first version.**
-Shorting a leveraged instrument needs a borrow/margin model this project has
-no data for yet, and getting that quietly wrong is a worse failure mode than
-not having it. Long-or-flat is honest about being step one.
+**Long, flat, or short -- always 1x, never leveraged.** Shorting here means
+borrowing exactly the notional already at risk and selling it, not borrowing
+*beyond* your capital -- the risk profile is the mirror image of going long,
+not bigger than it. A negative `position_qty` represents the short: cash
+rises by the sale proceeds at entry (it is simulated, not really spendable
+mid-position -- `cash + position_qty * price` is still the only honest
+equity number) and falls by the cost to buy back and cover at exit. Genuine
+margin leverage -- borrowing more notional than the account actually holds --
+is a different, harder problem (liquidation price, margin calls, borrow
+cost) this project has deliberately not built, and getting that quietly
+wrong is a worse failure mode than not having it.
+
+Flipping directly from long to short (or short to long) always passes
+through flat first, one trade per cycle, same as everything else here: a
+single trade doing two things atomically is exactly the kind of shortcut
+that hides a sign error.
 
 **This does not pick which predictor to trade.** `run_paper_cycle` trades
 whatever predictor name you point it at -- a baseline, or a CT-07 model, once
@@ -37,10 +49,11 @@ DEFAULT_STARTING_CASH = 10_000.0
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
-DEFAULT_FLAT_THRESHOLD = 0.50  # exit back to flat once conviction fades to a coin flip
+DEFAULT_SHORT_THRESHOLD = 1.0 - DEFAULT_LONG_THRESHOLD  # symmetric: 0.45
+DEFAULT_FLAT_THRESHOLD = 0.50  # exit either side back to flat once conviction fades to a coin flip
 DEFAULT_MAX_PREDICTION_AGE_MINUTES = 20.0  # the unattended cycle runs every 15 minutes
 
-Side = Literal["long", "flat"]
+Side = Literal["long", "flat", "short"]
 
 
 class PortfolioError(ValueError):
@@ -218,21 +231,34 @@ def _save_state(connection: sqlite3.Connection, state: PortfolioState) -> None:
 
 
 def decide_side(probability_up: float, *, current_side: Side = "flat") -> Side:
-    """Deterministic, deliberately simple v1 decision rule, with real hysteresis.
+    """Deterministic, deliberately simple v1 decision rule, with real hysteresis
+    on both sides, symmetric between going long and going short.
 
-    From flat, only enter long above DEFAULT_LONG_THRESHOLD. From long, only exit
-    back to flat once conviction drops to DEFAULT_FLAT_THRESHOLD or below. This
-    needs the current side as an input: a single shared threshold would let a
-    predictor oscillating right around that one number flip a trade (and pay
-    costs) every single cycle. The gap between the two thresholds is what stops
-    that, and it only works if the function knows which side of it it's already on.
+    From flat: enter long above DEFAULT_LONG_THRESHOLD, enter short below
+    DEFAULT_SHORT_THRESHOLD (0.45, the mirror of 0.55), otherwise stay flat.
+    From long: only exit to flat once conviction drops to DEFAULT_FLAT_THRESHOLD
+    (0.50) or below -- never jump straight to short. From short: only exit to
+    flat once conviction rises to 0.50 or above -- never jump straight to long.
+    Every direction change passes through flat first, one trade per cycle.
+
+    The hysteresis needs the current side as an input: a single shared
+    threshold per direction would let a predictor oscillating right around
+    that one number flip a trade (and pay costs) every single cycle. The gap
+    between the entry and exit thresholds is what stops that, and it only
+    works if the function knows which side of it it's already on.
     """
 
     if not (0.0 <= probability_up <= 1.0):
         raise PortfolioError(f"probability_up out of range: {probability_up}")
     if current_side == "long":
         return "flat" if probability_up <= DEFAULT_FLAT_THRESHOLD else "long"
-    return "long" if probability_up >= DEFAULT_LONG_THRESHOLD else "flat"
+    if current_side == "short":
+        return "flat" if probability_up >= DEFAULT_FLAT_THRESHOLD else "short"
+    if probability_up >= DEFAULT_LONG_THRESHOLD:
+        return "long"
+    if probability_up <= DEFAULT_SHORT_THRESHOLD:
+        return "short"
+    return "flat"
 
 
 def execute_paper_trade(
@@ -265,14 +291,21 @@ def execute_paper_trade(
         starting_cash=starting_cash,
         now_iso=now_iso,
     )
-    currently_long = state.position_qty > 0
-    if (target_side == "long") == currently_long:
+    current_side: Side = (
+        "long" if state.position_qty > 0 else "short" if state.position_qty < 0 else "flat"
+    )
+    if target_side == current_side:
         return None  # already where we want to be; no churn, no cost
+    if current_side != "flat" and target_side != "flat":
+        # Every direction change passes through flat first -- see module docstring.
+        raise PortfolioError(
+            f"Cannot jump directly from {current_side} to {target_side}; close to flat first"
+        )
 
     cost_rate = (fee_bps + slippage_bps) / 10_000.0
 
     if target_side == "long":
-        # Go long: commit all cash to the position, net of costs.
+        # Open long from flat: commit all cash to the position, net of costs.
         notional = state.cash
         total_cost = notional * cost_rate
         deployable = notional - total_cost
@@ -302,8 +335,45 @@ def execute_paper_trade(
             executed_at=now_iso,
             reason=reason,
         )
-    else:
-        # Close to flat: sell the whole position, net of costs.
+    elif target_side == "short":
+        # Open short from flat: sell borrowed qty sized off the same "deploy
+        # all current cash" convention long uses, so long and short take on
+        # identical notional risk, mirrored, not one bigger than the other.
+        # Cash rises by the sale proceeds -- this is bookkeeping for a
+        # simulated borrow, not literally spendable mid-position; only
+        # `cash + position_qty * price` is ever the real equity number.
+        notional = state.cash
+        total_cost = notional * cost_rate
+        proceeds = notional - total_cost
+        if proceeds <= 0:
+            raise PortfolioError("Insufficient cash to open a short after costs")
+        qty = notional / price
+        fee_cost = notional * (fee_bps / 10_000.0)
+        slippage_cost = notional * (slippage_bps / 10_000.0)
+        new_cash = state.cash + proceeds
+        new_state = PortfolioState(
+            predictor=predictor,
+            instrument=instrument,
+            starting_cash=state.starting_cash,
+            cash=new_cash,
+            position_qty=-qty,
+            avg_entry_price=price,
+            updated_at=now_iso,
+        )
+        trade = Trade(
+            predictor=predictor,
+            instrument=instrument,
+            side="short",
+            qty=qty,
+            price=price,
+            fee_cost=fee_cost,
+            slippage_cost=slippage_cost,
+            cash_after=new_cash,
+            executed_at=now_iso,
+            reason=reason,
+        )
+    elif current_side == "long":
+        # Close a long to flat: sell the whole position, net of costs.
         notional = state.position_qty * price
         total_cost = notional * cost_rate
         proceeds = notional - total_cost
@@ -324,6 +394,40 @@ def execute_paper_trade(
             instrument=instrument,
             side="flat",
             qty=state.position_qty,
+            price=price,
+            fee_cost=fee_cost,
+            slippage_cost=slippage_cost,
+            cash_after=new_cash,
+            executed_at=now_iso,
+            reason=reason,
+        )
+    else:
+        # Cover a short to flat: buy back the borrowed qty, net of costs.
+        # Unlike closing a long (costs reduce what you receive), covering a
+        # short costs MORE than the raw notional -- fees add to the outlay,
+        # they never subtract from it. Getting this sign backwards would let
+        # a short manufacture free money out of trading costs.
+        qty = abs(state.position_qty)
+        notional = qty * price
+        total_cost = notional * cost_rate
+        outlay = notional + total_cost
+        fee_cost = notional * (fee_bps / 10_000.0)
+        slippage_cost = notional * (slippage_bps / 10_000.0)
+        new_cash = state.cash - outlay
+        new_state = PortfolioState(
+            predictor=predictor,
+            instrument=instrument,
+            starting_cash=state.starting_cash,
+            cash=new_cash,
+            position_qty=0.0,
+            avg_entry_price=None,
+            updated_at=now_iso,
+        )
+        trade = Trade(
+            predictor=predictor,
+            instrument=instrument,
+            side="flat",
+            qty=qty,
             price=price,
             fee_cost=fee_cost,
             slippage_cost=slippage_cost,
@@ -436,7 +540,11 @@ def run_paper_cycle(
         starting_cash=starting_cash,
         now_iso=now_iso,
     )
-    current_side: Side = "long" if current_state.position_qty > 0 else "flat"
+    current_side: Side = (
+        "long" if current_state.position_qty > 0
+        else "short" if current_state.position_qty < 0
+        else "flat"
+    )
 
     # Mark-to-market at the live price, computed now rather than read from
     # history, so the interlock reacts to what this cycle's price is doing to
@@ -455,13 +563,15 @@ def run_paper_cycle(
     desired = decide_side(probability_up, current_side=current_side)
     forced_exit = False
 
-    if not decision.allowed and current_side == "long":
+    if not decision.allowed and current_side != "flat":
+        # A trip forces ANY open position flat, long or short -- the kill
+        # switch doesn't care which direction the damage came from.
         target: Side = "flat"
         forced_exit = True
         reason = f"RISK INTERLOCK forced exit: {decision.reason}"
-    elif not decision.allowed and desired == "long" and current_side == "flat":
+    elif not decision.allowed and desired in ("long", "short") and current_side == "flat":
         target = "flat"
-        reason = f"probability_up={probability_up:.4f}; risk-blocked entry: {decision.reason}"
+        reason = f"probability_up={probability_up:.4f}; risk-blocked entry ({desired}): {decision.reason}"
     else:
         target = desired
         reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
