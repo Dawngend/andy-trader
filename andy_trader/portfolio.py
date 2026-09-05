@@ -61,6 +61,20 @@ class PortfolioState:
 
 
 @dataclass(frozen=True)
+class PortfolioSummary:
+    """Aggregate P&L across every (predictor, instrument) pair that has ever traded."""
+
+    total_starting_cash: float
+    total_equity: float
+    total_return_pct: float
+    total_trade_count: int
+    winners: int
+    losers: int
+    best: tuple[str, str, float] | None
+    worst: tuple[str, str, float] | None
+
+
+@dataclass(frozen=True)
 class Trade:
     """One executed paper trade, immutable once written."""
 
@@ -502,6 +516,103 @@ def fetch_equity_curve(
         (predictor, instrument, limit),
     ).fetchall()
     return [dict(row) for row in reversed(rows)]
+
+
+def portfolio_summary(connection: sqlite3.Connection) -> PortfolioSummary:
+    """Roll up portfolio rows without creating a second source of live equity.
+
+    Each pair's latest recorded equity is already the value shown by its chart,
+    so the aggregate reads that same mark instead of reconstructing one from a
+    separate price table. A pair with no mark yet is still real allocated capital
+    and therefore contributes its current cash rather than zero. This read path
+    intentionally does not initialize or migrate schema because the dashboard
+    must remain unable to mutate the trading database.
+    """
+
+    empty_summary = PortfolioSummary(
+        total_starting_cash=0.0,
+        total_equity=0.0,
+        total_return_pct=0.0,
+        total_trade_count=0,
+        winners=0,
+        losers=0,
+        best=None,
+        worst=None,
+    )
+    state_table_exists = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'paper_portfolio_state'
+        """
+    ).fetchone()
+    if state_table_exists is None:
+        return empty_summary
+    rows = connection.execute(
+        """
+        SELECT predictor, instrument, starting_cash, cash
+        FROM paper_portfolio_state
+        ORDER BY predictor, instrument
+        """
+    ).fetchall()
+    if not rows:
+        return empty_summary
+
+    total_starting_cash = 0.0
+    total_equity = 0.0
+    total_trade_count = 0
+    returns: list[tuple[str, str, float]] = []
+
+    for row in rows:
+        predictor = str(row[0])
+        instrument = str(row[1])
+        latest_mark = connection.execute(
+            """
+            SELECT equity
+            FROM paper_equity_curve
+            WHERE predictor = ? AND instrument = ?
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT 1
+            """,
+            (predictor, instrument),
+        ).fetchone()
+        latest_equity = (
+            float(latest_mark[0]) if latest_mark is not None else float(row[3])
+        )
+        starting_equity = float(row[2])
+        return_pct = (
+            (latest_equity / starting_equity - 1.0) * 100.0 if starting_equity else 0.0
+        )
+
+        total_starting_cash += starting_equity
+        total_equity += latest_equity
+        total_trade_count += int(
+            connection.execute(
+                """
+                SELECT COUNT(*) AS trade_count
+                FROM paper_trades
+                WHERE predictor = ? AND instrument = ?
+                """,
+                (predictor, instrument),
+            ).fetchone()[0]
+        )
+        returns.append((predictor, instrument, return_pct))
+
+    total_return_pct = (
+        (total_equity / total_starting_cash - 1.0) * 100.0
+        if total_starting_cash
+        else 0.0
+    )
+    return PortfolioSummary(
+        total_starting_cash=total_starting_cash,
+        total_equity=total_equity,
+        total_return_pct=total_return_pct,
+        total_trade_count=total_trade_count,
+        winners=sum(return_pct > 0.0 for _, _, return_pct in returns),
+        losers=sum(return_pct < 0.0 for _, _, return_pct in returns),
+        best=max(returns, key=lambda item: item[2]),
+        worst=min(returns, key=lambda item: item[2]),
+    )
 
 
 def fetch_recent_trades(
