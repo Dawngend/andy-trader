@@ -1,0 +1,471 @@
+"""Local, real-time, read-only monitor for Andy Trader.
+
+Serves one page over plain HTTP on 127.0.0.1, never the network -- this reads
+your live trading database and has no reason to ever leave your machine.
+
+**What this shows and what it does not.** Live collected prices, every
+prediction as it is logged and settled, the running Brier-skill scoreboard per
+predictor, the CT-07 model registry (every retrain, promoted or rejected, with
+its holdout score), and CT-08's paper portfolios (simulated cash and position
+per predictor, real trading costs, an append-only equity curve). Every dollar
+shown is simulated -- `andy_trader.portfolio` never touches a real exchange
+account, and paper trading only happens for a (predictor, instrument) pair you
+have explicitly run a cycle for. Nothing trades itself into existence just by
+this dashboard being open.
+
+No third-party dependencies: stdlib http.server + sqlite3 + string templating,
+matching the rest of the project.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from typing import Sequence
+
+from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.portfolio import fetch_equity_curve, fetch_recent_trades, initialize_portfolio
+from andy_trader.predict import score_all
+from andy_trader.store import connect, default_database_path
+
+DEFAULT_PORT = 8787
+RECENT_PREDICTIONS_LIMIT = 40
+RECENT_REGISTRY_LIMIT = 20
+
+
+def _seconds_since(iso_timestamp: str, now: datetime) -> float:
+    parsed = datetime.fromisoformat(iso_timestamp)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (now - parsed).total_seconds()
+
+
+def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str, object]:
+    """Per instrument+interval, when the collector last actually saw a bar."""
+
+    rows = connection.execute(
+        """
+        SELECT instrument, interval, MAX(last_seen_at) AS last_seen_at
+        FROM crypto_observations
+        GROUP BY instrument, interval
+        ORDER BY instrument, interval
+        """
+    ).fetchall()
+    series = []
+    most_recent = None
+    for row in rows:
+        last_seen_at = row["last_seen_at"]
+        age_seconds = _seconds_since(last_seen_at, now)
+        series.append(
+            {
+                "instrument": row["instrument"],
+                "interval": row["interval"],
+                "last_seen_at": last_seen_at,
+                "age_seconds": age_seconds,
+                "stale": age_seconds > 20 * 60,  # scheduled cycle runs every 15 min
+            }
+        )
+        if most_recent is None or age_seconds < most_recent:
+            most_recent = age_seconds
+    return {
+        "series": series,
+        "freshest_age_seconds": most_recent,
+        "healthy": most_recent is not None and most_recent <= 20 * 60,
+    }
+
+
+def _pending_overdue(connection: sqlite3.Connection, now_iso: str) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) AS n FROM crypto_predictions WHERE settled_at IS NULL AND resolves_at <= ?",
+        (now_iso,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _recent_predictions(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT predictor, instrument, horizon, probability_up, reference_price,
+               created_at, resolves_at, settled_at, settle_price, outcome_up
+        FROM crypto_predictions
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (RECENT_PREDICTIONS_LIMIT,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _latest_prices(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = connection.execute(
+        """
+        SELECT instrument, interval, close, open_time
+        FROM (
+            SELECT instrument, interval, close, open_time,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY instrument, interval ORDER BY open_time DESC
+                   ) AS rank
+            FROM crypto_observations
+            WHERE degraded = 0 AND close IS NOT NULL
+        )
+        WHERE rank = 1
+        ORDER BY instrument, interval
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _scoreboard(connection: sqlite3.Connection) -> dict[str, object]:
+    reports = score_all(connection, minimum=1)
+    out: dict[str, object] = {}
+    for predictor, report in reports.items():
+        if isinstance(report, dict):  # CalibrationError case
+            out[predictor] = report
+        else:
+            out[predictor] = report.as_dict()
+    return out
+
+
+def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    try:
+        rows = connection.execute(
+            """
+            SELECT model_id, trained_at, instrument, interval, horizon,
+                   holdout_bars, holdout_brier_skill, base_rate_brier_skill,
+                   promoted, promotion_reason
+            FROM model_registry
+            ORDER BY trained_at DESC, id DESC
+            LIMIT ?
+            """,
+            (RECENT_REGISTRY_LIMIT,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # table does not exist yet: no model has ever been trained
+    return [dict(row) for row in rows]
+
+
+def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    """One summary row per (predictor, instrument) pair that has ever paper-traded."""
+
+    try:
+        rows = connection.execute(
+            "SELECT predictor, instrument, cash, position_qty, avg_entry_price, updated_at "
+            "FROM paper_portfolio_state ORDER BY predictor, instrument"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # no paper trade has ever run yet
+
+    summaries: list[dict[str, object]] = []
+    for row in rows:
+        predictor, instrument = row["predictor"], row["instrument"]
+        curve = fetch_equity_curve(connection, predictor=predictor, instrument=instrument, limit=200)
+        trades = fetch_recent_trades(connection, predictor=predictor, instrument=instrument, limit=1000)
+        latest_equity = curve[-1]["equity"] if curve else float(row["cash"])
+        starting_equity = curve[0]["equity"] if curve else float(row["cash"])
+        summaries.append(
+            {
+                "predictor": predictor,
+                "instrument": instrument,
+                "cash": float(row["cash"]),
+                "position_qty": float(row["position_qty"]),
+                "avg_entry_price": row["avg_entry_price"],
+                "equity": latest_equity,
+                "return_pct": (latest_equity / starting_equity - 1.0) * 100.0 if starting_equity else 0.0,
+                "trade_count": len(trades),
+                "equity_curve": [point["equity"] for point in curve[-100:]],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return summaries
+
+
+def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
+    """Pure, read-only snapshot of everything the dashboard displays.
+
+    Deliberately separate from the HTTP layer so it can be tested and reasoned
+    about without spinning up a server.
+    """
+
+    now = datetime.now(UTC)
+    now_iso = now.isoformat()
+    return {
+        "generated_at": now_iso,
+        "collector_health": _collector_health(connection, now),
+        "pending_overdue": _pending_overdue(connection, now_iso),
+        "latest_prices": _latest_prices(connection),
+        "recent_predictions": _recent_predictions(connection),
+        "scoreboard": _scoreboard(connection),
+        "registry": _registry(connection),
+        "portfolios": _portfolios(connection),
+    }
+
+
+_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Andy Trader Monitor</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0b0f14; color:#d8e1e8; font:14px/1.4 -apple-system,Segoe UI,sans-serif; margin:0; padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .badge { display:inline-block; background:#7a3b00; color:#ffd699; padding:3px 10px; border-radius:4px; font-weight:700; font-size:12px; letter-spacing:.04em; }
+  .sub { color:#8fa3b0; font-size:12px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; align-items:start; }
+  .card { background:#11161d; border:1px solid #1e2833; border-radius:8px; padding:14px 16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:#8fa3b0; margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:4px 6px; border-bottom:1px solid #1a232c; white-space:nowrap; }
+  th { color:#6d8494; font-weight:600; }
+  .ok { color:#4ade80; } .bad { color:#f87171; } .warn { color:#facc15; } .muted { color:#5c7080; }
+  .pill { padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.promoted { background:#123a1f; color:#4ade80; }
+  .pill.rejected { background:#3a1212; color:#f87171; }
+  #err { color:#f87171; display:none; margin-bottom:12px; }
+  .updated { font-size:11px; color:#5c7080; }
+</style>
+</head>
+<body>
+  <h1>Andy Trader &mdash; Live Monitor <span class="badge">PAPER &middot; SIMULATED CAPITAL &middot; REAL MARKET</span></h1>
+  <div class="sub">Real prices, real predictions, real settlement, simulated cash and positions only &mdash; nothing here ever touches a real exchange account.</div>
+  <div id="err"></div>
+  <div class="grid">
+    <div class="card" style="grid-column:1/-1;">
+      <h2>Paper Portfolios (CT-08)</h2>
+      <table id="portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Collector Health</h2>
+      <table id="health"><thead><tr><th>Instrument</th><th>Interval</th><th>Last Seen</th><th>Age</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Latest Prices</h2>
+      <table id="prices"><thead><tr><th>Instrument</th><th>Interval</th><th>Close</th><th>Open Time</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Scoreboard (Brier skill vs. base rate)</h2>
+      <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Model Registry (CT-07)</h2>
+      <table id="registry"><thead><tr><th>Model</th><th>Trained</th><th>Holdout Skill</th><th>vs Base</th><th>Verdict</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card" style="grid-column:1/-1;">
+      <h2>Recent Predictions</h2>
+      <table id="predictions"><thead><tr><th>Predictor</th><th>Instrument</th><th>Horizon</th><th>P(up)</th><th>Created</th><th>Status</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <p class="updated" id="updated"></p>
+<script>
+function fmtAge(s) {
+  if (s == null) return "-";
+  if (s < 90) return Math.round(s) + "s";
+  if (s < 5400) return Math.round(s/60) + "m";
+  return (s/3600).toFixed(1) + "h";
+}
+function fmtTime(iso) {
+  if (!iso) return "-";
+  return iso.replace("T"," ").slice(0,19) + "Z";
+}
+function td(v) { const e = document.createElement("td"); e.textContent = v; return e; }
+function row(cells) { const r = document.createElement("tr"); cells.forEach(c => r.appendChild(c)); return r; }
+
+function sparkline(values) {
+  if (!values || values.length < 2) return document.createTextNode("-");
+  const w = 120, h = 28, pad = 2;
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = (max - min) || 1;
+  const step = (w - 2*pad) / (values.length - 1);
+  const points = values.map((v, i) => {
+    const x = pad + i * step;
+    const y = h - pad - ((v - min) / span) * (h - 2*pad);
+    return x.toFixed(1) + "," + y.toFixed(1);
+  }).join(" ");
+  const rising = values[values.length - 1] >= values[0];
+  const svgns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgns, "svg");
+  svg.setAttribute("width", w); svg.setAttribute("height", h);
+  const poly = document.createElementNS(svgns, "polyline");
+  poly.setAttribute("points", points);
+  poly.setAttribute("fill", "none");
+  poly.setAttribute("stroke", rising ? "#4ade80" : "#f87171");
+  poly.setAttribute("stroke-width", "1.5");
+  svg.appendChild(poly);
+  return svg;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/state", {cache: "no-store"});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const s = await res.json();
+    document.getElementById("err").style.display = "none";
+
+    const pfBody = document.querySelector("#portfolios tbody");
+    pfBody.innerHTML = "";
+    s.portfolios.forEach(p => {
+      const sideCell = td(p.position_qty > 0 ? "LONG" : "flat");
+      sideCell.className = p.position_qty > 0 ? "ok" : "muted";
+      const retCell = td(p.return_pct.toFixed(2) + "%");
+      retCell.className = p.return_pct > 0 ? "ok" : (p.return_pct < 0 ? "bad" : "muted");
+      const curveCell = document.createElement("td");
+      curveCell.appendChild(sparkline(p.equity_curve));
+      pfBody.appendChild(row([
+        td(p.predictor), td(p.instrument), sideCell,
+        td("$" + p.cash.toFixed(2)), td(p.position_qty.toFixed(6)),
+        td("$" + p.equity.toFixed(2)), retCell, td(p.trade_count), curveCell,
+      ]));
+    });
+    if (s.portfolios.length === 0) {
+      pfBody.appendChild(row([td("no paper trading has run yet -- run: python -m andy_trader.portfolio --predictor <name> --instrument <inst>"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
+    }
+
+    const healthBody = document.querySelector("#health tbody");
+    healthBody.innerHTML = "";
+    s.collector_health.series.forEach(row_ => {
+      const ageCell = td(fmtAge(row_.age_seconds));
+      ageCell.className = row_.stale ? "bad" : "ok";
+      healthBody.appendChild(row([td(row_.instrument), td(row_.interval), td(fmtTime(row_.last_seen_at)), ageCell]));
+    });
+
+    const pricesBody = document.querySelector("#prices tbody");
+    pricesBody.innerHTML = "";
+    s.latest_prices.forEach(p => {
+      pricesBody.appendChild(row([td(p.instrument), td(p.interval), td(p.close), td(fmtTime(p.open_time))]));
+    });
+
+    const sbBody = document.querySelector("#scoreboard tbody");
+    sbBody.innerHTML = "";
+    Object.keys(s.scoreboard).sort().forEach(name => {
+      const r = s.scoreboard[name];
+      if (r.error) { sbBody.appendChild(row([td(name), td("-"), td(r.error), td("-")])); return; }
+      const skillCell = td(r.degenerate ? "degenerate" : r.brier_skill_score.toFixed(4));
+      skillCell.className = r.degenerate ? "muted" : (r.brier_skill_score > 0 ? "ok" : "bad");
+      sbBody.appendChild(row([td(name), td(r.count), skillCell, td((r.hit_rate*100).toFixed(1)+"%")]));
+    });
+
+    const regBody = document.querySelector("#registry tbody");
+    regBody.innerHTML = "";
+    s.registry.forEach(m => {
+      const verdict = document.createElement("td");
+      const pill = document.createElement("span");
+      pill.className = "pill " + (m.promoted ? "promoted" : "rejected");
+      pill.textContent = m.promoted ? "PROMOTED" : "REJECTED";
+      verdict.appendChild(pill);
+      regBody.appendChild(row([
+        td(m.model_id), td(fmtTime(m.trained_at)),
+        td(m.holdout_brier_skill.toFixed(4)), td(m.base_rate_brier_skill.toFixed(4)),
+        verdict,
+      ]));
+    });
+    if (s.registry.length === 0) {
+      regBody.appendChild(row([td("no model has been trained yet"), td(""), td(""), td(""), td("")]));
+    }
+
+    const predBody = document.querySelector("#predictions tbody");
+    predBody.innerHTML = "";
+    s.recent_predictions.forEach(p => {
+      let status;
+      if (p.settled_at) {
+        const correct = (p.outcome_up === 1) === (p.probability_up >= 0.5);
+        status = document.createElement("span");
+        status.textContent = p.outcome_up === 1 ? "settled: UP" : "settled: DOWN";
+        status.className = correct ? "ok" : "bad";
+      } else {
+        status = document.createElement("span");
+        status.textContent = "pending";
+        status.className = "warn";
+      }
+      const statusCell = document.createElement("td");
+      statusCell.appendChild(status);
+      predBody.appendChild(row([
+        td(p.predictor), td(p.instrument), td(p.horizon),
+        td(p.probability_up.toFixed(3)), td(fmtTime(p.created_at)), statusCell,
+      ]));
+    });
+
+    document.getElementById("updated").textContent = "updated " + fmtTime(s.generated_at);
+  } catch (e) {
+    const err = document.getElementById("err");
+    err.textContent = "Could not reach the dashboard server: " + e.message;
+    err.style.display = "block";
+  }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
+"""
+
+
+class _Handler(BaseHTTPRequestHandler):
+    database_path: Path = None  # set by run()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass  # keep stdout quiet; this is a local monitor, not a service
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/" or self.path == "":
+            body = _PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/api/state":
+            try:
+                with connect(self.database_path) as connection:
+                    state = build_dashboard_state(connection)
+                body = json.dumps(state).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as exc:  # noqa: BLE001 - surface any failure to the page
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+
+def run(database_path: Path, port: int = DEFAULT_PORT) -> None:
+    _Handler.database_path = database_path
+    server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    print(f"Andy Trader monitor: http://127.0.0.1:{port}  (database: {database_path})")
+    print("Local only -- not reachable from the network. Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--database", help="Override database path")
+    args = parser.parse_args(argv)
+
+    load_env_file(REPO_ROOT / ".env")
+    db_path = Path(args.database) if args.database else default_database_path()
+    run(db_path, port=args.port)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
