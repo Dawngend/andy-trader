@@ -378,7 +378,15 @@ def run_paper_cycle(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float = DEFAULT_STARTING_CASH,
 ) -> tuple[Trade | None, float]:
-    """One full cycle: decide, trade if needed, mark to market. Returns (trade, equity)."""
+    """One full cycle: decide, check the risk interlock, trade if allowed, mark to market.
+
+    Returns (trade, equity). The risk gate (CT-10) only ever blocks the *trade*
+    -- equity is always marked to market honestly, whether or not a trade was
+    allowed to happen, and a kill-switch trip or throttle is recorded in its
+    own audit table (`risk_events`), not silently swallowed here.
+    """
+
+    from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
 
     current_state = get_or_create_state(
         connection,
@@ -390,18 +398,38 @@ def run_paper_cycle(
     current_side: Side = "long" if current_state.position_qty > 0 else "flat"
     target = decide_side(probability_up, current_side=current_side)
     reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
-    trade = execute_paper_trade(
-        connection,
-        predictor=predictor,
-        instrument=instrument,
-        target_side=target,
-        price=price,
-        now_iso=now_iso,
-        reason=reason,
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-        starting_cash=starting_cash,
-    )
+
+    trade: Trade | None = None
+    entering_new_risk = target == "long" and current_side == "flat"
+    if target != current_side:
+        # The gate only ever applies to *entering* a position -- taking on new
+        # risk. Exiting to flat always reduces risk, so it is never blocked:
+        # a risk interlock that can trap you in a losing position by refusing
+        # to let you close it would be worse than having none at all.
+        allowed = True
+        if entering_new_risk:
+            decision = check_and_enforce(
+                connection,
+                predictor=predictor,
+                instrument=instrument,
+                starting_cash=current_state.starting_cash,
+                now_iso=now_iso,
+            )
+            allowed = decision.allowed
+        if allowed:
+            trade = execute_paper_trade(
+                connection,
+                predictor=predictor,
+                instrument=instrument,
+                target_side=target,
+                price=price,
+                now_iso=now_iso,
+                reason=reason,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                starting_cash=starting_cash,
+            )
+
     equity = mark_to_market(
         connection,
         predictor=predictor,

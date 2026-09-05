@@ -5,6 +5,7 @@ import sqlite3
 
 from andy_trader.dashboard import _collector_health, _latest_prices, _portfolios
 from andy_trader.portfolio import run_paper_cycle
+from andy_trader.risk import initialize_risk
 from andy_trader.store import Candle, initialize_database, record_observations
 
 
@@ -85,3 +86,24 @@ def test_paper_return_includes_the_first_entry_cost() -> None:
     portfolios = _portfolios(connection)
 
     assert portfolios[0]["return_pct"] < 0.0
+    assert portfolios[0]["risk"] == {"tripped": False, "severity": None, "reason": None}
+
+
+def test_portfolio_surfaces_a_tripped_risk_state() -> None:
+    connection = _conn()
+    initialize_risk(connection)
+    run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.60,
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+    connection.execute(
+        "INSERT INTO risk_kill_switch (predictor, instrument, tripped, severity, tripped_at, tripped_reason) "
+        "VALUES ('p', 'BTC-USD', 1, 'hard', '2026-09-05T01:00:00+00:00', 'total loss exceeded')"
+    )
+    connection.commit()
+
+    portfolios = _portfolios(connection)
+
+    assert portfolios[0]["risk"]["tripped"] is True
+    assert portfolios[0]["risk"]["severity"] == "hard"
+    assert portfolios[0]["risk"]["reason"] == "total loss exceeded"

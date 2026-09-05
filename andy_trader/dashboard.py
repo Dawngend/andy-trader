@@ -216,6 +216,7 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
         ).fetchall()
         latest_equity = curve[-1]["equity"] if curve else float(row["cash"])
         starting_equity = float(row["starting_cash"])
+        risk_state = _risk_state(connection, predictor=predictor, instrument=instrument)
         summaries.append(
             {
                 "predictor": predictor,
@@ -228,9 +229,26 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
                 "trade_count": len(trades),
                 "equity_curve": [point["equity"] for point in curve[-100:]],
                 "updated_at": row["updated_at"],
+                "risk": risk_state,
             }
         )
     return summaries
+
+
+def _risk_state(connection: sqlite3.Connection, *, predictor: str, instrument: str) -> dict[str, object]:
+    """CT-10 kill-switch status for one portfolio. Read-only; never trips or clears anything."""
+
+    try:
+        row = connection.execute(
+            "SELECT tripped, severity, tripped_at, tripped_reason FROM risk_kill_switch "
+            "WHERE predictor = ? AND instrument = ?",
+            (predictor, instrument),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"tripped": False, "severity": None, "reason": None}
+    if row is None or not row["tripped"]:
+        return {"tripped": False, "severity": None, "reason": None}
+    return {"tripped": True, "severity": row["severity"], "reason": row["tripped_reason"]}
 
 
 def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
@@ -288,7 +306,7 @@ _PAGE = """<!doctype html>
   <div class="grid">
     <div class="card" style="grid-column:1/-1;">
       <h2>Paper Portfolios (CT-08)</h2>
-      <table id="portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th></tr></thead><tbody></tbody></table>
+      <table id="portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Collector Health</h2>
@@ -367,14 +385,29 @@ async function refresh() {
       retCell.className = p.return_pct > 0 ? "ok" : (p.return_pct < 0 ? "bad" : "muted");
       const curveCell = document.createElement("td");
       curveCell.appendChild(sparkline(p.equity_curve));
+      const riskCell = document.createElement("td");
+      if (p.risk && p.risk.tripped) {
+        const pill = document.createElement("span");
+        pill.className = "pill " + (p.risk.severity === "hard" ? "rejected" : "promoted");
+        pill.style.background = p.risk.severity === "hard" ? "#3a1212" : "#3a2a12";
+        pill.style.color = p.risk.severity === "hard" ? "#f87171" : "#facc15";
+        pill.textContent = p.risk.severity === "hard" ? "HARD HALT" : "SOFT TRIPPED";
+        pill.title = p.risk.reason || "";
+        riskCell.appendChild(pill);
+      } else {
+        const ok = document.createElement("span");
+        ok.className = "muted";
+        ok.textContent = "ok";
+        riskCell.appendChild(ok);
+      }
       pfBody.appendChild(row([
         td(p.predictor), td(p.instrument), sideCell,
         td("$" + p.cash.toFixed(2)), td(p.position_qty.toFixed(6)),
-        td("$" + p.equity.toFixed(2)), retCell, td(p.trade_count), curveCell,
+        td("$" + p.equity.toFixed(2)), retCell, td(p.trade_count), curveCell, riskCell,
       ]));
     });
     if (s.portfolios.length === 0) {
-      pfBody.appendChild(row([td("no paper trading has run yet -- run: python -m andy_trader.portfolio --predictor <name> --instrument <inst>"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
+      pfBody.appendChild(row([td("no paper trading has run yet -- run: python -m andy_trader.portfolio --predictor <name> --instrument <inst>"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
     }
 
     const healthBody = document.querySelector("#health tbody");
