@@ -57,3 +57,64 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     ]
     stored = next(entry for entry in entries if entry["event"] == "store_updated")
     assert stored["predictions"] == 2  # only the minimum-history-one baselines can run
+    assert "paper_trade_completed" not in events  # opt-in only; nothing was configured
+
+
+def _fake_price_collect(*, instruments, intervals, venues, settings):
+    del venues, settings
+    return [
+        Candle(
+            instrument=instruments[0], venue="bybit", interval=intervals[0],
+            open_time=datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat(),
+            open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0,
+        )
+    ], []
+
+
+def test_paper_trade_is_opt_in_and_runs_when_explicitly_configured(monkeypatch, tmp_path: Path) -> None:
+    journal = tmp_path / "cycle.jsonl"
+    monkeypatch.setattr(run_cycle, "collect", _fake_price_collect)
+    monkeypatch.setattr(run_cycle, "CYCLE_LOG_PATH", journal)
+    monkeypatch.setattr(run_cycle, "default_database_path", lambda: tmp_path / "c.db")
+    monkeypatch.setattr(run_cycle, "load_env_file", lambda _path: None)
+    monkeypatch.delenv("CRYPTO_MAX_DATA_AGE_MINUTES", raising=False)
+    monkeypatch.delenv("CRYPTO_PAPER_TRADE_PAIRS", raising=False)
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet", "--paper-trade", "baseline:coin_flip=BTC-USD"]
+    )
+
+    assert result == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    paper_event = next(entry for entry in entries if entry["event"] == "paper_trade_completed")
+    assert paper_event["attempts"] == [
+        {
+            "predictor": "baseline:coin_flip",
+            "instrument": "BTC-USD",
+            "traded": False,  # coin_flip's 0.5 sits exactly at the flat threshold
+            "side": None,
+            "equity": 10_000.0,
+            "skipped_reason": None,
+        }
+    ]
+
+
+def test_paper_trade_malformed_entry_is_ignored_not_fatal(monkeypatch, tmp_path: Path, capsys) -> None:
+    journal = tmp_path / "cycle.jsonl"
+    monkeypatch.setattr(run_cycle, "collect", _fake_price_collect)
+    monkeypatch.setattr(run_cycle, "CYCLE_LOG_PATH", journal)
+    monkeypatch.setattr(run_cycle, "default_database_path", lambda: tmp_path / "c.db")
+    monkeypatch.setattr(run_cycle, "load_env_file", lambda _path: None)
+    monkeypatch.delenv("CRYPTO_MAX_DATA_AGE_MINUTES", raising=False)
+    monkeypatch.delenv("CRYPTO_PAPER_TRADE_PAIRS", raising=False)
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet", "--paper-trade", "not-a-valid-pair"]
+    )
+
+    assert result == 0  # a malformed config entry must never take down the whole cycle
+    assert "Ignoring malformed" in capsys.readouterr().err
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert not any(entry["event"] == "paper_trade_completed" for entry in entries)

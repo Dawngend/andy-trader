@@ -16,8 +16,9 @@ from andy_trader.portfolio import (
     fetch_recent_trades,
     get_or_create_state,
     initialize_portfolio,
-    mark_to_market,
     main,
+    mark_to_market,
+    paper_trade_once,
     run_paper_cycle,
 )
 from andy_trader.store import Candle, Prediction, connect, record_observations, record_prediction
@@ -352,3 +353,73 @@ def test_cli_refuses_a_stale_prediction(tmp_path: Path, capsys: pytest.CaptureFi
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_trades'"
         ).fetchall()
         assert tables == []
+
+
+def test_paper_trade_once_refuses_when_no_prediction_exists(tmp_path: Path) -> None:
+    database = tmp_path / "paper.db"
+    with connect(database) as connection:
+        attempt = paper_trade_once(connection, predictor="baseline:test", instrument="BTC-USD")
+    assert attempt.trade is None
+    assert attempt.equity is None
+    assert "no 1h predictions found" in attempt.skipped_reason
+
+
+def test_paper_trade_once_trades_a_fresh_prediction(tmp_path: Path) -> None:
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    bar_time = (now - timedelta(minutes=5)).isoformat()
+    call_time = (now - timedelta(minutes=1)).isoformat()
+    with connect(database) as connection:
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument="BTC-USD", venue="bybit", interval="1h", open_time=bar_time,
+                    open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0,
+                )
+            ],
+        )
+        record_prediction(
+            connection,
+            Prediction(
+                predictor="baseline:test", instrument="BTC-USD", horizon="1h",
+                probability_up=0.9, reference_price=100.0,
+                created_at=call_time, resolves_at=(now + timedelta(minutes=59)).isoformat(),
+            ),
+        )
+        attempt = paper_trade_once(connection, predictor="baseline:test", instrument="BTC-USD", now=now)
+
+    assert attempt.skipped_reason is None
+    assert attempt.trade is not None
+    assert attempt.trade.side == "long"
+    assert attempt.equity is not None
+
+
+def test_paper_trade_once_reuses_the_same_staleness_rule_the_cli_uses(tmp_path: Path) -> None:
+    """The whole point of extracting paper_trade_once: one refusal rule, not two."""
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    with connect(database) as connection:
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument="BTC-USD", venue="bybit", interval="1h",
+                    open_time=(now - timedelta(minutes=5)).isoformat(),
+                    open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0,
+                )
+            ],
+        )
+        record_prediction(
+            connection,
+            Prediction(
+                predictor="baseline:test", instrument="BTC-USD", horizon="1h",
+                probability_up=0.9, reference_price=100.0,
+                created_at=(now - timedelta(minutes=21)).isoformat(),  # > 20m default limit
+                resolves_at=(now + timedelta(minutes=39)).isoformat(),
+            ),
+        )
+        attempt = paper_trade_once(connection, predictor="baseline:test", instrument="BTC-USD", now=now)
+
+    assert attempt.trade is None
+    assert "refusing to trade a stale decision" in attempt.skipped_reason

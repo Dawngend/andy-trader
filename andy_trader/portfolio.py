@@ -484,14 +484,125 @@ def fetch_recent_trades(
     return [dict(row) for row in rows]
 
 
+@dataclass(frozen=True)
+class PaperTradeAttempt:
+    """Outcome of one staleness-checked attempt to paper-trade a live prediction.
+
+    `skipped_reason` is set (and `trade`/`equity` are None) whenever the
+    attempt refused to trade rather than trade on a stale decision or a stale
+    price -- this is the one function both the manual CLI and the unattended
+    cycle share, so that refusal logic can never drift between the two.
+    """
+
+    predictor: str
+    instrument: str
+    horizon: str
+    price: float | None
+    price_at: str | None
+    prediction_created_at: str | None
+    executed_at: str
+    trade: Trade | None
+    equity: float | None
+    skipped_reason: str | None = None
+
+
+def paper_trade_once(
+    connection: sqlite3.Connection,
+    *,
+    predictor: str,
+    instrument: str,
+    interval: str = "1h",
+    horizon: str = "1h",
+    now: datetime | None = None,
+    max_prediction_age_minutes: float = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
+    max_data_age_minutes: float | None = None,
+) -> PaperTradeAttempt:
+    """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
+
+    Refuses (returns a `skipped_reason`, never raises) rather than trade on a
+    stale prediction or a stale price -- exactly the scenario the 2026-09-05
+    outage created, where reference data was hours old during a certificate
+    failure. A refusal here is not an error; it is the correct behavior.
+    """
+
+    from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes
+
+    now = now or datetime.now(UTC)
+    now_iso = now.isoformat()
+    max_data_age_minutes = (
+        max_data_age_minutes if max_data_age_minutes is not None else DEFAULT_MAX_DATA_AGE_MINUTES
+    )
+
+    row = connection.execute(
+        """
+        SELECT probability_up, reference_price, created_at FROM crypto_predictions
+        WHERE predictor = ? AND instrument = ? AND horizon = ?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (predictor, instrument, horizon),
+    ).fetchone()
+    if row is None:
+        return PaperTradeAttempt(
+            predictor=predictor, instrument=instrument, horizon=horizon,
+            price=None, price_at=None, prediction_created_at=None, executed_at=now_iso,
+            trade=None, equity=None,
+            skipped_reason=f"no {horizon} predictions found for predictor={predictor!r} instrument={instrument!r}",
+        )
+
+    closes = load_closes(connection, instrument, interval=interval, limit=1)
+    if not closes:
+        return PaperTradeAttempt(
+            predictor=predictor, instrument=instrument, horizon=horizon,
+            price=None, price_at=None, prediction_created_at=row["created_at"], executed_at=now_iso,
+            trade=None, equity=None,
+            skipped_reason=f"no live price available for {instrument}",
+        )
+    latest_time, latest_price = closes[-1]
+
+    prediction_age_minutes = (now - datetime.fromisoformat(row["created_at"])).total_seconds() / 60.0
+    data_age_minutes = (now - datetime.fromisoformat(latest_time)).total_seconds() / 60.0
+
+    if prediction_age_minutes > max_prediction_age_minutes:
+        return PaperTradeAttempt(
+            predictor=predictor, instrument=instrument, horizon=horizon,
+            price=latest_price, price_at=latest_time, prediction_created_at=row["created_at"], executed_at=now_iso,
+            trade=None, equity=None,
+            skipped_reason=(
+                f"latest {horizon} prediction is {prediction_age_minutes:.1f}m old; "
+                f"refusing to trade a stale decision"
+            ),
+        )
+    if data_age_minutes > max_data_age_minutes:
+        return PaperTradeAttempt(
+            predictor=predictor, instrument=instrument, horizon=horizon,
+            price=latest_price, price_at=latest_time, prediction_created_at=row["created_at"], executed_at=now_iso,
+            trade=None, equity=None,
+            skipped_reason=(
+                f"latest {interval} close is {data_age_minutes:.1f}m old; limit is {max_data_age_minutes:.1f}m"
+            ),
+        )
+
+    trade, equity = run_paper_cycle(
+        connection,
+        predictor=predictor,
+        instrument=instrument,
+        probability_up=float(row["probability_up"]),
+        price=latest_price,
+        now_iso=now_iso,
+    )
+    return PaperTradeAttempt(
+        predictor=predictor, instrument=instrument, horizon=horizon,
+        price=latest_price, price_at=latest_time, prediction_created_at=row["created_at"], executed_at=now_iso,
+        trade=trade, equity=equity,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     import json
-    import os
     from pathlib import Path
 
     from andy_trader.env import REPO_ROOT, load_env_file
-    from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes
     from andy_trader.store import connect, default_database_path
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -507,66 +618,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     db_path = Path(args.database) if args.database else default_database_path()
 
     with connect(db_path) as connection:
-        row = connection.execute(
-            """
-            SELECT probability_up, reference_price, created_at FROM crypto_predictions
-            WHERE predictor = ? AND instrument = ? AND horizon = ?
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (args.predictor, args.instrument, args.horizon),
-        ).fetchone()
-        if row is None:
-            print(
-                f"No {args.horizon} predictions found for predictor={args.predictor!r} "
-                f"instrument={args.instrument!r}"
-            )
-            return 1
-
-        closes = load_closes(connection, args.instrument, interval=args.interval, limit=1)
-        if not closes:
-            print(f"No live price available for {args.instrument}")
-            return 1
-        latest_time, latest_price = closes[-1]
-        now = datetime.now(UTC)
-        prediction_age_minutes = (
-            now - datetime.fromisoformat(row["created_at"])
-        ).total_seconds() / 60.0
-        data_age_minutes = (
-            now - datetime.fromisoformat(latest_time)
-        ).total_seconds() / 60.0
-        if prediction_age_minutes > DEFAULT_MAX_PREDICTION_AGE_MINUTES:
-            print(
-                f"Latest {args.horizon} prediction is {prediction_age_minutes:.1f}m old; "
-                f"refusing to trade a stale decision"
-            )
-            return 1
-        maximum_data_age_minutes = float(
-            os.environ.get("CRYPTO_MAX_DATA_AGE_MINUTES", str(DEFAULT_MAX_DATA_AGE_MINUTES))
-        )
-        if data_age_minutes > maximum_data_age_minutes:
-            print(
-                f"Latest {args.interval} close is {data_age_minutes:.1f}m old; "
-                f"limit is {maximum_data_age_minutes:.1f}m"
-            )
-            return 1
-        now_iso = now.isoformat()
-
-        trade, equity = run_paper_cycle(
+        attempt = paper_trade_once(
             connection,
             predictor=args.predictor,
             instrument=args.instrument,
-            probability_up=float(row["probability_up"]),
-            price=latest_price,
-            now_iso=now_iso,
+            interval=args.interval,
+            horizon=args.horizon,
         )
+        if attempt.skipped_reason:
+            print(attempt.skipped_reason)
+            return 1
+
+        trade, equity = attempt.trade, attempt.equity
         result = {
             "predictor": args.predictor,
             "instrument": args.instrument,
             "horizon": args.horizon,
-            "price": latest_price,
-            "price_at": latest_time,
-            "prediction_created_at": row["created_at"],
-            "executed_at": now_iso,
+            "price": attempt.price,
+            "price_at": attempt.price_at,
+            "prediction_created_at": attempt.prediction_created_at,
+            "executed_at": attempt.executed_at,
             "traded": trade is not None,
             "trade": trade.__dict__ if trade else None,
             "equity": equity,

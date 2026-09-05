@@ -22,6 +22,7 @@ from typing import Sequence
 
 from andy_trader.collector import _http_json, _settings_from_env, collect
 from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.portfolio import paper_trade_once
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, predict_once
 from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
@@ -67,6 +68,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--skip-signals", action="store_true",
         help="Prices only. Signals move slowly, so skipping them on a fast cadence is fine.",
     )
+    parser.add_argument(
+        "--paper-trade",
+        help=(
+            "Comma-separated predictor=instrument pairs to paper-trade this cycle, e.g. "
+            "'baseline:momentum=BTC-USD,baseline:momentum=ETH-USD'. Opt-in only -- nothing "
+            "paper-trades unless explicitly listed here or in CRYPTO_PAPER_TRADE_PAIRS."
+        ),
+    )
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
@@ -78,6 +87,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     maximum_data_age_minutes = float(
         os.environ.get("CRYPTO_MAX_DATA_AGE_MINUTES", str(DEFAULT_MAX_DATA_AGE_MINUTES))
     )
+    paper_trade_spec = args.paper_trade or os.environ.get("CRYPTO_PAPER_TRADE_PAIRS", "")
+    paper_trade_pairs: list[tuple[str, str]] = []
+    for chunk in paper_trade_spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            print(f"Ignoring malformed --paper-trade entry (expected predictor=instrument): {chunk!r}", file=sys.stderr)
+            continue
+        predictor_name, _, instrument_name = chunk.partition("=")
+        paper_trade_pairs.append((predictor_name.strip(), instrument_name.strip()))
 
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     _journal(
@@ -139,6 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         _journal("signals_collected", signals=len(signals), problems=len(signal_problems))
 
+        paper_trade_results: list[dict[str, object]] = []
         with connect(default_database_path()) as connection:
             inserted, seen = record_observations(connection, candles)
             if signals:
@@ -151,6 +172,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 maximum_data_age_minutes=maximum_data_age_minutes,
             )
             settled = settle_due_predictions(connection, interval=reference_interval)
+
+            # Opt-in only: nothing paper-trades unless a pair was explicitly
+            # configured. A prediction/price freshness check happens inside
+            # paper_trade_once itself, same rule the manual CLI uses -- one
+            # refusal rule, not a second copy that could quietly drift.
+            for predictor_name, instrument_name in paper_trade_pairs:
+                attempt = paper_trade_once(
+                    connection,
+                    predictor=predictor_name,
+                    instrument=instrument_name,
+                    interval=reference_interval,
+                    horizon=reference_interval,
+                    max_data_age_minutes=maximum_data_age_minutes,
+                )
+                paper_trade_results.append(
+                    {
+                        "predictor": predictor_name,
+                        "instrument": instrument_name,
+                        "traded": attempt.trade is not None,
+                        "side": attempt.trade.side if attempt.trade else None,
+                        "equity": attempt.equity,
+                        "skipped_reason": attempt.skipped_reason,
+                    }
+                )
+        if paper_trade_pairs:
+            _journal("paper_trade_completed", attempts=paper_trade_results)
         _journal(
             "store_updated",
             observed=seen,
@@ -180,6 +227,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  degraded: {what} {problem.get('instrument', '-')} "
             f"{where}: {problem['reason'][:120]}".replace("  ", " ")
         )
+    for attempt in paper_trade_results:
+        if attempt["skipped_reason"]:
+            print(f"  paper: {attempt['predictor']} {attempt['instrument']} skipped: {attempt['skipped_reason']}")
+        elif attempt["traded"]:
+            print(
+                f"  paper: {attempt['predictor']} {attempt['instrument']} -> {attempt['side']} "
+                f"(equity={attempt['equity']:.2f})"
+            )
     _journal("cycle_completed", degraded=len(problems))
     return 0
 
