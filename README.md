@@ -258,7 +258,10 @@ all 16 Bybit requests failed, CoinGecko recovered seven of eight instruments,
 Calls created earlier during the outage include 230 references older than 90
 minutes. Those rows remain immutable audit evidence, but the scorer's quality
 gate excludes and reports them rather than pretending they were honest 1h/4h
-forecasts. Future live and paper decisions also abstain on stale input.
+forecasts. Future live and paper decisions also abstain on stale input. Each
+network request is capped at one eight-second attempt because the next
+15-minute scheduled pass is the retry; this bounds a fully hung cycle below its
+cadence instead of compounding retries inside retries.
 
 ## Honest expectations
 

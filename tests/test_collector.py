@@ -17,6 +17,12 @@ from andy_trader.collector import (
 SETTINGS = FetchSettings(retries=1, backoff_seconds=0, rate_limit_seconds=0)
 
 
+def test_default_fetch_budget_cannot_retry_a_hung_request_inside_one_pass() -> None:
+    settings = FetchSettings()
+    assert settings.retries == 1
+    assert settings.timeout_seconds <= 8.0
+
+
 def _http(payload):
     return lambda _url, _settings: payload
 
@@ -37,7 +43,7 @@ def test_tls_verification_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch
             sleeper=sleeps.append,
         )
 
-    assert attempts == [20.0]
+    assert attempts == [8.0]
     assert sleeps == []
 
 

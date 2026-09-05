@@ -95,8 +95,8 @@ class CollectorError(RuntimeError):
 
 @dataclass(frozen=True)
 class FetchSettings:
-    timeout_seconds: float = 20.0
-    retries: int = 3
+    timeout_seconds: float = 8.0
+    retries: int = 1
     backoff_seconds: float = 1.0
     rate_limit_seconds: float = 1.0
 
