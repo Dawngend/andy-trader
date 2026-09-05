@@ -28,7 +28,7 @@ import sys
 from typing import Sequence
 
 from andy_trader.env import REPO_ROOT, load_env_file
-from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, score_all
+from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes, score_all
 from andy_trader.store import connect, default_database_path
 
 DEFAULT_PORT = 8787
@@ -217,6 +217,10 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
         latest_equity = curve[-1]["equity"] if curve else float(row["cash"])
         starting_equity = float(row["starting_cash"])
         risk_state = _risk_state(connection, predictor=predictor, instrument=instrument)
+        price_series = [
+            {"time": open_time, "close": close}
+            for open_time, close in load_closes(connection, instrument, interval="1h", limit=200)
+        ]
         summaries.append(
             {
                 "predictor": predictor,
@@ -225,9 +229,14 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
                 "position_qty": float(row["position_qty"]),
                 "avg_entry_price": row["avg_entry_price"],
                 "equity": latest_equity,
+                "starting_equity": starting_equity,
                 "return_pct": (latest_equity / starting_equity - 1.0) * 100.0 if starting_equity else 0.0,
                 "trade_count": len(trades),
                 "equity_curve": [point["equity"] for point in curve[-100:]],
+                "equity_curve_full": [
+                    {"time": point["recorded_at"], "equity": point["equity"]} for point in curve
+                ],
+                "price_series": price_series,
                 "updated_at": row["updated_at"],
                 "risk": risk_state,
             }
@@ -297,12 +306,22 @@ _PAGE = """<!doctype html>
   .pill.rejected { background:#3a1212; color:#f87171; }
   #err { color:#f87171; display:none; margin-bottom:12px; }
   .updated { font-size:11px; color:#5c7080; }
+  .bigchart-card { display:flex; flex-direction:column; gap:6px; }
+  .bigchart-head { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px 20px; }
+  .bigchart-title { font-size:12px; color:#8fa3b0; text-transform:uppercase; letter-spacing:.05em; }
+  .bigchart-value { font-size:26px; font-weight:700; }
+  .bigchart-change { font-size:14px; font-weight:600; }
+  .bigchart-row { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .bigchart-svg-wrap { position:relative; }
+  .bigchart-svg-wrap svg { width:100%; height:auto; display:block; }
+  .bigchart-empty { color:#5c7080; font-size:12px; padding:40px 0; text-align:center; }
 </style>
 </head>
 <body>
   <h1>Andy Trader &mdash; Live Monitor <span class="badge">PAPER &middot; SIMULATED CAPITAL &middot; REAL MARKET</span></h1>
   <div class="sub">Real prices, real predictions, real settlement, simulated cash and positions only &mdash; nothing here ever touches a real exchange account.</div>
   <div id="err"></div>
+  <div id="bigcharts"></div>
   <div class="grid">
     <div class="card" style="grid-column:1/-1;">
       <h2>Paper Portfolios (CT-08)</h2>
@@ -369,12 +388,161 @@ function sparkline(values) {
   return svg;
 }
 
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function bigLineChart(values, opts) {
+  // opts: { referenceValue?, valuePrefix?, valueSuffix? }
+  const w = 640, h = 200, padL = 8, padR = 8, padT = 12, padB = 12;
+  const wrap = document.createElement("div");
+  wrap.className = "bigchart-svg-wrap";
+  if (!values || values.length < 2) {
+    const empty = document.createElement("div");
+    empty.className = "bigchart-empty";
+    empty.textContent = "not enough data points yet";
+    wrap.appendChild(empty);
+    return wrap;
+  }
+  const ref = opts.referenceValue != null ? opts.referenceValue : values[0];
+  const min = Math.min(...values, ref), max = Math.max(...values, ref);
+  const span = (max - min) || Math.abs(ref) * 0.01 || 1;
+  const x = i => padL + (i / (values.length - 1)) * (w - padL - padR);
+  const y = v => padT + (1 - (v - min) / span) * (h - padT - padB);
+  const rising = values[values.length - 1] >= ref;
+  const color = rising ? "#4ade80" : "#f87171";
+
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+
+  const gradId = "grad-" + Math.random().toString(36).slice(2);
+  const defs = document.createElementNS(SVGNS, "defs");
+  const grad = document.createElementNS(SVGNS, "linearGradient");
+  grad.setAttribute("id", gradId);
+  grad.setAttribute("x1", "0"); grad.setAttribute("y1", "0");
+  grad.setAttribute("x2", "0"); grad.setAttribute("y2", "1");
+  const stop1 = document.createElementNS(SVGNS, "stop");
+  stop1.setAttribute("offset", "0%"); stop1.setAttribute("stop-color", color); stop1.setAttribute("stop-opacity", "0.35");
+  const stop2 = document.createElementNS(SVGNS, "stop");
+  stop2.setAttribute("offset", "100%"); stop2.setAttribute("stop-color", color); stop2.setAttribute("stop-opacity", "0");
+  grad.appendChild(stop1); grad.appendChild(stop2);
+  defs.appendChild(grad);
+  svg.appendChild(defs);
+
+  // Reference line (starting equity, or the window's opening price).
+  const refLine = document.createElementNS(SVGNS, "line");
+  refLine.setAttribute("x1", padL); refLine.setAttribute("x2", w - padR);
+  refLine.setAttribute("y1", y(ref)); refLine.setAttribute("y2", y(ref));
+  refLine.setAttribute("stroke", "#3a4756"); refLine.setAttribute("stroke-dasharray", "4,4");
+  svg.appendChild(refLine);
+
+  const linePoints = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const areaPoints = `${padL.toFixed(1)},${(h - padB).toFixed(1)} ` + linePoints +
+    ` ${x(values.length - 1).toFixed(1)},${(h - padB).toFixed(1)}`;
+
+  const area = document.createElementNS(SVGNS, "polygon");
+  area.setAttribute("points", areaPoints);
+  area.setAttribute("fill", `url(#${gradId})`);
+  svg.appendChild(area);
+
+  const poly = document.createElementNS(SVGNS, "polyline");
+  poly.setAttribute("points", linePoints);
+  poly.setAttribute("fill", "none");
+  poly.setAttribute("stroke", color);
+  poly.setAttribute("stroke-width", "2");
+  poly.setAttribute("stroke-linejoin", "round");
+  svg.appendChild(poly);
+
+  // A dot on the last point makes "where are we right now" unambiguous.
+  const dot = document.createElementNS(SVGNS, "circle");
+  dot.setAttribute("cx", x(values.length - 1)); dot.setAttribute("cy", y(values[values.length - 1]));
+  dot.setAttribute("r", "3.5"); dot.setAttribute("fill", color);
+  svg.appendChild(dot);
+
+  const maxLabel = document.createElementNS(SVGNS, "text");
+  maxLabel.setAttribute("x", padL); maxLabel.setAttribute("y", padT + 4);
+  maxLabel.setAttribute("fill", "#5c7080"); maxLabel.setAttribute("font-size", "10");
+  maxLabel.textContent = (opts.valuePrefix || "") + max.toFixed(2) + (opts.valueSuffix || "");
+  svg.appendChild(maxLabel);
+
+  const minLabel = document.createElementNS(SVGNS, "text");
+  minLabel.setAttribute("x", padL); minLabel.setAttribute("y", h - 2);
+  minLabel.setAttribute("fill", "#5c7080"); minLabel.setAttribute("font-size", "10");
+  minLabel.textContent = (opts.valuePrefix || "") + min.toFixed(2) + (opts.valueSuffix || "");
+  svg.appendChild(minLabel);
+
+  wrap.appendChild(svg);
+  return wrap;
+}
+
+function bigChartCard(title, values, opts) {
+  const card = document.createElement("div");
+  card.className = "card bigchart-card";
+  const head = document.createElement("div");
+  head.className = "bigchart-head";
+  const titleEl = document.createElement("div");
+  titleEl.className = "bigchart-title";
+  titleEl.textContent = title;
+  head.appendChild(titleEl);
+
+  if (values && values.length >= 2) {
+    const ref = opts.referenceValue != null ? opts.referenceValue : values[0];
+    const current = values[values.length - 1];
+    const changePct = ref ? ((current / ref - 1) * 100) : 0;
+    const valueEl = document.createElement("div");
+    valueEl.className = "bigchart-value";
+    valueEl.textContent = (opts.valuePrefix || "") + current.toFixed(2) + (opts.valueSuffix || "");
+    valueEl.style.color = changePct >= 0 ? "#4ade80" : "#f87171";
+    const changeEl = document.createElement("span");
+    changeEl.className = "bigchart-change";
+    changeEl.style.color = changePct >= 0 ? "#4ade80" : "#f87171";
+    changeEl.textContent = (changePct >= 0 ? "+" : "") + changePct.toFixed(2) + "% " + (changePct >= 0 ? "▲" : "▼");
+    valueEl.appendChild(document.createTextNode(" "));
+    valueEl.appendChild(changeEl);
+    head.appendChild(valueEl);
+  }
+  card.appendChild(head);
+  card.appendChild(bigLineChart(values, opts));
+  return card;
+}
+
+function renderBigCharts(portfolios) {
+  const container = document.getElementById("bigcharts");
+  container.innerHTML = "";
+  portfolios.forEach(p => {
+    const row = document.createElement("div");
+    row.className = "bigchart-row";
+    row.style.marginBottom = "20px";
+
+    const equityValues = (p.equity_curve_full || []).map(pt => pt.equity);
+    row.appendChild(
+      bigChartCard(
+        `Equity — ${p.predictor} on ${p.instrument} (PAPER)`,
+        equityValues,
+        { referenceValue: p.starting_equity, valuePrefix: "$" }
+      )
+    );
+
+    const priceValues = (p.price_series || []).map(pt => pt.close);
+    row.appendChild(
+      bigChartCard(
+        `${p.instrument} Price (real market)`,
+        priceValues,
+        { valuePrefix: "$" }
+      )
+    );
+
+    container.appendChild(row);
+  });
+}
+
 async function refresh() {
   try {
     const res = await fetch("/api/state", {cache: "no-store"});
     if (!res.ok) throw new Error("HTTP " + res.status);
     const s = await res.json();
     document.getElementById("err").style.display = "none";
+
+    renderBigCharts(s.portfolios);
 
     const pfBody = document.querySelector("#portfolios tbody");
     pfBody.innerHTML = "";
