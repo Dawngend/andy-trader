@@ -194,6 +194,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "side": attempt.trade.side if attempt.trade else None,
                         "equity": attempt.equity,
                         "skipped_reason": attempt.skipped_reason,
+                        # Distinguishes a risk-caused non-event from the
+                        # predictor simply deciding not to trade -- before
+                        # this, both looked identical in this exact journal.
+                        "risk_allowed": attempt.risk_allowed,
+                        "risk_reason": attempt.risk_reason,
+                        "forced_exit": attempt.forced_exit,
                     }
                 )
         if paper_trade_pairs:
@@ -228,13 +234,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{where}: {problem['reason'][:120]}".replace("  ", " ")
         )
     for attempt in paper_trade_results:
+        label = f"{attempt['predictor']} {attempt['instrument']}"
         if attempt["skipped_reason"]:
-            print(f"  paper: {attempt['predictor']} {attempt['instrument']} skipped: {attempt['skipped_reason']}")
+            print(f"  paper: {label} skipped: {attempt['skipped_reason']}")
+        elif attempt["forced_exit"]:
+            print(f"  paper: {label} RISK INTERLOCK forced exit: {attempt['risk_reason']}")
+        elif not attempt["risk_allowed"]:
+            print(f"  paper: {label} risk-blocked: {attempt['risk_reason']}")
         elif attempt["traded"]:
-            print(
-                f"  paper: {attempt['predictor']} {attempt['instrument']} -> {attempt['side']} "
-                f"(equity={attempt['equity']:.2f})"
-            )
+            print(f"  paper: {label} -> {attempt['side']} (equity={attempt['equity']:.2f})")
     _journal("cycle_completed", degraded=len(problems))
     return 0
 

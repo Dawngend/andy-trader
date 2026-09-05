@@ -366,6 +366,20 @@ def mark_to_market(
     return equity
 
 
+@dataclass(frozen=True)
+class PaperCycleResult:
+    """Everything a caller needs to tell a risk-caused non-event apart from an
+    ordinary one. Before this existed, a risk-blocked entry and a predictor
+    simply deciding to stay flat looked identical -- both were `trade is None`
+    with no further explanation anywhere in the journal."""
+
+    trade: Trade | None
+    equity: float
+    risk_allowed: bool
+    risk_reason: str
+    forced_exit: bool
+
+
 def run_paper_cycle(
     connection: sqlite3.Connection,
     *,
@@ -377,13 +391,26 @@ def run_paper_cycle(
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float = DEFAULT_STARTING_CASH,
-) -> tuple[Trade | None, float]:
-    """One full cycle: decide, check the risk interlock, trade if allowed, mark to market.
+) -> PaperCycleResult:
+    """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
-    Returns (trade, equity). The risk gate (CT-10) only ever blocks the *trade*
-    -- equity is always marked to market honestly, whether or not a trade was
-    allowed to happen, and a kill-switch trip or throttle is recorded in its
-    own audit table (`risk_events`), not silently swallowed here.
+    The risk gate is evaluated every single cycle, not only when opening a
+    new position -- a position that is already open and simply being held
+    still needs to be able to trip the kill switch. This was a real bug,
+    found by an independent review after the initial CT-10 build: a losing
+    long position that never triggered a hysteresis exit could lose value
+    forever without the interlock ever once looking at it.
+
+    Once tripped, the interlock does not merely block new entries -- it
+    actively forces an existing long position closed. A kill switch that
+    only stops things from getting worse, while leaving the existing damage
+    to sit there until the predictor's own logic happens to exit on its own,
+    is not much of a kill switch.
+
+    Exiting from an *unforced*, ordinary hysteresis-driven decision is never
+    blocked by risk regardless of the interlock's verdict -- reducing risk is
+    always allowed. The interlock's only powers are: block a new entry, or
+    force an existing position flat. It can never trap capital in a position.
     """
 
     from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
@@ -396,39 +423,49 @@ def run_paper_cycle(
         now_iso=now_iso,
     )
     current_side: Side = "long" if current_state.position_qty > 0 else "flat"
-    target = decide_side(probability_up, current_side=current_side)
-    reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
+
+    # Mark-to-market at the live price, computed now rather than read from
+    # history, so the interlock reacts to what this cycle's price is doing to
+    # the position it is currently holding -- not to last cycle's number.
+    live_equity = current_state.cash + current_state.position_qty * price
+
+    decision = check_and_enforce(
+        connection,
+        predictor=predictor,
+        instrument=instrument,
+        starting_cash=current_state.starting_cash,
+        now_iso=now_iso,
+        current_equity=live_equity,
+    )
+
+    desired = decide_side(probability_up, current_side=current_side)
+    forced_exit = False
+
+    if not decision.allowed and current_side == "long":
+        target: Side = "flat"
+        forced_exit = True
+        reason = f"RISK INTERLOCK forced exit: {decision.reason}"
+    elif not decision.allowed and desired == "long" and current_side == "flat":
+        target = "flat"
+        reason = f"probability_up={probability_up:.4f}; risk-blocked entry: {decision.reason}"
+    else:
+        target = desired
+        reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
 
     trade: Trade | None = None
-    entering_new_risk = target == "long" and current_side == "flat"
     if target != current_side:
-        # The gate only ever applies to *entering* a position -- taking on new
-        # risk. Exiting to flat always reduces risk, so it is never blocked:
-        # a risk interlock that can trap you in a losing position by refusing
-        # to let you close it would be worse than having none at all.
-        allowed = True
-        if entering_new_risk:
-            decision = check_and_enforce(
-                connection,
-                predictor=predictor,
-                instrument=instrument,
-                starting_cash=current_state.starting_cash,
-                now_iso=now_iso,
-            )
-            allowed = decision.allowed
-        if allowed:
-            trade = execute_paper_trade(
-                connection,
-                predictor=predictor,
-                instrument=instrument,
-                target_side=target,
-                price=price,
-                now_iso=now_iso,
-                reason=reason,
-                fee_bps=fee_bps,
-                slippage_bps=slippage_bps,
-                starting_cash=starting_cash,
-            )
+        trade = execute_paper_trade(
+            connection,
+            predictor=predictor,
+            instrument=instrument,
+            target_side=target,
+            price=price,
+            now_iso=now_iso,
+            reason=reason,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            starting_cash=starting_cash,
+        )
 
     equity = mark_to_market(
         connection,
@@ -438,7 +475,13 @@ def run_paper_cycle(
         now_iso=now_iso,
         starting_cash=starting_cash,
     )
-    return trade, equity
+    return PaperCycleResult(
+        trade=trade,
+        equity=equity,
+        risk_allowed=decision.allowed,
+        risk_reason=decision.reason,
+        forced_exit=forced_exit,
+    )
 
 
 def fetch_equity_curve(
@@ -504,6 +547,9 @@ class PaperTradeAttempt:
     trade: Trade | None
     equity: float | None
     skipped_reason: str | None = None
+    risk_allowed: bool = True
+    risk_reason: str | None = None
+    forced_exit: bool = False
 
 
 def paper_trade_once(
@@ -582,7 +628,7 @@ def paper_trade_once(
             ),
         )
 
-    trade, equity = run_paper_cycle(
+    result = run_paper_cycle(
         connection,
         predictor=predictor,
         instrument=instrument,
@@ -593,7 +639,8 @@ def paper_trade_once(
     return PaperTradeAttempt(
         predictor=predictor, instrument=instrument, horizon=horizon,
         price=latest_price, price_at=latest_time, prediction_created_at=row["created_at"], executed_at=now_iso,
-        trade=trade, equity=equity,
+        trade=result.trade, equity=result.equity,
+        risk_allowed=result.risk_allowed, risk_reason=result.risk_reason, forced_exit=result.forced_exit,
     )
 
 

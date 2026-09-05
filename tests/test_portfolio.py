@@ -154,7 +154,7 @@ def test_mark_to_market_records_equity_curve_point() -> None:
 
 def test_run_paper_cycle_opens_on_high_confidence_and_marks_to_market() -> None:
     connection = _conn()
-    trade, equity = run_paper_cycle(
+    result = run_paper_cycle(
         connection,
         predictor="p",
         instrument="BTC-USD",
@@ -162,14 +162,16 @@ def test_run_paper_cycle_opens_on_high_confidence_and_marks_to_market() -> None:
         price=100.0,
         now_iso="2026-09-05T00:00:00+00:00",
     )
-    assert trade is not None
-    assert trade.side == "long"
-    assert equity == pytest.approx(trade.qty * 100.0)
+    assert result.trade is not None
+    assert result.trade.side == "long"
+    assert result.equity == pytest.approx(result.trade.qty * 100.0)
+    assert result.risk_allowed is True
+    assert result.forced_exit is False
 
 
 def test_run_paper_cycle_stays_flat_below_threshold() -> None:
     connection = _conn()
-    trade, equity = run_paper_cycle(
+    result = run_paper_cycle(
         connection,
         predictor="p",
         instrument="BTC-USD",
@@ -177,8 +179,8 @@ def test_run_paper_cycle_stays_flat_below_threshold() -> None:
         price=100.0,
         now_iso="2026-09-05T00:00:00+00:00",
     )
-    assert trade is None
-    assert equity == pytest.approx(10_000.0)
+    assert result.trade is None
+    assert result.equity == pytest.approx(10_000.0)
 
 
 def test_cannot_trade_at_nonpositive_price() -> None:

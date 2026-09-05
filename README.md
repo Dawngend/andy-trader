@@ -131,10 +131,12 @@ columns filled in. Any other update to that table is a bug.
 | CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
 | Positioning and sentiment predictors | evaluated, none beat the base rate |
 | CT-07 walk-forward retraining and promotion gate | built; first candidate rejected |
-| CT-08 paper portfolio | built, long-or-flat and simulated only; manual opt-in |
+| CT-08 paper portfolio | built, long-or-flat and simulated only |
 | CT-09 local dashboard | built, read-only on `127.0.0.1:8787` |
+| CT-10 risk interlock | built; evaluated every cycle, not only on entry |
+| Unattended paper trading | enabled on the scheduled task: `baseline:momentum` on BTC-USD |
 
-186 tests. `python -m pytest tests/ -q`.
+204 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 

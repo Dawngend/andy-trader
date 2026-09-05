@@ -186,6 +186,7 @@ def check_and_enforce(
     instrument: str,
     starting_cash: float,
     now_iso: str,
+    current_equity: float | None = None,
     limits: RiskLimits = RiskLimits(),
 ) -> RiskDecision:
     """The gate a trade must pass before it is allowed to execute.
@@ -193,6 +194,14 @@ def check_and_enforce(
     Never blocks marking to market or observing -- only ever blocks the
     *trade* action. A predictor that is not allowed to trade right now still
     gets its equity tracked honestly.
+
+    `current_equity`, when given, is this cycle's mark-to-market value at the
+    live price, computed by the caller before any trade decision. Without it,
+    this function can only see the *last recorded* equity point, which is
+    always one full cycle stale relative to the price a decision is about to
+    be made against -- a sudden collapse within a single cycle would stay
+    invisible until the cycle after it happened. Passing the live number is
+    what lets the interlock react to the same price it is about to trade at.
     """
 
     initialize_risk(connection)
@@ -211,11 +220,12 @@ def check_and_enforce(
         (predictor, instrument),
     ).fetchall()
 
-    if not curve:
+    if not curve and current_equity is None:
         return RiskDecision(allowed=True, reason="no equity history yet; nothing to enforce against")
 
-    latest_equity = float(curve[-1]["equity"])
-    peak_equity = max(float(row["equity"]) for row in curve)
+    latest_equity = current_equity if current_equity is not None else float(curve[-1]["equity"])
+    historical_peak = max((float(row["equity"]) for row in curve), default=latest_equity)
+    peak_equity = max(historical_peak, latest_equity)
     day_start = _day_start_iso(now_iso)
     todays_points = [row for row in curve if row["recorded_at"] >= day_start]
     day_open_equity = float(todays_points[0]["equity"]) if todays_points else latest_equity

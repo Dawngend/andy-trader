@@ -231,3 +231,95 @@ def test_limits_are_configurable_per_call() -> None:
         limits=RiskLimits(max_daily_loss_pct=1.0),
     )
     assert not strict_decision.allowed
+
+
+def test_holding_a_losing_long_now_trips_and_forces_an_exit() -> None:
+    """CT-10 gap found by an independent review of the initial build: risk was
+    only ever evaluated when *opening* a position, so a position that stayed
+    long could lose value forever without the interlock ever once looking at
+    it. Fixed by evaluating check_and_enforce every cycle and having a trip
+    actively force the position flat, not merely block new entries."""
+    from andy_trader.portfolio import get_or_create_state, run_paper_cycle
+
+    connection = _conn()
+    # Open through the real path (not a direct execute_paper_trade call) so
+    # mark_to_market actually seeds the equity curve, exactly as a real
+    # scheduled cycle would -- a position opened this way always has at
+    # least one recorded equity point before the next cycle evaluates it.
+    opening = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.9,
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+    assert opening.trade is not None and opening.trade.side == "long"
+
+    # Price collapses 60% -- past the 40% permanent-halt threshold -- while the
+    # predictor still says "stay long" (0.9 confidence). Before the fix this
+    # never even called check_and_enforce because target == current_side.
+    result = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.9,
+        price=40.0, now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert result.trade is not None, "the kill switch must force the position closed, not just block new entries"
+    assert result.trade.side == "flat"
+    assert result.forced_exit is True
+    assert result.risk_allowed is False
+    assert "RISK INTERLOCK forced exit" in result.trade.reason
+
+    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert state["tripped"] == 1
+    assert state["severity"] == "hard"
+
+    # The position is genuinely flat now -- holding it could never resume
+    # silently bleeding further, which was the whole point of the fix.
+    post_state = get_or_create_state(
+        connection, predictor="p", instrument="BTC-USD", now_iso="2026-09-05T01:00:00+00:00"
+    )
+    assert post_state.position_qty == 0.0
+
+
+def test_ordinary_hysteresis_exit_is_never_mislabeled_as_a_forced_exit() -> None:
+    """A predictor exiting on its own (probability dropped, nothing was ever
+    tripped) must not be confused with a risk-forced exit in the trade log."""
+    from andy_trader.portfolio import run_paper_cycle
+
+    connection = _conn()
+    opening = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.9,
+        price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+    assert opening.trade is not None
+    # Small gain, well within every limit -- probability drops to an ordinary exit.
+    result = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.3,
+        price=101.0, now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert result.trade is not None
+    assert result.trade.side == "flat"
+    assert result.forced_exit is False
+    assert result.risk_allowed is True
+    assert "RISK INTERLOCK" not in result.trade.reason
+
+
+def test_blocked_entry_is_distinguishable_from_an_ordinary_no_trade_decision() -> None:
+    """The second half of the same gap: a risk-blocked entry attempt must not
+    look identical to the predictor simply deciding not to trade."""
+    from andy_trader.portfolio import get_or_create_state, run_paper_cycle
+
+    connection = _conn()
+    connection.execute(
+        "INSERT INTO risk_kill_switch (predictor, instrument, tripped, severity, tripped_at, tripped_reason) "
+        "VALUES ('p', 'BTC-USD', 1, 'soft', '2026-09-05T00:00:00+00:00', 'earlier daily loss')"
+    )
+    connection.commit()
+
+    result = run_paper_cycle(
+        connection, predictor="p", instrument="BTC-USD", probability_up=0.9,
+        price=100.0, now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert result.trade is None  # correctly stayed flat -- nothing to force closed
+    assert result.risk_allowed is False
+    assert "earlier daily loss" in result.risk_reason
+    assert result.forced_exit is False  # blocked from entering is not the same as forced out

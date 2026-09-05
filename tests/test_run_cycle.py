@@ -96,6 +96,9 @@ def test_paper_trade_is_opt_in_and_runs_when_explicitly_configured(monkeypatch, 
             "side": None,
             "equity": 10_000.0,
             "skipped_reason": None,
+            "risk_allowed": True,
+            "risk_reason": "within all configured limits",
+            "forced_exit": False,
         }
     ]
 
