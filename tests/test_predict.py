@@ -55,6 +55,32 @@ def test_load_closes_deduplicates_the_same_bar_across_venues(tmp_path: Path) -> 
         assert len(load_closes(connection, "BTC-USD")) == 3
 
 
+def test_load_closes_ignores_legacy_unaligned_coingecko_quotes(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(
+            connection,
+            _series(bars=2)
+            + [
+                Candle(
+                    instrument="BTC-USD",
+                    venue="coingecko",
+                    interval="1h",
+                    open_time="2026-09-01T01:30:00+00:00",
+                    open=None,
+                    high=None,
+                    low=None,
+                    close=999.0,
+                    volume=None,
+                )
+            ],
+        )
+
+        assert load_closes(connection, "BTC-USD") == [
+            ("2026-09-01T00:00:00+00:00", 100.0),
+            ("2026-09-01T01:00:00+00:00", 101.0),
+        ]
+
+
 def test_predict_once_writes_one_call_per_baseline_horizon(tmp_path: Path) -> None:
     with connect(tmp_path / "c.db") as connection:
         record_observations(connection, _series(bars=40))
@@ -101,6 +127,26 @@ def test_predict_once_skips_an_instrument_with_no_history(tmp_path: Path) -> Non
         )
         assert result["written"] == 0
         assert result["skipped"][0]["reason"] == "no non-degraded history"
+
+
+def test_predict_once_abstains_when_the_live_reference_close_is_stale(tmp_path: Path) -> None:
+    """The 2026-09-05 TLS outage must not relabel an old close as a new call."""
+
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series(bars=3))
+        result = predict_once(
+            connection,
+            instruments=("BTC-USD",),
+            horizons=("1h",),
+            baselines=(Baseline("half", lambda _c: 0.5, minimum_history=1),),
+            now_iso="2026-09-01T04:00:00+00:00",
+            maximum_data_age_minutes=90.0,
+        )
+
+        assert result["written"] == 0
+        assert "120.0m old" in result["skipped"][0]["reason"]
+        count = connection.execute("SELECT COUNT(*) AS n FROM crypto_predictions").fetchone()
+        assert count["n"] == 0
 
 
 def test_predict_once_skips_a_baseline_that_lacks_history_but_keeps_the_rest(tmp_path: Path) -> None:
@@ -236,3 +282,38 @@ def test_score_all_respects_the_minimum_sample_size(tmp_path: Path) -> None:
         )
         settle_due_predictions(connection, now_iso="2026-09-02T00:00:00+00:00")
         assert score_all(connection, minimum=50) == {}
+
+
+def test_score_all_excludes_and_surfaces_stale_reference_calls(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        predictor = (Baseline("half", lambda _c: 0.5, minimum_history=1),)
+        record_observations(connection, [_zigzag_bar(0, 100.0)])
+        predict_once(
+            connection,
+            instruments=("BTC-USD",),
+            horizons=("1h",),
+            baselines=predictor,
+            now_iso="2026-09-01T00:00:00+00:00",
+        )
+        predict_once(
+            connection,
+            instruments=("BTC-USD",),
+            horizons=("1h",),
+            baselines=predictor,
+            now_iso="2026-09-01T02:00:00+00:00",
+        )
+        record_observations(
+            connection,
+            [_zigzag_bar(1, 101.0), _zigzag_bar(3, 101.0)],
+        )
+        settle_due_predictions(connection, now_iso="2026-09-01T04:00:00+00:00")
+
+        excluded: dict[str, int] = {}
+        report = score_all(
+            connection,
+            maximum_data_age_minutes=90.0,
+            excluded_stale=excluded,
+        )["baseline:half"]
+
+        assert report.count == 1
+        assert excluded == {"baseline:half": 1}

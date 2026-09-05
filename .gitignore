@@ -8,6 +8,7 @@
 # Output from an unattended collect/predict/settle session. Regenerable, and it
 # is a record of one machine's run rather than part of the project.
 .session-run.log
+.cycle-run.jsonl
 
 # Credentials
 .env

@@ -38,6 +38,11 @@ python -m andy_trader.predict predict
 # wait for a horizon to elapse
 python -m andy_trader.predict settle
 python -m andy_trader.predict score
+
+# Optional research and paper-only monitoring paths
+python -m andy_trader.training --instrument BTC-USD --check-schedule
+python -m andy_trader.portfolio --predictor baseline:momentum --instrument BTC-USD
+python -m andy_trader.dashboard
 ```
 
 No API keys. Every venue is a keyless public endpoint, and nothing here can place an order.
@@ -89,7 +94,7 @@ hard that beating it proves nothing.
 | Venue | open / high / low | close | volume | Notes |
 | --- | --- | --- | --- | --- |
 | `bybit` | yes | yes | yes | Default lead. Only venue giving full bars at both 1h and 4h. USDT-quoted |
-| `coingecko` | **NULL** | yes | yes | Fallback. Never blocked in testing |
+| `coingecko` | **NULL** | yes | yes | 1h fallback. Its request-time quote is folded into the current hourly bucket |
 | `coinbase` | yes | yes | yes | 1h only, no 4h granularity |
 | `kraken` | yes | yes | yes | Registered, out of the default |
 
@@ -104,7 +109,8 @@ about what we could observe, and losing it makes a backtest quietly optimistic l
 
 ## Storage
 
-Two tables, both append-only in spirit.
+The two core audit tables are append-only in spirit. Supporting tables hold
+signals, model-training decisions, and simulated paper-account state.
 
 `crypto_observations` is keyed by a content hash of the bar's values, with `first_seen_at`,
 `last_seen_at` and `times_seen`. Re-fetching an unchanged closed candle bumps the counter. A candle
@@ -124,14 +130,17 @@ columns filled in. Any other update to that table is a bug.
 | CT-04 walk-forward backtest, fees and slippage | done |
 | CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
 | Positioning and sentiment predictors | evaluated, none beat the base rate |
+| CT-07 walk-forward retraining and promotion gate | built; first candidate rejected |
+| CT-08 paper portfolio | built, long-or-flat and simulated only; manual opt-in |
+| CT-09 local dashboard | built, read-only on `127.0.0.1:8787` |
 
-143 tests. `python -m pytest tests/ -q`.
+186 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
-Run on the existing BTC-USD 1h history with a 100-bar minimum expanding window,
+Measured on 2026-09-05 using the existing BTC-USD 1h history with a 100-bar minimum expanding window,
 1h horizon, 10 bps fee and 5 bps slippage on both entry and exit. This produced
-100 genuinely out-of-sample windows. The series uses the same deterministic
+120 genuinely out-of-sample windows. The series uses the same deterministic
 one-row-per-open-time venue selection as live prediction; it does not erase the
 small Bybit USDT/USD basis.
 
@@ -142,19 +151,19 @@ settle before that equity can enter another trade. This prevents four adjacent
 
 | Predictor | Brier skill | Reliability | Gross return | Net return | Trades | Max drawdown |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| EMA crossover 12/26 | -0.0051 | 0.0027 | +0.56% | -25.54% | 100 | 25.54% |
-| Base rate | -0.0088 | 0.0005 | +4.52% | -22.59% | 100 | 22.59% |
-| Coin flip | -0.0101 | 0.0025 | 0.00% | 0.00% | 0 | 0.00% |
-| Momentum | -0.0420 | 0.0152 | +1.25% | -25.02% | 100 | 25.02% |
-| **PyTorch MLP, seed 1729** | **-0.0434** | **0.0218** | **-6.79%** | **-31.00%** | **100** | **31.00%** |
-| Random, seed 1729 | -0.4541 | 0.1227 | -4.38% | -29.21% | 100 | 29.21% |
+| Coin flip | -0.0070 | 0.0017 | 0.00% | 0.00% | 0 | 0.00% |
+| Base rate | -0.0075 | 0.0002 | +2.51% | -28.52% | 120 | 28.52% |
+| EMA crossover 12/26 | -0.0084 | 0.0012 | -1.01% | -30.98% | 120 | 30.98% |
+| Momentum | -0.0349 | 0.0127 | -1.54% | -31.35% | 120 | 31.35% |
+| **PyTorch MLP, seed 1729** | **-0.0354** | **0.0143** | **-4.55%** | **-33.45%** | **120** | **33.45%** |
+| Random, seed 1729 | -0.4553 | 0.1254 | -7.59% | -35.58% | 120 | 35.58% |
 
-The PyTorch candidate lost honestly. Its 0.0218 reliability term and 0.1367
+The PyTorch candidate lost honestly. Its 0.0143 reliability term and 0.1079
 expected calibration error show material miscalibration despite chronological
-temperature scaling; its 38% hit rate is not the headline. It trails the best
-calibration baseline (EMA crossover), the base-rate baseline, and the no-trade
-coin flip after costs. It is therefore available only with `--include-model`
-for continued evaluation and is not part of the default backtest or live call.
+temperature scaling; its 40.8% hit rate is not the headline. It trails the
+coin flip, base-rate, and EMA baselines on calibration and the no-trade coin
+flip after costs. It is therefore available only with `--include-model` for
+continued evaluation and is not part of the default backtest or live call.
 
 ```bash
 python -m andy_trader.backtest --instrument BTC-USD --horizon 1h
@@ -168,25 +177,25 @@ outside the outer quartiles. A signal also abstains when it is missing, has fewe
 than 20 historical observations, or is older than its source-specific freshness
 limit. These rules were fixed before running the comparisons.
 
-The existing database produced 112 BTC-USD windows and 103 DOGE-USD windows at
+Measured on 2026-09-05, the existing database produced 120 BTC-USD windows and 113 DOGE-USD windows at
 the 1h horizon. Ten bps fee and five bps slippage were charged on both entry and
 exit.
 
 | Instrument | Signal predictor | Brier skill | Gross return | Net return | Trades |
 | --- | --- | ---: | ---: | ---: | ---: |
-| BTC-USD | fear_greed_contrarian | -0.0231 | +2.08% | -3.00% | 17 |
-| BTC-USD | funding_contrarian | -0.0243 | -4.21% | -15.07% | 40 |
-| BTC-USD | crowd_contrarian | -0.0334 | -5.40% | -25.17% | 78 |
-| BTC-USD | crowd_momentum | -0.0485 | +5.52% | -16.51% | 78 |
-| DOGE-USD | crowd_momentum | -0.0088 | +7.46% | -14.71% | 77 |
-| DOGE-USD | funding_contrarian | -0.0111 | -0.06% | -17.55% | 64 |
-| DOGE-USD | fear_greed_contrarian | -0.0360 | +2.36% | -2.14% | 15 |
-| DOGE-USD | crowd_contrarian | -0.0633 | -7.20% | -26.39% | 77 |
+| BTC-USD | funding_contrarian | -0.0221 | -4.21% | -15.07% | 40 |
+| BTC-USD | fear_greed_contrarian | -0.0268 | +1.66% | -5.69% | 25 |
+| BTC-USD | crowd_contrarian | -0.0367 | -5.40% | -24.72% | 76 |
+| BTC-USD | crowd_momentum | -0.0371 | +5.52% | -16.01% | 76 |
+| DOGE-USD | crowd_momentum | -0.0038 | +7.10% | -17.52% | 87 |
+| DOGE-USD | funding_contrarian | -0.0113 | -0.06% | -17.55% | 64 |
+| DOGE-USD | fear_greed_contrarian | -0.0506 | +2.69% | -4.74% | 25 |
+| DOGE-USD | crowd_contrarian | -0.0750 | -6.91% | -28.34% | 87 |
 
 Every signal predictor had negative Brier skill, so none beat the hindsight base
 rate used by the calibration report. None beat the zero-trade coin flip net of
 costs either. DOGE crowd momentum ranked above its walk-forward base-rate
-predictor on Brier skill, but remained below zero skill and lost 14.71% after
+predictor on Brier skill, but remained below zero skill and lost 17.52% after
 costs. The 77.7% DOGE long ratio is therefore not treated as an edge: against
 DOGE's own history it carries different information than BTC near 53.2%.
 
@@ -194,6 +203,62 @@ DOGE's own history it carries different information than BTC near 53.2%.
 python -m andy_trader.backtest --instrument BTC-USD --horizon 1h --include-signals
 python -m andy_trader.backtest --instrument DOGE-USD --horizon 1h --include-signals
 ```
+
+## Retraining and promotion result
+
+CT-07 adds a deterministic rolling retraining command, backward as-of joins for
+funding, positioning, open interest, and Fear and Greed, a chronological
+holdout, and a registry that records every promotion decision. Promotion
+requires positive holdout Brier skill and a win over the base-rate predictor on
+the identical holdout. A rejected candidate never enters the default live or
+paper path.
+
+The first real BTC-USD run used 168 training bars and 24 holdout bars with seed
+1729. It scored **-0.0074 holdout Brier skill**, versus **-0.0061** for the
+base-rate predictor, and was rejected. Its calibration temperature was 5.9667.
+No weights were saved and no model is promoted. The registry records the loss;
+the scheduled cycle continues to log only the five baseline predictors.
+
+```bash
+python -m andy_trader.training --instrument BTC-USD --horizon 1h
+python -m andy_trader.training --instrument BTC-USD --horizon 1h --walk-forward
+```
+
+## Paper portfolio and monitor
+
+CT-08 keeps persistent simulated cash, one long-or-flat position per predictor
+and instrument, trading costs, immutable trade rows, and an equity curve. It
+does not auto-select a predictor and is not part of the unattended cycle. The
+current database contains one `baseline:momentum` BTC-USD portfolio at its
+$10,000 starting value, flat, with zero trades. That is setup state, not a
+performance result.
+
+CT-09 serves the same database on localhost only. It shows collection health,
+prices, predictions, calibration, model promotion decisions, and paper equity.
+It does not place trades. The score display and CLI exclude, and explicitly
+count, predictions whose call-time reference data exceeded the configured
+freshness ceiling.
+
+```bash
+python -m andy_trader.portfolio --predictor baseline:momentum --instrument BTC-USD --horizon 1h
+python -m andy_trader.dashboard
+```
+
+## September 5 collection incident
+
+The local network presented an untrusted certificate chain for Bybit,
+Coinbase, and Kraken. Certificate verification remains enabled: there is no TLS
+bypass, DNS override, or proxy in this project. The unattended cycle now stops
+retrying a certificate failure, journals each phase to `.cycle-run.jsonl`, and
+uses CoinGecko only for instruments missing a usable 1h primary result.
+
+At 09:32 PHT the real scheduled task completed successfully under that path:
+all 16 Bybit requests failed, CoinGecko recovered seven of eight instruments,
+70 fresh calls were recorded, LINK-USD abstained, and the task returned 0.
+Calls created earlier during the outage include 230 references older than 90
+minutes. Those rows remain immutable audit evidence, but the scorer's quality
+gate excludes and reports them rather than pretending they were honest 1h/4h
+forecasts. Future live and paper decisions also abstain on stale input.
 
 ## Honest expectations
 

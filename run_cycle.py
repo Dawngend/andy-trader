@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import json
+import os
 import sys
 from typing import Sequence
 
-from andy_trader.collector import FetchSettings, _http_json as _raw_http, collect
+from andy_trader.collector import _http_json, _settings_from_env, collect
 from andy_trader.env import REPO_ROOT, load_env_file
-from andy_trader.predict import predict_once
+from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, predict_once
 from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
 
@@ -30,12 +32,20 @@ DEFAULT_INSTRUMENTS = (
 )
 DEFAULT_INTERVALS = ("1h", "4h")
 DEFAULT_HORIZONS = ("1h", "4h")
+CYCLE_LOG_PATH = REPO_ROOT / ".cycle-run.jsonl"
 
 
-def _http_json(url: str) -> object:
-    """Adapter: the signal collector passes only a URL."""
+def _journal(event: str, **details: object) -> None:
+    """Best-effort phase journal for failures that kill Python externally."""
 
-    return _raw_http(url, FetchSettings())
+    payload = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "event": event, **details}
+    try:
+        with CYCLE_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        # Market collection must not fail merely because a diagnostic log is
+        # unavailable. The SQLite audit remains the authoritative data record.
+        pass
 
 
 # Bybit alone on the schedule, deliberately. It returns full OHLCV for every
@@ -60,19 +70,62 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
+    settings = _settings_from_env(os.environ)
     instruments = tuple(args.instruments.split(",")) if args.instruments else DEFAULT_INSTRUMENTS
     intervals = tuple(args.intervals.split(",")) if args.intervals else DEFAULT_INTERVALS
     horizons = tuple(args.horizons.split(",")) if args.horizons else DEFAULT_HORIZONS
     venues = tuple(args.venues.split(",")) if args.venues else SCHEDULED_VENUES
+    maximum_data_age_minutes = float(
+        os.environ.get("CRYPTO_MAX_DATA_AGE_MINUTES", str(DEFAULT_MAX_DATA_AGE_MINUTES))
+    )
 
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
+    _journal(
+        "cycle_started",
+        instruments=list(instruments),
+        intervals=list(intervals),
+        horizons=list(horizons),
+        venues=list(venues),
+    )
     try:
         candles, problems = collect(
             instruments=instruments,
             intervals=intervals,
             venues=venues,
-            settings=FetchSettings(),
+            settings=settings,
         )
+        _journal("primary_prices_collected", candles=len(candles), problems=len(problems))
+
+        # Bybit is intermittently replaced by a PLDT block page. CoinGecko is
+        # intentionally queried only for instruments whose live reference
+        # interval has no usable primary row, avoiding its free-tier 429s on
+        # healthy passes while still preventing a total price outage.
+        reference_interval = intervals[0]
+        usable = {
+            (candle.instrument, candle.interval)
+            for candle in candles
+            if not candle.degraded and candle.close is not None
+        }
+        fallback_instruments = tuple(
+            instrument
+            for instrument in instruments
+            if (instrument, reference_interval) not in usable
+        )
+        if fallback_instruments:
+            fallback_candles, fallback_problems = collect(
+                instruments=fallback_instruments,
+                intervals=(reference_interval,),
+                venues=("coingecko",),
+                settings=settings,
+            )
+            candles.extend(fallback_candles)
+            problems.extend(fallback_problems)
+            _journal(
+                "fallback_prices_collected",
+                instruments=list(fallback_instruments),
+                candles=len(fallback_candles),
+                problems=len(fallback_problems),
+            )
         signals: list = []
         signal_problems: list = []
         if not args.skip_signals:
@@ -80,18 +133,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             # re-observe unchanged values. That is deliberately cheap: the
             # content hash collapses repeats onto one row and bumps times_seen,
             # so the cost is a request rather than a duplicated series.
-            signals, signal_problems = collect_signals(instruments, http=_http_json)
+            signals, signal_problems = collect_signals(
+                instruments,
+                http=lambda url: _http_json(url, settings),
+            )
+        _journal("signals_collected", signals=len(signals), problems=len(signal_problems))
 
         with connect(default_database_path()) as connection:
             inserted, seen = record_observations(connection, candles)
             if signals:
                 record_signals(connection, signals)
             written = predict_once(
-                connection, instruments=instruments, horizons=horizons, interval=intervals[0]
+                connection,
+                instruments=instruments,
+                horizons=horizons,
+                interval=reference_interval,
+                maximum_data_age_minutes=maximum_data_age_minutes,
             )
-            settled = settle_due_predictions(connection, interval=intervals[0])
+            settled = settle_due_predictions(connection, interval=reference_interval)
+        _journal(
+            "store_updated",
+            observed=seen,
+            inserted=inserted,
+            predictions=written["written"],
+            skipped=len(written["skipped"]),
+            settled=settled,
+        )
         problems = problems + signal_problems
     except Exception as exc:  # noqa: BLE001 - the scheduler needs one clear failure signal
+        _journal("cycle_failed", error_type=type(exc).__name__, error=str(exc)[:400])
         print(f"{stamp} CYCLE FAILED {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
@@ -110,6 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  degraded: {what} {problem.get('instrument', '-')} "
             f"{where}: {problem['reason'][:120]}".replace("  ", " ")
         )
+    _journal("cycle_completed", degraded=len(problems))
     return 0
 
 

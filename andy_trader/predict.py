@@ -31,6 +31,7 @@ from andy_trader.store import (
 )
 
 DEFAULT_HISTORY_BARS = 200
+DEFAULT_MAX_DATA_AGE_MINUTES = 90.0
 
 
 def load_closes(
@@ -53,16 +54,22 @@ def load_closes(
         FROM (
             SELECT open_time, close, venue, times_seen,
                    ROW_NUMBER() OVER (
-                       PARTITION BY open_time ORDER BY times_seen DESC, venue ASC
+                       PARTITION BY open_time
+                       ORDER BY times_seen DESC, venue ASC, first_seen_at DESC
                    ) AS rank
             FROM crypto_observations
             WHERE instrument = ? AND interval = ? AND degraded = 0 AND close IS NOT NULL
+              AND (
+                  venue != 'coingecko'
+                  OR (? = '1h' AND strftime('%M:%S', open_time) = '00:00')
+                  OR (? = '1d' AND strftime('%H:%M:%S', open_time) = '00:00:00')
+              )
         )
         WHERE rank = 1
         ORDER BY open_time DESC
         LIMIT ?
         """,
-        (instrument, interval, limit),
+        (instrument, interval, interval, interval, limit),
     ).fetchall()
     return [(row["open_time"], float(row["close"])) for row in reversed(rows)]
 
@@ -77,6 +84,7 @@ def predict_once(
     predictors: Sequence[Predictor] | None = None,
     now_iso: str | None = None,
     mode: str = "advisory",
+    maximum_data_age_minutes: float | None = None,
 ) -> dict[str, object]:
     """Write one prediction per configured predictor, instrument, and horizon.
 
@@ -97,6 +105,8 @@ def predict_once(
     configured = predictors if predictors is not None else baselines
     active = tuple(configured) if configured is not None else default_baselines()
     now = now_iso or utc_now_iso()
+    if maximum_data_age_minutes is not None and maximum_data_age_minutes < 0:
+        raise ValueError("maximum_data_age_minutes must be non-negative or None")
     written = 0
     skipped: list[dict[str, str]] = []
 
@@ -104,6 +114,27 @@ def predict_once(
         history = load_closes(connection, instrument, interval=interval)
         if not history:
             skipped.append({"instrument": instrument, "reason": "no non-degraded history"})
+            continue
+        data_age_minutes = (
+            datetime.fromisoformat(now) - datetime.fromisoformat(history[-1][0])
+        ).total_seconds() / 60.0
+        if (
+            maximum_data_age_minutes is not None
+            and data_age_minutes > maximum_data_age_minutes
+        ):
+            # On 2026-09-05 every Bybit request failed TLS verification, but
+            # the live loop still found an old close and timestamped 80 calls
+            # as new. A stale reference changes the effective horizon, so an
+            # abstention is the only honest forecast.
+            skipped.append(
+                {
+                    "instrument": instrument,
+                    "reason": (
+                        f"latest {interval} close is {data_age_minutes:.1f}m old; "
+                        f"limit is {maximum_data_age_minutes:.1f}m"
+                    ),
+                }
+            )
             continue
         closes = [close for _, close in history]
         reference_price = closes[-1]
@@ -141,6 +172,7 @@ def predict_once(
                             "interval": interval,
                             "history_bars": len(closes),
                             "last_close_at": history[-1][0],
+                            "data_age_minutes": data_age_minutes,
                             **context.features,
                         },
                     ),
@@ -155,6 +187,8 @@ def score_all(
     horizon: str | None = None,
     instrument: str | None = None,
     minimum: int = 1,
+    maximum_data_age_minutes: float | None = None,
+    excluded_stale: dict[str, int] | None = None,
 ) -> dict[str, object]:
     """Score every predictor that has settled calls, ranked by skill score."""
 
@@ -169,6 +203,29 @@ def score_all(
         rows = fetch_settled(
             connection, predictor=predictor, instrument=instrument, horizon=horizon
         )
+        if maximum_data_age_minutes is not None:
+            scoreable = []
+            for row in rows:
+                try:
+                    features = json.loads(row["features_json"])
+                    recorded_age = features.get("data_age_minutes")
+                    if recorded_age is None and features.get("last_close_at"):
+                        recorded_age = (
+                            datetime.fromisoformat(row["created_at"])
+                            - datetime.fromisoformat(features["last_close_at"])
+                        ).total_seconds() / 60.0
+                    stale = recorded_age is not None and (
+                        float(recorded_age) < 0
+                        or float(recorded_age) > maximum_data_age_minutes
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stale = False  # legacy rows without usable provenance remain visible
+                if stale:
+                    if excluded_stale is not None:
+                        excluded_stale[predictor] = excluded_stale.get(predictor, 0) + 1
+                    continue
+                scoreable.append(row)
+            rows = scoreable
         if len(rows) < minimum:
             continue
         probabilities = [float(row["probability_up"]) for row in rows]
@@ -196,6 +253,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
     parser.add_argument("--json", action="store_true", help="Machine-readable output")
     parser.add_argument("--minimum", type=int, default=1, help="Minimum settled calls to score")
+    parser.add_argument(
+        "--maximum-data-age-minutes",
+        type=float,
+        help="Refuse live calls whose newest close is older than this",
+    )
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
@@ -207,6 +269,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         environ, "CRYPTO_HORIZONS", ("1h", "4h")
     )
     database_path = Path(args.database) if args.database else default_database_path(environ)
+    maximum_data_age_minutes = (
+        args.maximum_data_age_minutes
+        if args.maximum_data_age_minutes is not None
+        else float(
+            environ.get(
+                "CRYPTO_MAX_DATA_AGE_MINUTES",
+                str(DEFAULT_MAX_DATA_AGE_MINUTES),
+            )
+        )
+    )
 
     with connect(database_path) as connection:
         if args.command == "predict":
@@ -215,6 +287,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 instruments=instruments,
                 horizons=horizons,
                 interval=args.interval,
+                maximum_data_age_minutes=maximum_data_age_minutes,
             )
             print(json.dumps(result) if args.json else f"logged {result['written']} predictions")
             for skip in result["skipped"]:
@@ -228,13 +301,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                   f"unresolvable {stats['unresolvable']}")
             return 0
 
-        reports = score_all(connection, minimum=args.minimum)
+        excluded_stale: dict[str, int] = {}
+        reports = score_all(
+            connection,
+            minimum=args.minimum,
+            maximum_data_age_minutes=maximum_data_age_minutes,
+            excluded_stale=excluded_stale,
+        )
         if not reports:
+            if excluded_stale:
+                print(f"excluded {sum(excluded_stale.values())} stale-reference calls")
             print("nothing settled yet; run 'settle' after a horizon has elapsed")
             return 0
         if args.json:
-            print(json.dumps({k: v.as_dict() for k, v in reports.items()}, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "reports": {
+                            key: value if isinstance(value, dict) else value.as_dict()
+                            for key, value in reports.items()
+                        },
+                        "excluded_stale": excluded_stale,
+                    },
+                    indent=2,
+                )
+            )
             return 0
+        if excluded_stale:
+            print(
+                f"QUALITY GATE: excluded {sum(excluded_stale.values())} settled calls "
+                f"whose reference data exceeded {maximum_data_age_minutes:.1f}m"
+            )
         ranked = sorted(reports.items(), key=lambda kv: kv[1].brier_skill_score, reverse=True)
         for predictor, report in ranked:
             print(format_report(report, predictor=predictor))

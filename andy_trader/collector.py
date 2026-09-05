@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import time
 from typing import Callable, Mapping, Sequence
@@ -109,6 +110,14 @@ def _http_json(url: str, settings: FetchSettings, sleeper: Callable[[float], Non
                 return json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last_error = exc
+            # The 2026-09-05 PLDT block-page incident presented an untrusted
+            # certificate for every exchange request. Retrying the same bad
+            # chain three times cannot repair trust and stretched one cycle by
+            # more than a minute, so fail this source immediately and let the
+            # existing degraded-row and fallback paths preserve the evidence.
+            reason = exc.reason if isinstance(exc, URLError) else exc
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                break
             if attempt < settings.retries:
                 sleeper(settings.backoff_seconds * attempt)
     raise ConnectionError(f"{type(last_error).__name__}: {last_error}")
@@ -238,25 +247,33 @@ def fetch_coingecko(
         for point in payload.get("total_volumes") or []
         if isinstance(point, (list, tuple)) and len(point) >= 2
     }
-    candles: list[Candle] = []
+    candles_by_open_time: dict[str, Candle] = {}
     for point in prices:
         if not isinstance(point, (list, tuple)) or len(point) < 2:
             continue
         stamp_ms, close = int(point[0]), float(point[1])
-        candles.append(
-            Candle(
-                instrument=instrument,
-                venue="coingecko",
-                interval=interval,
-                open_time=datetime.fromtimestamp(stamp_ms / 1000, UTC).isoformat(),
-                open=None,
-                high=None,
-                low=None,
-                close=close,
-                volume=volumes.get(stamp_ms),
-            )
+        observed_at = datetime.fromtimestamp(stamp_ms / 1000, UTC)
+        open_time = (
+            observed_at.replace(minute=0, second=0, microsecond=0)
+            if interval == "1h"
+            else observed_at.replace(hour=0, minute=0, second=0, microsecond=0)
         )
-    return candles
+        # market_chart appends a request-time spot quote after its regular
+        # grid. The 2026-09-05 fallback run exposed 01:30 beside the 01:00
+        # point. Both belong to the same hourly bucket, and the later quote is
+        # the best live close; keeping both would turn one hour into two bars.
+        candles_by_open_time[open_time.isoformat()] = Candle(
+            instrument=instrument,
+            venue="coingecko",
+            interval=interval,
+            open_time=open_time.isoformat(),
+            open=None,
+            high=None,
+            low=None,
+            close=close,
+            volume=volumes.get(stamp_ms),
+        )
+    return list(candles_by_open_time.values())
 
 
 def fetch_bybit(

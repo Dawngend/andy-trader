@@ -1,6 +1,8 @@
 """Tests for CT-08 paper portfolio accounting: cash conservation, costs, decisions."""
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -15,8 +17,10 @@ from andy_trader.portfolio import (
     get_or_create_state,
     initialize_portfolio,
     mark_to_market,
+    main,
     run_paper_cycle,
 )
+from andy_trader.store import Candle, Prediction, connect, record_observations, record_prediction
 
 
 def _conn() -> sqlite3.Connection:
@@ -57,6 +61,7 @@ def test_new_state_starts_flat_with_full_starting_cash() -> None:
         connection, predictor="baseline:momentum", instrument="BTC-USD", now_iso="2026-09-05T00:00:00+00:00"
     )
     assert state.position_qty == 0.0
+    assert state.starting_cash == 10_000.0
     assert state.cash == 10_000.0
     assert state.avg_entry_price is None
 
@@ -195,3 +200,155 @@ def test_separate_predictors_and_instruments_have_isolated_state() -> None:
     )
     assert b_state.cash == 10_000.0  # untouched by "a" trading
     assert b_state.position_qty == 0.0
+
+
+def test_existing_portfolio_schema_is_migrated_with_a_starting_cash_denominator() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE paper_portfolio_state (
+            predictor TEXT NOT NULL,
+            instrument TEXT NOT NULL,
+            cash REAL NOT NULL,
+            position_qty REAL NOT NULL,
+            avg_entry_price REAL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (predictor, instrument)
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO paper_portfolio_state VALUES (?, ?, ?, ?, ?, ?)",
+        ("p", "BTC-USD", 10_000.0, 0.0, None, "2026-09-05T00:00:00+00:00"),
+    )
+
+    initialize_portfolio(connection)
+
+    state = get_or_create_state(
+        connection,
+        predictor="p",
+        instrument="BTC-USD",
+        now_iso="2026-09-05T00:00:00+00:00",
+    )
+    assert state.starting_cash == 10_000.0
+
+
+def test_cli_uses_the_requested_horizon_and_wall_clock_execution_time(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    bar_time = (now - timedelta(minutes=30)).isoformat()
+    one_hour_call_time = (now - timedelta(minutes=2)).isoformat()
+    four_hour_call_time = (now - timedelta(minutes=1)).isoformat()
+    with connect(database) as connection:
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument="BTC-USD",
+                    venue="bybit",
+                    interval="1h",
+                    open_time=bar_time,
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=1.0,
+                )
+            ],
+        )
+        record_prediction(
+            connection,
+            Prediction(
+                predictor="baseline:test",
+                instrument="BTC-USD",
+                horizon="1h",
+                probability_up=0.5,
+                reference_price=100.0,
+                created_at=one_hour_call_time,
+                resolves_at=(now + timedelta(minutes=58)).isoformat(),
+            ),
+        )
+        record_prediction(
+            connection,
+            Prediction(
+                predictor="baseline:test",
+                instrument="BTC-USD",
+                horizon="4h",
+                probability_up=0.9,
+                reference_price=100.0,
+                created_at=four_hour_call_time,
+                resolves_at=(now + timedelta(hours=4)).isoformat(),
+            ),
+        )
+
+    assert main(
+        [
+            "--predictor",
+            "baseline:test",
+            "--instrument",
+            "BTC-USD",
+            "--horizon",
+            "1h",
+            "--database",
+            str(database),
+        ]
+    ) == 0
+
+    with connect(database) as connection:
+        state = connection.execute("SELECT * FROM paper_portfolio_state").fetchone()
+        assert state["position_qty"] == 0.0
+        assert datetime.fromisoformat(state["updated_at"]) > datetime.fromisoformat(bar_time)
+
+
+def test_cli_refuses_a_stale_prediction(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    bar_time = (now - timedelta(minutes=30)).isoformat()
+    with connect(database) as connection:
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument="BTC-USD",
+                    venue="bybit",
+                    interval="1h",
+                    open_time=bar_time,
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=1.0,
+                )
+            ],
+        )
+        record_prediction(
+            connection,
+            Prediction(
+                predictor="baseline:test",
+                instrument="BTC-USD",
+                horizon="1h",
+                probability_up=0.9,
+                reference_price=100.0,
+                created_at=(now - timedelta(minutes=21)).isoformat(),
+                resolves_at=(now + timedelta(minutes=39)).isoformat(),
+            ),
+        )
+
+    assert main(
+        [
+            "--predictor",
+            "baseline:test",
+            "--database",
+            str(database),
+        ]
+    ) == 1
+    assert "refusing to trade a stale decision" in capsys.readouterr().out
+
+    with connect(database) as connection:
+        tables = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_trades'"
+        ).fetchall()
+        assert tables == []

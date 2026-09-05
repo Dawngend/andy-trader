@@ -29,6 +29,7 @@ comparable, not measuring two different cost worlds.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import sqlite3
 from typing import Literal, Sequence
 
@@ -37,6 +38,7 @@ DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
 DEFAULT_FLAT_THRESHOLD = 0.50  # exit back to flat once conviction fades to a coin flip
+DEFAULT_MAX_PREDICTION_AGE_MINUTES = 20.0  # the unattended cycle runs every 15 minutes
 
 Side = Literal["long", "flat"]
 
@@ -51,6 +53,7 @@ class PortfolioState:
 
     predictor: str
     instrument: str
+    starting_cash: float
     cash: float
     position_qty: float
     avg_entry_price: float | None
@@ -79,6 +82,7 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS paper_portfolio_state (
             predictor TEXT NOT NULL,
             instrument TEXT NOT NULL,
+            starting_cash REAL NOT NULL,
             cash REAL NOT NULL,
             position_qty REAL NOT NULL,
             avg_entry_price REAL,
@@ -123,6 +127,17 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS paper_equity_curve_lookup "
         "ON paper_equity_curve(predictor, instrument, recorded_at)"
     )
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(paper_portfolio_state)")
+    }
+    if "starting_cash" not in columns:
+        # CT-08 initially inferred return from the first mark, which hides the
+        # entry cost. Preserve the one already-created default portfolio while
+        # adding the real denominator for every future custom bankroll.
+        connection.execute(
+            "ALTER TABLE paper_portfolio_state "
+            f"ADD COLUMN starting_cash REAL NOT NULL DEFAULT {DEFAULT_STARTING_CASH}"
+        )
     connection.commit()
 
 
@@ -143,6 +158,7 @@ def get_or_create_state(
         return PortfolioState(
             predictor=row["predictor"],
             instrument=row["instrument"],
+            starting_cash=float(row["starting_cash"]),
             cash=float(row["cash"]),
             position_qty=float(row["position_qty"]),
             avg_entry_price=row["avg_entry_price"],
@@ -150,15 +166,17 @@ def get_or_create_state(
         )
     connection.execute(
         """
-        INSERT INTO paper_portfolio_state (predictor, instrument, cash, position_qty, avg_entry_price, updated_at)
-        VALUES (?, ?, ?, 0.0, NULL, ?)
+        INSERT INTO paper_portfolio_state
+        (predictor, instrument, starting_cash, cash, position_qty, avg_entry_price, updated_at)
+        VALUES (?, ?, ?, ?, 0.0, NULL, ?)
         """,
-        (predictor, instrument, starting_cash, now_iso),
+        (predictor, instrument, starting_cash, starting_cash, now_iso),
     )
     connection.commit()
     return PortfolioState(
         predictor=predictor,
         instrument=instrument,
+        starting_cash=starting_cash,
         cash=starting_cash,
         position_qty=0.0,
         avg_entry_price=None,
@@ -252,6 +270,7 @@ def execute_paper_trade(
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
+            starting_cash=state.starting_cash,
             cash=0.0,
             position_qty=qty,
             avg_entry_price=price,
@@ -280,6 +299,7 @@ def execute_paper_trade(
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
+            starting_cash=state.starting_cash,
             cash=new_cash,
             position_qty=0.0,
             avg_entry_price=None,
@@ -439,16 +459,18 @@ def fetch_recent_trades(
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     import json
+    import os
     from pathlib import Path
 
     from andy_trader.env import REPO_ROOT, load_env_file
-    from andy_trader.predict import load_closes
+    from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes
     from andy_trader.store import connect, default_database_path
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictor", required=True, help="Predictor name to paper-trade, e.g. baseline:momentum")
     parser.add_argument("--instrument", default="BTC-USD")
     parser.add_argument("--interval", default="1h")
+    parser.add_argument("--horizon", default="1h")
     parser.add_argument("--database", help="Override database path")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -460,13 +482,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         row = connection.execute(
             """
             SELECT probability_up, reference_price, created_at FROM crypto_predictions
-            WHERE predictor = ? AND instrument = ?
+            WHERE predictor = ? AND instrument = ? AND horizon = ?
             ORDER BY created_at DESC LIMIT 1
             """,
-            (args.predictor, args.instrument),
+            (args.predictor, args.instrument, args.horizon),
         ).fetchone()
         if row is None:
-            print(f"No predictions found for predictor={args.predictor!r} instrument={args.instrument!r}")
+            print(
+                f"No {args.horizon} predictions found for predictor={args.predictor!r} "
+                f"instrument={args.instrument!r}"
+            )
             return 1
 
         closes = load_closes(connection, args.instrument, interval=args.interval, limit=1)
@@ -474,6 +499,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"No live price available for {args.instrument}")
             return 1
         latest_time, latest_price = closes[-1]
+        now = datetime.now(UTC)
+        prediction_age_minutes = (
+            now - datetime.fromisoformat(row["created_at"])
+        ).total_seconds() / 60.0
+        data_age_minutes = (
+            now - datetime.fromisoformat(latest_time)
+        ).total_seconds() / 60.0
+        if prediction_age_minutes > DEFAULT_MAX_PREDICTION_AGE_MINUTES:
+            print(
+                f"Latest {args.horizon} prediction is {prediction_age_minutes:.1f}m old; "
+                f"refusing to trade a stale decision"
+            )
+            return 1
+        maximum_data_age_minutes = float(
+            os.environ.get("CRYPTO_MAX_DATA_AGE_MINUTES", str(DEFAULT_MAX_DATA_AGE_MINUTES))
+        )
+        if data_age_minutes > maximum_data_age_minutes:
+            print(
+                f"Latest {args.interval} close is {data_age_minutes:.1f}m old; "
+                f"limit is {maximum_data_age_minutes:.1f}m"
+            )
+            return 1
+        now_iso = now.isoformat()
 
         trade, equity = run_paper_cycle(
             connection,
@@ -481,12 +529,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             instrument=args.instrument,
             probability_up=float(row["probability_up"]),
             price=latest_price,
-            now_iso=latest_time,
+            now_iso=now_iso,
         )
         result = {
             "predictor": args.predictor,
             "instrument": args.instrument,
+            "horizon": args.horizon,
             "price": latest_price,
+            "price_at": latest_time,
+            "prediction_created_at": row["created_at"],
+            "executed_at": now_iso,
             "traded": trade is not None,
             "trade": trade.__dict__ if trade else None,
             "equity": equity,

@@ -1,5 +1,9 @@
+import ssl
+from urllib.error import URLError
+
 import pytest
 
+import andy_trader.collector as collector
 from andy_trader.collector import (
     CollectorError,
     FetchSettings,
@@ -15,6 +19,26 @@ SETTINGS = FetchSettings(retries=1, backoff_seconds=0, rate_limit_seconds=0)
 
 def _http(payload):
     return lambda _url, _settings: payload
+
+
+def test_tls_verification_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = []
+    sleeps = []
+
+    def fail(_request, *, timeout):
+        attempts.append(timeout)
+        raise URLError(ssl.SSLCertVerificationError(1, "untrusted block page"))
+
+    monkeypatch.setattr(collector, "urlopen", fail)
+    with pytest.raises(ConnectionError, match="untrusted block page"):
+        collector._http_json(
+            "https://example.invalid",
+            FetchSettings(retries=3, backoff_seconds=1),
+            sleeper=sleeps.append,
+        )
+
+    assert attempts == [20.0]
+    assert sleeps == []
 
 
 def test_coinbase_parses_the_low_high_open_close_ordering() -> None:
@@ -86,6 +110,19 @@ def test_coingecko_pairs_prices_with_volumes_and_leaves_ohl_null() -> None:
 def test_coingecko_tolerates_a_missing_volume_point() -> None:
     payload = {"prices": [[1788462000000, 80000.0]], "total_volumes": []}
     assert fetch_coingecko("BTC-USD", "1h", SETTINGS, http=_http(payload))[0].volume is None
+
+
+def test_coingecko_folds_the_request_time_quote_into_its_hour() -> None:
+    payload = {
+        "prices": [[1788462000000, 80000.0], [1788463830000, 80100.0]],
+        "total_volumes": [],
+    }
+
+    candles = fetch_coingecko("BTC-USD", "1h", SETTINGS, http=_http(payload))
+
+    assert len(candles) == 1
+    assert candles[0].open_time == "2026-09-03T19:00:00+00:00"
+    assert candles[0].close == 80100.0
 
 
 def test_coingecko_returns_nothing_for_an_unmapped_instrument() -> None:

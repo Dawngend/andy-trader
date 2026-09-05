@@ -28,8 +28,7 @@ import sys
 from typing import Sequence
 
 from andy_trader.env import REPO_ROOT, load_env_file
-from andy_trader.portfolio import fetch_equity_curve, fetch_recent_trades, initialize_portfolio
-from andy_trader.predict import score_all
+from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, score_all
 from andy_trader.store import connect, default_database_path
 
 DEFAULT_PORT = 8787
@@ -45,12 +44,15 @@ def _seconds_since(iso_timestamp: str, now: datetime) -> float:
 
 
 def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str, object]:
-    """Per instrument+interval, when the collector last actually saw a bar."""
+    """Per series source reachability and usable-bar freshness."""
 
     rows = connection.execute(
         """
-        SELECT instrument, interval, MAX(last_seen_at) AS last_seen_at
+        SELECT instrument, interval,
+               MAX(last_seen_at) AS last_seen_at,
+               MAX(open_time) AS latest_bar_at
         FROM crypto_observations
+        WHERE degraded = 0 AND close IS NOT NULL
         GROUP BY instrument, interval
         ORDER BY instrument, interval
         """
@@ -60,6 +62,15 @@ def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str
     for row in rows:
         last_seen_at = row["last_seen_at"]
         age_seconds = _seconds_since(last_seen_at, now)
+        latest_bar_at = row["latest_bar_at"]
+        data_age_seconds = _seconds_since(latest_bar_at, now)
+        interval_seconds = {"1h": 3600, "4h": 14_400, "1d": 86_400}.get(
+            row["interval"], 0
+        )
+        # Bar open_time naturally trails the wall clock by up to one complete
+        # interval. Twenty extra minutes covers the 15-minute scheduler plus a
+        # small completion margin without masking a genuinely stale reference.
+        data_stale = data_age_seconds > interval_seconds + 20 * 60
         series.append(
             {
                 "instrument": row["instrument"],
@@ -67,6 +78,9 @@ def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str
                 "last_seen_at": last_seen_at,
                 "age_seconds": age_seconds,
                 "stale": age_seconds > 20 * 60,  # scheduled cycle runs every 15 min
+                "latest_bar_at": latest_bar_at,
+                "data_age_seconds": data_age_seconds,
+                "data_stale": data_stale,
             }
         )
         if most_recent is None or age_seconds < most_recent:
@@ -74,7 +88,9 @@ def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str
     return {
         "series": series,
         "freshest_age_seconds": most_recent,
-        "healthy": most_recent is not None and most_recent <= 20 * 60,
+        "healthy": bool(series) and all(
+            not row["stale"] and not row["data_stale"] for row in series
+        ),
     }
 
 
@@ -105,9 +121,10 @@ def _latest_prices(connection: sqlite3.Connection) -> list[dict[str, object]]:
         """
         SELECT instrument, interval, close, open_time
         FROM (
-            SELECT instrument, interval, close, open_time,
+            SELECT instrument, interval, close, open_time, venue, times_seen,
                    ROW_NUMBER() OVER (
-                       PARTITION BY instrument, interval ORDER BY open_time DESC
+                       PARTITION BY instrument, interval
+                       ORDER BY open_time DESC, times_seen DESC, venue ASC
                    ) AS rank
             FROM crypto_observations
             WHERE degraded = 0 AND close IS NOT NULL
@@ -119,15 +136,21 @@ def _latest_prices(connection: sqlite3.Connection) -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
-def _scoreboard(connection: sqlite3.Connection) -> dict[str, object]:
-    reports = score_all(connection, minimum=1)
+def _scoreboard(connection: sqlite3.Connection) -> tuple[dict[str, object], dict[str, int]]:
+    excluded_stale: dict[str, int] = {}
+    reports = score_all(
+        connection,
+        minimum=1,
+        maximum_data_age_minutes=DEFAULT_MAX_DATA_AGE_MINUTES,
+        excluded_stale=excluded_stale,
+    )
     out: dict[str, object] = {}
     for predictor, report in reports.items():
         if isinstance(report, dict):  # CalibrationError case
             out[predictor] = report
         else:
             out[predictor] = report.as_dict()
-    return out
+    return out, excluded_stale
 
 
 def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
@@ -152,9 +175,23 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
     """One summary row per (predictor, instrument) pair that has ever paper-traded."""
 
     try:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(paper_portfolio_state)")
+        }
+        if not columns:
+            return []
+        # Keep the monitor genuinely read-only even while an older CT-08
+        # database is waiting for portfolio.initialize_portfolio to perform
+        # its explicit migration. The only pre-migration bankroll was the
+        # original fixed $10,000 default.
+        starting_cash_sql = (
+            "starting_cash" if "starting_cash" in columns else "10000.0 AS starting_cash"
+        )
         rows = connection.execute(
-            "SELECT predictor, instrument, cash, position_qty, avg_entry_price, updated_at "
-            "FROM paper_portfolio_state ORDER BY predictor, instrument"
+            f"SELECT predictor, instrument, {starting_cash_sql}, cash, position_qty, "
+            "avg_entry_price, updated_at FROM paper_portfolio_state "
+            "ORDER BY predictor, instrument"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # no paper trade has ever run yet
@@ -162,10 +199,23 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     for row in rows:
         predictor, instrument = row["predictor"], row["instrument"]
-        curve = fetch_equity_curve(connection, predictor=predictor, instrument=instrument, limit=200)
-        trades = fetch_recent_trades(connection, predictor=predictor, instrument=instrument, limit=1000)
+        curve = [
+            dict(point)
+            for point in reversed(
+                connection.execute(
+                    "SELECT * FROM paper_equity_curve "
+                    "WHERE predictor = ? AND instrument = ? "
+                    "ORDER BY recorded_at DESC LIMIT 200",
+                    (predictor, instrument),
+                ).fetchall()
+            )
+        ]
+        trades = connection.execute(
+            "SELECT id FROM paper_trades WHERE predictor = ? AND instrument = ? LIMIT 1000",
+            (predictor, instrument),
+        ).fetchall()
         latest_equity = curve[-1]["equity"] if curve else float(row["cash"])
-        starting_equity = curve[0]["equity"] if curve else float(row["cash"])
+        starting_equity = float(row["starting_cash"])
         summaries.append(
             {
                 "predictor": predictor,
@@ -192,13 +242,15 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
 
     now = datetime.now(UTC)
     now_iso = now.isoformat()
+    scoreboard, score_exclusions = _scoreboard(connection)
     return {
         "generated_at": now_iso,
         "collector_health": _collector_health(connection, now),
         "pending_overdue": _pending_overdue(connection, now_iso),
         "latest_prices": _latest_prices(connection),
         "recent_predictions": _recent_predictions(connection),
-        "scoreboard": _scoreboard(connection),
+        "scoreboard": scoreboard,
+        "score_exclusions": score_exclusions,
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
     }
@@ -240,7 +292,7 @@ _PAGE = """<!doctype html>
     </div>
     <div class="card">
       <h2>Collector Health</h2>
-      <table id="health"><thead><tr><th>Instrument</th><th>Interval</th><th>Last Seen</th><th>Age</th></tr></thead><tbody></tbody></table>
+      <table id="health"><thead><tr><th>Instrument</th><th>Interval</th><th>Last Success</th><th>Source Age</th><th>Latest Bar</th><th>Bar Age</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Latest Prices</h2>
@@ -248,6 +300,7 @@ _PAGE = """<!doctype html>
     </div>
     <div class="card">
       <h2>Scoreboard (Brier skill vs. base rate)</h2>
+      <p class="updated" id="score-quality"></p>
       <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
@@ -329,7 +382,12 @@ async function refresh() {
     s.collector_health.series.forEach(row_ => {
       const ageCell = td(fmtAge(row_.age_seconds));
       ageCell.className = row_.stale ? "bad" : "ok";
-      healthBody.appendChild(row([td(row_.instrument), td(row_.interval), td(fmtTime(row_.last_seen_at)), ageCell]));
+      const dataAgeCell = td(fmtAge(row_.data_age_seconds));
+      dataAgeCell.className = row_.data_stale ? "bad" : "ok";
+      healthBody.appendChild(row([
+        td(row_.instrument), td(row_.interval), td(fmtTime(row_.last_seen_at)), ageCell,
+        td(fmtTime(row_.latest_bar_at)), dataAgeCell,
+      ]));
     });
 
     const pricesBody = document.querySelector("#prices tbody");
@@ -340,6 +398,10 @@ async function refresh() {
 
     const sbBody = document.querySelector("#scoreboard tbody");
     sbBody.innerHTML = "";
+    const excluded = Object.values(s.score_exclusions).reduce((a, b) => a + b, 0);
+    document.getElementById("score-quality").textContent = excluded
+      ? excluded + " stale-reference calls excluded by the 90m quality gate"
+      : "No stale-reference calls excluded";
     Object.keys(s.scoreboard).sort().forEach(name => {
       const r = s.scoreboard[name];
       if (r.error) { sbBody.appendChild(row([td(name), td("-"), td(r.error), td("-")])); return; }
