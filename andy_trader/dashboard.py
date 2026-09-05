@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import sqlite3
 import sys
@@ -276,6 +277,31 @@ def _risk_state(connection: sqlite3.Connection, *, predictor: str, instrument: s
     if row is None or not row["tripped"]:
         return {"tripped": False, "severity": None, "reason": None}
     return {"tripped": True, "severity": row["severity"], "reason": row["tripped_reason"]}
+
+
+def _json_safe(value: object) -> object:
+    """Recursively replace non-finite floats with None before serializing.
+
+    Python's json.dumps happily emits the non-standard tokens Infinity,
+    -Infinity, and NaN. A real predictor can legitimately produce one --
+    CT-02's calibration harness deliberately reports -inf skill for a
+    degenerate sample rather than a flattering 0.0 (see calibration.py) --
+    and a brand-new predictor with only a couple of settled calls hits that
+    exact case in practice, not just in theory. Standard JSON has no token
+    for these values, so a strict client-side JSON.parse rejects the entire
+    payload the instant one appears anywhere in it. The frontend already
+    knows how to display a degenerate reading (it checks the `degenerate`
+    flag independently of the number itself); it just needs a value it can
+    actually receive.
+    """
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
@@ -762,7 +788,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 with connect(self.database_path) as connection:
                     state = build_dashboard_state(connection)
-                body = json.dumps(state).encode("utf-8")
+                body = json.dumps(_json_safe(state)).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))

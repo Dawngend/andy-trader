@@ -1,9 +1,10 @@
 """Tests for the dashboard's read-only state projection."""
 
 from datetime import UTC, datetime, timedelta
+import json
 import sqlite3
 
-from andy_trader.dashboard import _collector_health, _latest_prices, _portfolios
+from andy_trader.dashboard import _collector_health, _json_safe, _latest_prices, _portfolios
 from andy_trader.portfolio import run_paper_cycle
 from andy_trader.risk import initialize_risk
 from andy_trader.store import Candle, initialize_database, record_observations
@@ -107,3 +108,71 @@ def test_portfolio_surfaces_a_tripped_risk_state() -> None:
     assert portfolios[0]["risk"]["tripped"] is True
     assert portfolios[0]["risk"]["severity"] == "hard"
     assert portfolios[0]["risk"]["reason"] == "total loss exceeded"
+
+
+def test_json_safe_neutralizes_every_non_finite_float_python_would_otherwise_emit() -> None:
+    """The real bug this guards against: a brand-new predictor with a
+    degenerate holdout sample produces a real -inf skill (calibration.py's
+    own deliberate design, not a bug), and Python's json.dumps happily emits
+    the non-standard -Infinity token for it. A strict client-side JSON.parse
+    rejects the entire payload the instant that token appears anywhere in it
+    -- this broke the live dashboard for real, not hypothetically."""
+    payload = {
+        "skill": float("-inf"),
+        "also_bad": float("inf"),
+        "nan_value": float("nan"),
+        "fine": 1.5,
+        "nested": {"deep": float("-inf"), "list": [1.0, float("nan"), 3]},
+        "untouched": {"degenerate": True, "reason": "not enough evidence"},
+    }
+
+    safe = _json_safe(payload)
+
+    assert safe["skill"] is None
+    assert safe["also_bad"] is None
+    assert safe["nan_value"] is None
+    assert safe["fine"] == 1.5
+    assert safe["nested"]["deep"] is None
+    assert safe["nested"]["list"] == [1.0, None, 3]
+    assert safe["untouched"] == {"degenerate": True, "reason": "not enough evidence"}
+
+    # The actual regression check: this must be valid, standard JSON now,
+    # parseable by a strict client, not just "doesn't raise in Python."
+    reparsed = json.loads(json.dumps(safe))
+    assert reparsed["skill"] is None
+
+
+def test_build_dashboard_state_survives_a_real_degenerate_scoreboard_report() -> None:
+    """End-to-end reproduction of the actual outage: one settled call, so the
+    holdout sample is degenerate and the real calibration module returns a
+    genuine -inf skill score for it -- confirm the whole pipeline (not just
+    the sanitizer in isolation) produces standard-JSON-safe output."""
+    from andy_trader.dashboard import build_dashboard_state
+    from andy_trader.store import Prediction, record_prediction, settle_due_predictions
+
+    connection = _conn()
+    record_observations(
+        connection,
+        [_candle(venue="bybit", open_time="2026-09-05T00:00:00+00:00", close=100.0)],
+    )
+    record_observations(
+        connection,
+        [_candle(venue="bybit", open_time="2026-09-05T01:00:00+00:00", close=101.0)],
+    )
+    record_prediction(
+        connection,
+        Prediction(
+            predictor="model:promoted", instrument="BTC-USD", horizon="1h",
+            probability_up=0.9, reference_price=100.0,
+            created_at="2026-09-05T00:00:00+00:00", resolves_at="2026-09-05T01:00:00+00:00",
+        ),
+    )
+    settle_due_predictions(connection, now_iso="2026-09-05T01:00:00+00:00")
+
+    state = build_dashboard_state(connection)
+    report = state["scoreboard"]["model:promoted"]
+    assert report["degenerate"] is True
+
+    # This must not raise -- the real historical bug was that build_dashboard_state
+    # itself was fine; only json.dumps of its output silently produced invalid JSON.
+    json.dumps(_json_safe(state))
