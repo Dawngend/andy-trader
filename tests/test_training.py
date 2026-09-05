@@ -27,7 +27,9 @@ from andy_trader.signals import (
 )
 from andy_trader.store import Candle, connect, record_observations
 from andy_trader.training import (
+    MODELS_DIR,
     MultimodalTorchPredictor,
+    load_promoted_model,
     run_retrain_window,
     run_walk_forward_retraining,
     should_retrain,
@@ -268,3 +270,93 @@ def test_walk_forward_retraining_rolls_across_history(tmp_path: Path) -> None:
         for e in entries:
             assert e.train_bars == 40
             assert e.holdout_bars == 24
+
+
+def test_predictor_save_and_load_round_trip_produces_identical_predictions(tmp_path: Path) -> None:
+    """The whole point of weight persistence: a loaded predictor must behave
+    exactly like the one that was saved, not merely load without error."""
+    candles = _synthetic_candles(80)
+    history = [(c.open_time, c.close) for c in candles]
+    signals = _signals_by_name(_synthetic_signals(candles))
+
+    predictor = MultimodalTorchPredictor(seed=42, lookback=12, epochs=5)
+    predictor.fit(history[:60], signals)
+    original_prediction = predictor.predict_one(history[:60], signals)
+
+    weights_file = tmp_path / "test_model.pt"
+    predictor.save(weights_file)
+    assert weights_file.exists()
+
+    loaded = MultimodalTorchPredictor.load(weights_file)
+    loaded_prediction = loaded.predict_one(history[:60], signals)
+
+    assert loaded_prediction == pytest.approx(original_prediction, abs=1e-6)
+    assert loaded.seed == predictor.seed
+    assert loaded.lookback == predictor.lookback
+    assert loaded.temperature == pytest.approx(predictor.temperature)
+
+
+def _signals_by_name(signals: Sequence[Signal]) -> dict[str, list]:
+    from andy_trader.features import SignalObservation as _SO
+
+    by_name: dict[str, list] = {}
+    for s in signals:
+        by_name.setdefault(s.signal, []).append(
+            _SO(signal=s.signal, observed_time=s.observed_time, value=s.value)
+        )
+    return by_name
+
+
+def test_run_retrain_window_only_saves_weights_when_promoted(tmp_path: Path, monkeypatch) -> None:
+    """The invariant that must always hold regardless of whether this particular
+    run happens to beat the base rate: weights exist on disk if and only if
+    the registry says promoted, and a promoted model is genuinely loadable."""
+    monkeypatch.setattr("andy_trader.training.MODELS_DIR", tmp_path / "models")
+
+    db_file = tmp_path / "train.db"
+    candles = _synthetic_candles(100)
+    signals = _synthetic_signals(candles)
+
+    with connect(db_file) as conn:
+        record_observations(conn, candles)
+        record_signals(conn, signals)
+
+        entry = run_retrain_window(
+            conn, instrument="BTC-USD", train_bars=50, holdout_bars=24, lookback=12, epochs=5, seed=7,
+        )
+
+        if entry.promoted:
+            assert entry.weights_path is not None
+            assert Path(entry.weights_path).exists()
+            loaded = load_promoted_model(conn, instrument="BTC-USD")
+            assert loaded is not None
+        else:
+            assert entry.weights_path is None
+            assert load_promoted_model(conn, instrument="BTC-USD") is None
+
+
+def test_load_promoted_model_returns_none_when_nothing_promoted(tmp_path: Path) -> None:
+    db_file = tmp_path / "empty.db"
+    with connect(db_file) as conn:
+        assert load_promoted_model(conn, instrument="BTC-USD") is None
+
+
+def test_load_promoted_model_returns_none_when_weights_file_is_missing(tmp_path: Path) -> None:
+    """A registry row can outlive its weights file (moved machine, cleaned disk).
+    That must be a graceful 'nothing to trade', never a crash."""
+    db_file = tmp_path / "orphan.db"
+    with connect(db_file) as conn:
+        initialize_registry(conn)
+        entry = ModelRegistryEntry(
+            model_id="orphaned_model", trained_at="2026-09-05T00:00:00+00:00",
+            instrument="BTC-USD", interval="1h", horizon="1h",
+            train_start_time="2026-09-01T00:00:00+00:00", train_end_time="2026-09-04T00:00:00+00:00",
+            train_bars=72, holdout_start_time="2026-09-04T00:00:00+00:00",
+            holdout_end_time="2026-09-05T00:00:00+00:00", holdout_bars=24,
+            hyperparameters={}, holdout_brier=0.2, holdout_brier_reference=0.25,
+            holdout_brier_skill=0.05, base_rate_brier_skill=0.0,
+            promoted=True, promotion_reason="test", weights_path=str(tmp_path / "does_not_exist.pt"),
+        )
+        record_registry_entry(conn, entry)
+
+        assert load_promoted_model(conn, instrument="BTC-USD") is None

@@ -34,6 +34,7 @@ from andy_trader.predict import load_closes
 from andy_trader.promotion import DEFAULT_MINIMUM_HOLDOUT_BARS, evaluate_promotion_gate
 from andy_trader.registry import (
     ModelRegistryEntry,
+    fetch_latest_promoted_model,
     fetch_registry_entries,
     initialize_registry,
     record_registry_entry,
@@ -45,6 +46,7 @@ DEFAULT_LOOKBACK = 24
 DEFAULT_TRAIN_BARS = 168  # 7 days of 1h bars
 DEFAULT_HOLDOUT_BARS = 24  # 24 hours holdout
 DEFAULT_RETRAIN_INTERVAL_BARS = 24
+MODELS_DIR = REPO_ROOT / "models"  # gitignored, same treatment as the .db file
 
 
 @dataclass
@@ -174,6 +176,67 @@ class MultimodalTorchPredictor:
         with torch.no_grad():
             logit = self._network(inputs) / self._temperature
             return float(torch.sigmoid(logit).item())
+
+    def save(self, path: Path) -> None:
+        """Persist weights and everything needed to reconstruct this exact predictor.
+
+        Without this, `model_registry.weights_path` was always None and a
+        promoted model could never actually be loaded and used -- the
+        registry recorded that a model *would have* traded, not a model
+        that *could*. Only ever called for a candidate that has already
+        cleared the promotion gate; an unpromoted model's weights are
+        never useful to load, so they are never saved.
+        """
+
+        torch, _ = _torch_modules()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "state_dict": self._network.state_dict(),
+                "means": self._means,
+                "scales": self._scales,
+                "temperature": self._temperature,
+                "seed": self.seed,
+                "lookback": self.lookback,
+                "epochs": self.epochs,
+                "learning_rate": self.learning_rate,
+                "feature_count": self.feature_count,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> "MultimodalTorchPredictor":
+        """Reconstruct a fitted predictor from a file written by `save`.
+
+        Rebuilds the exact same architecture shape before loading the state
+        dict -- PyTorch's `load_state_dict` matches by parameter name and
+        shape, not by re-deriving the network topology, so the constructor
+        call here must exactly mirror `fit`'s `nn.Sequential`.
+        """
+
+        torch, nn = _torch_modules()
+        payload = torch.load(path, weights_only=False)
+        predictor = cls(
+            seed=payload["seed"],
+            lookback=payload["lookback"],
+            epochs=payload["epochs"],
+            learning_rate=payload["learning_rate"],
+        )
+        network = nn.Sequential(
+            nn.Linear(payload["feature_count"], 16),
+            nn.Tanh(),
+            nn.Linear(16, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1),
+        )
+        network.load_state_dict(payload["state_dict"])
+        network.eval()
+        predictor._network = network
+        predictor._means = tuple(payload["means"])
+        predictor._scales = tuple(payload["scales"])
+        predictor._temperature = float(payload["temperature"])
+        return predictor
 
 
 def should_retrain(
@@ -314,6 +377,16 @@ def run_retrain_window(
     stamp_id = now.replace("-", "").replace(":", "").replace("+", "").replace(".", "_")
     model_id = f"torch_mlp_{instrument.lower()}_{stamp_id}_s{seed}"
 
+    # Only a promoted candidate's weights are ever saved. An unpromoted
+    # model's weights would never be loaded by anything -- the registry
+    # already keeps its score for the audit trail, which is all a rejected
+    # candidate needs.
+    weights_path: str | None = None
+    if decision.promoted:
+        weights_file = MODELS_DIR / f"{model_id}.pt"
+        predictor.save(weights_file)
+        weights_path = str(weights_file)
+
     entry = ModelRegistryEntry(
         model_id=model_id,
         trained_at=now,
@@ -340,10 +413,31 @@ def run_retrain_window(
         base_rate_brier_skill=base_rate_report.brier_skill_score,
         promoted=decision.promoted,
         promotion_reason=decision.reason,
+        weights_path=weights_path,
     )
 
     record_registry_entry(connection, entry)
     return entry
+
+
+def load_promoted_model(
+    connection: sqlite3.Connection, *, instrument: str, horizon: str = "1h", interval: str = "1h"
+) -> MultimodalTorchPredictor | None:
+    """Load the most recently promoted model for live use, or None if there isn't one.
+
+    Returns None (never raises) whenever there is nothing to load: no model
+    has ever been promoted for this pair, or the on-disk weights file is
+    missing (e.g. moved, or trained on a machine other than this one). A
+    missing model is simply a reason not to trade it, not a crash.
+    """
+
+    entry = fetch_latest_promoted_model(connection, instrument, horizon, interval=interval)
+    if entry is None or not entry.weights_path:
+        return None
+    weights_file = Path(entry.weights_path)
+    if not weights_file.exists():
+        return None
+    return MultimodalTorchPredictor.load(weights_file)
 
 
 def run_walk_forward_retraining(

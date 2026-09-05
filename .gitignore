@@ -10,6 +10,11 @@
 .session-run.log
 .cycle-run.jsonl
 
+# Saved weights for promoted CT-07 models. Regenerable by re-running the
+# training/promotion pipeline against the (also gitignored) database; the
+# model_registry table already keeps the auditable record of every attempt.
+models/
+
 # Credentials
 .env
 .env.*
