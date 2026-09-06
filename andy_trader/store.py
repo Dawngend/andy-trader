@@ -8,7 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Iterable, Mapping, Sequence
+from typing import Collection, Iterable, Mapping, Sequence
 
 from andy_trader.env import REPO_ROOT
 
@@ -18,10 +18,22 @@ DEFAULT_DB_FILENAME = "crypto_observations.db"
 # adding it to _HORIZON_DELTAS makes every prediction at that horizon
 # permanently unsettleable, which is silent and therefore worse than a crash.
 _HORIZON_DELTAS: Mapping[str, timedelta] = {
+    # Sub-hourly horizons exist for the intra-round continuation strategy. They
+    # are only settleable against 1m bars: settling a 2m call against the
+    # default 1h series would compare a price up to 90 minutes away and score
+    # pure noise as skill. Callers using these MUST pass interval="1m" and a
+    # tight tolerance to `settle_due_predictions`; `settle_fast_predictions`
+    # in andy_trader.fast_momentum is the safe entry point.
+    "1m": timedelta(minutes=1),
+    "2m": timedelta(minutes=2),
+    "5m": timedelta(minutes=5),
     "1h": timedelta(hours=1),
     "4h": timedelta(hours=4),
     "1d": timedelta(days=1),
 }
+
+# Horizons that must never be settled against the hourly series.
+FAST_HORIZONS = frozenset({"1m", "2m", "5m"})
 
 
 class CryptoStoreError(RuntimeError):
@@ -339,24 +351,45 @@ def settle_due_predictions(
     now_iso: str | None = None,
     interval: str = "1h",
     tolerance_minutes: int = 90,
+    horizons: Collection[str] | None = None,
 ) -> dict[str, int]:
     """Resolve every prediction whose horizon has elapsed.
 
     This function deliberately never reads probability_up. It looks up the price
     and compares it to reference_price. Keeping the outcome computation blind to
     the call is what stops a settlement bug from flattering the score.
+
+    `horizons` restricts which horizons this pass will touch. It defaults to
+    "every horizon except the sub-hourly ones", because the default 90-minute
+    tolerance against an hourly series would settle a 2-minute call using a
+    price from over an hour away and record the resulting coin flip as a real
+    outcome. Fast horizons must be settled by their own pass against 1m bars.
     """
 
     now = now_iso or utc_now_iso()
-    pending = connection.execute(
-        """
+    if horizons is None:
+        selected = None if interval in {"1m", "5m"} else "exclude_fast"
+    else:
+        selected = tuple(horizons)
+
+    query = """
         SELECT id, instrument, reference_price, resolves_at
         FROM crypto_predictions
         WHERE settled_at IS NULL AND resolves_at <= ?
-        ORDER BY resolves_at ASC
-        """,
-        (now,),
-    ).fetchall()
+    """
+    params: list[object] = [now]
+    if selected == "exclude_fast":
+        placeholders = ", ".join("?" for _ in FAST_HORIZONS)
+        query += f" AND horizon NOT IN ({placeholders})"
+        params.extend(sorted(FAST_HORIZONS))
+    elif isinstance(selected, tuple):
+        if not selected:
+            return {"due": 0, "settled": 0, "unresolvable": 0}
+        placeholders = ", ".join("?" for _ in selected)
+        query += f" AND horizon IN ({placeholders})"
+        params.extend(selected)
+    query += " ORDER BY resolves_at ASC"
+    pending = connection.execute(query, params).fetchall()
 
     settled = 0
     unresolvable = 0

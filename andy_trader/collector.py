@@ -74,6 +74,24 @@ _COINGECKO_IDS = {
 # granularity for you and cannot be pinned to an hour.
 _COINGECKO_DAYS = {"1h": 7, "1d": 90}
 
+# Binance spot klines. Keyless, and the ONLY venue on this connection that
+# serves sub-hourly bars: probed 2026-09-06, api.binance.com returned 200 for
+# 1m klines in the same pass where bybit, kraken, coinbase and okx all failed
+# the TLS check described above. That asymmetry is consistent with the PLDT
+# block list being per-domain rather than the venues being down, so Binance is
+# registered as the fast-interval source rather than as a general replacement.
+_BINANCE_INTERVALS = {"1m": "1m", "5m": "5m", "1h": "1h", "4h": "4h", "1d": "1d"}
+_BINANCE_SYMBOLS = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+    "SOL-USD": "SOLUSDT",
+    "XRP-USD": "XRPUSDT",
+    "DOGE-USD": "DOGEUSDT",
+    "ADA-USD": "ADAUSDT",
+    "AVAX-USD": "AVAXUSDT",
+    "LINK-USD": "LINKUSDT",
+}
+
 # Bybit v5 spot klines. Keyless, and the only venue here that returns a full
 # OHLCV bar at both 1h and 4h, which is why it leads the default order.
 _BYBIT_INTERVALS = {"1h": "60", "4h": "240", "1d": "D"}
@@ -335,7 +353,64 @@ def fetch_bybit(
     return candles
 
 
+def fetch_binance(
+    instrument: str,
+    interval: str,
+    settings: FetchSettings,
+    *,
+    http: Callable[[str, FetchSettings], object] | None = None,
+) -> list[Candle]:
+    """Full OHLCV bars from Binance spot klines. Keyless, no account needed.
+
+    This is the only registered venue serving 1m and 5m bars, which is what the
+    intra-round continuation strategy needs; every other venue here starts at
+    1h. Like Bybit it is USDT-quoted, so rows land under venue="binance" and are
+    never merged with a USD-quoted series.
+
+    limit=500 covers just over eight hours of 1m bars, so a collector running on
+    any cadence up to hourly re-fetches the whole gap and the content-hash dedup
+    in `record_observations` collapses the overlap onto existing rows.
+    """
+
+    symbol = _BINANCE_SYMBOLS.get(instrument)
+    binance_interval = _BINANCE_INTERVALS.get(interval)
+    if symbol is None or binance_interval is None:
+        return []
+    url = (
+        "https://api.binance.com/api/v3/klines"
+        f"?symbol={symbol}&interval={binance_interval}&limit=500"
+    )
+    getter = http or (lambda u, s: _http_json(u, s))
+    payload = getter(url, settings)
+    if isinstance(payload, Mapping) and "code" in payload:
+        raise ValueError(f"Binance API error {payload.get('code')}: {payload.get('msg')}")
+    if not isinstance(payload, list):
+        raise ValueError(f"unexpected Binance payload type {type(payload).__name__}")
+    candles: list[Candle] = []
+    for row in payload:
+        # [openTime_ms, open, high, low, close, volume, closeTime, ...], oldest
+        # first, numeric fields as strings.
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        stamp, open_, high, low, close, volume = row[:6]
+        candles.append(
+            Candle(
+                instrument=instrument,
+                venue="binance",
+                interval=interval,
+                open_time=datetime.fromtimestamp(int(stamp) / 1000, UTC).isoformat(),
+                open=float(open_),
+                high=float(high),
+                low=float(low),
+                close=float(close),
+                volume=float(volume),
+            )
+        )
+    return candles
+
+
 VENUES: Mapping[str, Callable[..., list[Candle]]] = {
+    "binance": fetch_binance,
     "bybit": fetch_bybit,
     "coingecko": fetch_coingecko,
     "coinbase": fetch_coinbase,
@@ -346,7 +421,11 @@ VENUES: Mapping[str, Callable[..., list[Candle]]] = {
 # testing, so a pass where the exchange is unreachable still collects something.
 # Coinbase and Kraken stay registered and tested but out of the default, since
 # adding venues multiplies requests without adding much beyond a consensus check.
-DEFAULT_VENUES = ("bybit", "coingecko")
+# Binance joins the default order because it was the one exchange reachable in
+# the 2026-09-06 probe and the only source of sub-hourly bars. It does not
+# replace CoinGecko: CoinGecko remains the never-blocked fallback, and keeping
+# both means a pass where the exchange domains are block-paged still collects.
+DEFAULT_VENUES = ("binance", "bybit", "coingecko")
 
 
 def collect(

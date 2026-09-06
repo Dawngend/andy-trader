@@ -84,6 +84,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--fast-instruments",
+        help=(
+            "Comma-separated instruments to run the 1-minute continuation strategy for, e.g. "
+            "'BTC-USD'. Opt-in only, via this flag or CRYPTO_FAST_INSTRUMENTS. This collects 1m "
+            "bars, settles any due sub-hourly calls against them, and emits a call when the "
+            "cycle happens to land on a round's decision minute. NOTE: a 5-minute strategy "
+            "cannot be traded from a 15-minute cadence -- on that schedule this mostly just "
+            "accumulates the 1m history the continuation curve is fitted from, which is a "
+            "prerequisite worth running on its own. Live calls need their own ~1-minute task."
+        ),
+    )
+    parser.add_argument(
         "--retrain-instruments",
         help=(
             "Comma-separated instruments to check/run CT-07 retraining for this cycle, e.g. "
@@ -193,6 +205,65 @@ def main(argv: Sequence[str] | None = None) -> int:
                 maximum_data_age_minutes=maximum_data_age_minutes,
             )
             settled = settle_due_predictions(connection, interval=reference_interval)
+
+            # The 1-minute continuation path. Opt-in, and deliberately separate
+            # from everything above: its predictions settle against 1m bars, and
+            # letting the hourly settlement pass near them would resolve a
+            # 2-minute call with a price from another hour entirely.
+            fast_spec = args.fast_instruments or os.environ.get("CRYPTO_FAST_INSTRUMENTS", "")
+            fast_instruments = tuple(i.strip() for i in fast_spec.split(",") if i.strip())
+            fast_results: list[dict[str, object]] = []
+            if fast_instruments:
+                try:
+                    from andy_trader.fast_momentum import (
+                        build_rounds,
+                        fit_continuation_curve,
+                        load_minute_closes,
+                        predict_round_once,
+                        settle_fast_predictions,
+                    )
+
+                    fast_candles, fast_problems = collect(
+                        instruments=fast_instruments,
+                        intervals=("1m",),
+                        venues=("binance",),
+                        settings=settings,
+                    )
+                    if fast_candles:
+                        record_observations(connection, fast_candles)
+                    fast_settled = settle_fast_predictions(connection)
+
+                    for instrument in fast_instruments:
+                        # The curve is fitted only on rounds that have already
+                        # settled, so it never sees the round it is about to call.
+                        history = build_rounds(load_minute_closes(connection, instrument))
+                        curve = fit_continuation_curve(history)
+                        prediction = predict_round_once(
+                            connection, instrument=instrument, curve=curve
+                        )
+                        fast_results.append(
+                            {
+                                "instrument": instrument,
+                                "rounds_known": len(history),
+                                "called": prediction is not None,
+                                "probability_up": (
+                                    prediction.probability_up if prediction else None
+                                ),
+                            }
+                        )
+                    _journal(
+                        "fast_cycle_completed",
+                        candles=len(fast_candles),
+                        problems=len(fast_problems),
+                        settled=fast_settled.get("settled", 0),
+                        attempts=fast_results,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill the main cycle
+                    _journal(
+                        "fast_cycle_failed",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:400],
+                    )
 
             # Opt-in, since retraining spends real compute: only the
             # instruments explicitly configured get a new training pass

@@ -27,8 +27,10 @@ __pycache__/
 venv/
 .pytest_cache/
 # Windows refuses to unlink pytest's default temp symlink, so runs here use
-# --basetemp=.pytest-tmp instead of the system temp directory.
-.pytest-tmp/
+# --basetemp=.pytest-tmp instead of the system temp directory. The glob also
+# covers per-run variants, which matter when two pytest processes share the
+# repo: concurrent runs against one basetemp collide on Windows cleanup.
+.pytest-tmp*/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
