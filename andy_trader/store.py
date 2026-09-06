@@ -236,8 +236,12 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             down_fill_shares REAL NOT NULL,
             up_fill_cost REAL,
             down_fill_cost REAL,
+            up_fee_cost REAL,
+            down_fee_cost REAL,
             combined_cost REAL,
             mispriced INTEGER CHECK (mispriced IN (0, 1) OR mispriced IS NULL),
+            net_combined_cost REAL,
+            net_mispriced INTEGER CHECK (net_mispriced IN (0, 1) OR net_mispriced IS NULL),
             unmeasurable_reason TEXT
         )
         """
@@ -246,6 +250,24 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS complete_set_observations_round "
         "ON complete_set_observations(round_id, observed_at)"
     )
+    complete_set_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(complete_set_observations)")
+    }
+    # Fee-awareness was added a few hours after this table's first night of
+    # data collection (the fee formula needed confirming against Polymarket's
+    # own docs first). These columns are additive and nullable specifically so
+    # the already-recorded rows are never rewritten -- they simply carry no fee
+    # figure, which is honestly what is true: it was not computed at the time.
+    for column in ("up_fee_cost", "down_fee_cost", "net_combined_cost"):
+        if column not in complete_set_columns:
+            connection.execute(
+                f"ALTER TABLE complete_set_observations ADD COLUMN {column} REAL"
+            )
+    if "net_mispriced" not in complete_set_columns:
+        connection.execute(
+            "ALTER TABLE complete_set_observations ADD COLUMN net_mispriced INTEGER "
+            "CHECK (net_mispriced IN (0, 1) OR net_mispriced IS NULL)"
+        )
 
 
 def record_observations(connection: sqlite3.Connection, candles: Iterable[Candle]) -> tuple[int, int]:

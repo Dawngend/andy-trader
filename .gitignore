@@ -38,6 +38,11 @@ venv/
 build/
 dist/
 
+# One-night scratch runner for CT-11 data collection, run directly rather than
+# scheduled since registering a real task needs elevation. Not part of CT-11
+# itself; kept locally in case another overnight collection run is useful.
+overnight_complete_set_collect.py
+
 # OS
 Thumbs.db
 desktop.ini

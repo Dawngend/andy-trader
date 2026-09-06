@@ -6,12 +6,14 @@ import pytest
 
 import andy_trader.complete_set as complete_set
 from andy_trader.complete_set import (
+    CRYPTO_TAKER_FEE_RATE,
     CompleteSetError,
     _http_json,
     collect_current_round,
     observe_complete_set,
     record_complete_set_observation,
     summarize_history,
+    taker_fee,
     walk_ask_book,
 )
 from andy_trader.store import connect
@@ -146,6 +148,209 @@ def test_clob_no_order_book_response_becomes_an_empty_snapshot(
     monkeypatch.setattr(complete_set, "urlopen", no_book)
 
     assert _http_json(url, 3.0) == {"asks": [], "bids": []}
+
+
+def test_taker_fee_matches_polymarkets_own_worked_example() -> None:
+    """docs.polymarket.com/trading/fees states the Crypto-category peak fee is
+    $1.75 per 100 shares at p=0.50. If this drifts from Polymarket's own
+    number, every downstream net-of-fees figure is quietly wrong."""
+
+    fee = taker_fee(100, 0.50, CRYPTO_TAKER_FEE_RATE)
+
+    assert float(fee) == pytest.approx(1.75)
+
+
+def test_taker_fee_is_symmetric_and_zero_at_the_edges() -> None:
+    assert taker_fee(100, 0.30, CRYPTO_TAKER_FEE_RATE) == taker_fee(100, 0.70, CRYPTO_TAKER_FEE_RATE)
+    assert float(taker_fee(100, 0.01, CRYPTO_TAKER_FEE_RATE)) == pytest.approx(0.0693, abs=1e-4)
+
+
+def test_the_real_finding_a_gross_mispricing_the_fee_fully_consumes() -> None:
+    """The actual shape found on this project's first night of live collection:
+    combined_cost was $0.99 (looks mispriced), and Polymarket's own 7% crypto
+    taker fee, charged on both legs, is enough by itself to erase it. Being
+    statistically/structurally cheaper than $1 is not the same claim as being
+    net-of-fees cheaper than $1, and a detector that only reports the first
+    one would have told Dawn this was free money when it was not."""
+
+    observation = observe_complete_set(
+        "btc-updown-5m-real-example",
+        "2026-09-06T23:00:00+00:00",
+        _book((0.48, 100)),
+        _book((0.51, 100)),
+        target_notional=10,
+    )
+
+    assert observation.combined_cost == pytest.approx(0.99)
+    assert observation.mispriced is True
+    # fee = 10 * 0.07 * p * (1-p) per leg
+    expected_fee = float(taker_fee(10, 0.48, CRYPTO_TAKER_FEE_RATE)) + float(
+        taker_fee(10, 0.51, CRYPTO_TAKER_FEE_RATE)
+    )
+    assert observation.up_fee_cost + observation.down_fee_cost == pytest.approx(expected_fee)
+    assert observation.net_combined_cost == pytest.approx(0.99 + expected_fee / 10)
+    assert observation.net_mispriced is False
+
+
+def test_a_large_enough_gap_survives_the_fee() -> None:
+    """The other real shape from that same night: a handful of rounds were
+    cheap enough (around $0.94-0.95) that the fee did not fully close the gap.
+    The detector must be able to say yes here, not just no everywhere."""
+
+    observation = observe_complete_set(
+        "btc-updown-5m-survives",
+        "2026-09-06T23:05:00+00:00",
+        _book((0.50, 100)),
+        _book((0.44, 100)),
+        target_notional=10,
+    )
+
+    assert observation.combined_cost == pytest.approx(0.94)
+    assert observation.net_mispriced is True
+    assert observation.net_combined_cost < 1.0
+
+
+def test_fee_is_walked_per_level_not_approximated_from_the_average_price() -> None:
+    """p*(1-p) is concave, so pricing the whole fill at its average price would
+    give a different (biased) number than summing each level's own fee. A fill
+    spanning 0.30 for 5 shares and 0.60 for 5 shares must charge those two
+    levels their own fee, not 10 shares at an average price of 0.45."""
+
+    fill = walk_ask_book(_book((0.30, 5), (0.60, 5)), 10)
+
+    exact = float(taker_fee(5, 0.30, CRYPTO_TAKER_FEE_RATE)) + float(
+        taker_fee(5, 0.60, CRYPTO_TAKER_FEE_RATE)
+    )
+    approximated_from_average = float(taker_fee(10, 0.45, CRYPTO_TAKER_FEE_RATE))
+
+    assert fill.fee_cost == pytest.approx(exact)
+    assert fill.fee_cost != pytest.approx(approximated_from_average)
+
+
+def test_an_unmeasurable_side_has_no_fee_either() -> None:
+    """A fill that could not complete never actually executed, so it does not
+    owe a taker fee on the shares it could not get -- None, not zero, since
+    zero would misleadingly claim a real, costed, completed transaction."""
+
+    observation = observe_complete_set(
+        "btc-updown-5m-thin",
+        "2026-09-06T23:10:00+00:00",
+        _book((0.40, 5)),
+        _book((0.50, 100)),
+    )
+
+    assert observation.up_fee_cost is None
+    assert observation.net_combined_cost is None
+    assert observation.net_mispriced is None
+
+
+def test_migrating_a_pre_fee_database_adds_columns_without_touching_old_rows(
+    tmp_path: Path,
+) -> None:
+    """The real production database already held 474 observations, recorded
+    hours before the fee columns existed. Opening it again must add the new
+    columns without rewriting a single previously-recorded fact."""
+    import sqlite3
+
+    database = tmp_path / "pre_fee.db"
+    raw = sqlite3.connect(database)
+    raw.execute(
+        """
+        CREATE TABLE complete_set_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            target_notional REAL NOT NULL,
+            up_best_ask REAL, down_best_ask REAL,
+            up_best_ask_depth_shares REAL, down_best_ask_depth_shares REAL,
+            up_best_ask_depth_notional REAL, down_best_ask_depth_notional REAL,
+            naive_combined_cost REAL,
+            up_fill_shares REAL NOT NULL, down_fill_shares REAL NOT NULL,
+            up_fill_cost REAL, down_fill_cost REAL,
+            combined_cost REAL, mispriced INTEGER,
+            unmeasurable_reason TEXT
+        )
+        """
+    )
+    raw.execute(
+        "INSERT INTO complete_set_observations "
+        "(round_id, observed_at, target_notional, up_fill_shares, down_fill_shares, "
+        " combined_cost, mispriced) VALUES ('old-round', '2026-09-06T22:00:00+00:00', "
+        "10.0, 10.0, 10.0, 0.99, 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    with connect(database) as connection:
+        row = connection.execute(
+            "SELECT round_id, combined_cost, mispriced, net_combined_cost, net_mispriced "
+            "FROM complete_set_observations WHERE round_id = 'old-round'"
+        ).fetchone()
+
+    assert row["combined_cost"] == pytest.approx(0.99)
+    assert row["mispriced"] == 1
+    assert row["net_combined_cost"] is None
+    assert row["net_mispriced"] is None
+
+
+def test_report_derives_net_mispricing_for_rows_older_than_the_fee_columns(
+    tmp_path: Path,
+) -> None:
+    """The exact bug caught while reviewing the real overnight data: the report
+    said '0 net mispriced' immediately after adding the fee columns, because
+    all 474 real rows predated them and a bare COUNT over a NULL column reads
+    as zero. Zero found and zero computed are different facts, and only the
+    second one was true. The report must derive an approximate answer from the
+    raw fields those old rows already have, not report a false zero."""
+    import sqlite3
+
+    database = tmp_path / "pre_fee_data.db"
+    raw = sqlite3.connect(database)
+    raw.execute(
+        """
+        CREATE TABLE complete_set_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id TEXT NOT NULL, observed_at TEXT NOT NULL, target_notional REAL NOT NULL,
+            up_best_ask REAL, down_best_ask REAL,
+            up_best_ask_depth_shares REAL, down_best_ask_depth_shares REAL,
+            up_best_ask_depth_notional REAL, down_best_ask_depth_notional REAL,
+            naive_combined_cost REAL,
+            up_fill_shares REAL NOT NULL, down_fill_shares REAL NOT NULL,
+            up_fill_cost REAL, down_fill_cost REAL,
+            combined_cost REAL, mispriced INTEGER, unmeasurable_reason TEXT
+        )
+        """
+    )
+    # A round cheap enough (0.94, matching the real night's best case) to
+    # survive the fee even under the approximation.
+    raw.execute(
+        "INSERT INTO complete_set_observations "
+        "(round_id, observed_at, target_notional, up_best_ask, down_best_ask, "
+        " up_fill_shares, down_fill_shares, up_fill_cost, down_fill_cost, "
+        " combined_cost, mispriced) VALUES "
+        "('old-cheap', '2026-09-06T22:00:00+00:00', 10.0, 0.50, 0.44, "
+        " 10.0, 10.0, 5.0, 4.4, 0.94, 1)"
+    )
+    # A round only marginally under $1 (0.99, the real night's median case),
+    # which the fee alone should erase.
+    raw.execute(
+        "INSERT INTO complete_set_observations "
+        "(round_id, observed_at, target_notional, up_best_ask, down_best_ask, "
+        " up_fill_shares, down_fill_shares, up_fill_cost, down_fill_cost, "
+        " combined_cost, mispriced) VALUES "
+        "('old-thin-margin', '2026-09-06T22:05:00+00:00', 10.0, 0.48, 0.51, "
+        " 10.0, 10.0, 4.8, 5.1, 0.99, 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    with connect(database) as connection:
+        report = summarize_history(connection)
+
+    assert report.mispriced_rounds == 2  # the gross, pre-fee count is unchanged
+    assert report.net_mispriced_rounds == 1  # only the genuinely cheap one survives
+    assert report.net_mispriced_costs
+    assert report.net_mispriced_costs[0] < 1.0
 
 
 def test_collector_rejects_invalid_target_before_network() -> None:
