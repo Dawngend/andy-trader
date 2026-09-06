@@ -232,12 +232,17 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
         starting_cash_sql = (
             "s.starting_cash" if "starting_cash" in columns else "10000.0 AS starting_cash"
         )
+        basis_sql = (
+            "s.basis_started_at"
+            if "basis_started_at" in columns
+            else "NULL AS basis_started_at"
+        )
         # Books that have actually traded sort first. Ordering alphabetically
         # put eight brand-new, never-traded pairs above eight with a hundred
         # points of history each, so the monitor opened on a wall of empty
         # charts and looked broken when it was merely sorted badly.
         rows = connection.execute(
-            f"SELECT s.predictor, s.instrument, {starting_cash_sql}, "
+            f"SELECT s.predictor, s.instrument, {starting_cash_sql}, {basis_sql}, "
             "s.cash, s.position_qty, s.avg_entry_price, s.updated_at "
             "FROM paper_portfolio_state s "
             "ORDER BY (SELECT COUNT(*) FROM paper_trades t "
@@ -250,14 +255,22 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
     for row in rows:
         predictor, instrument = row["predictor"], row["instrument"]
+        basis_started_at = (
+            row["basis_started_at"] if "basis_started_at" in row.keys() else None
+        )
         curve = [
             dict(point)
             for point in reversed(
                 connection.execute(
                     "SELECT * FROM paper_equity_curve "
                     "WHERE predictor = ? AND instrument = ? "
+                    # Points recorded before the book's capital basis was reset
+                    # belong to a different book. Drawing them against the new
+                    # starting value renders an accounting change as a vertical
+                    # cliff that reads like a total loss.
+                    "AND (? IS NULL OR recorded_at >= ?) "
                     "ORDER BY recorded_at DESC LIMIT 200",
-                    (predictor, instrument),
+                    (predictor, instrument, basis_started_at, basis_started_at),
                 ).fetchall()
             )
         ]
@@ -265,6 +278,14 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
             "SELECT id FROM paper_trades WHERE predictor = ? AND instrument = ? LIMIT 1000",
             (predictor, instrument),
         ).fetchall()
+        # Trades on the CURRENT capital basis. The lifetime count stays in the
+        # table as the historical record, but only these have an equity curve
+        # that can honestly be drawn against today's starting value.
+        trades_since_basis = connection.execute(
+            "SELECT COUNT(*) AS n FROM paper_trades "
+            "WHERE predictor = ? AND instrument = ? AND (? IS NULL OR executed_at >= ?)",
+            (predictor, instrument, basis_started_at, basis_started_at),
+        ).fetchone()["n"]
         latest_equity = curve[-1]["equity"] if curve else float(row["cash"])
         starting_equity = float(row["starting_cash"])
         risk_state = _risk_state(connection, predictor=predictor, instrument=instrument)
@@ -283,6 +304,7 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
                 "starting_equity": starting_equity,
                 "return_pct": (latest_equity / starting_equity - 1.0) * 100.0 if starting_equity else 0.0,
                 "trade_count": len(trades),
+                "trades_since_basis": trades_since_basis,
                 "equity_curve": [point["equity"] for point in curve[-100:]],
                 "equity_curve_full": [
                     {"time": point["recorded_at"], "equity": point["equity"]} for point in curve
@@ -650,37 +672,50 @@ function renderBigCharts(portfolios) {
   // full-height empty panel for each one buried the books that DO have history
   // under a wall of blank boxes. Blocked pairs are still worth knowing about,
   // so they are summarised in one line instead of eight charts.
-  const traded = portfolios.filter(p => p.trade_count > 0);
-  const blocked = portfolios.filter(p => p.trade_count === 0);
+  // Only a book that has traded on its CURRENT capital basis has an equity
+  // curve worth drawing. Lifetime trade count is not the test: after a rebase a
+  // book can have 26 historical trades and no curve, because those trades
+  // belong to a different starting value.
+  const traded = portfolios.filter(p => p.trades_since_basis > 0);
+  const idle = portfolios.filter(p => p.trades_since_basis === 0);
 
-  if (blocked.length) {
+  if (idle.length) {
     const note = document.createElement("div");
     note.className = "blocked-note";
-    const names = blocked.map(p => `${p.predictor.replace(/^baseline:/, "")} on ${p.instrument}`);
-    note.textContent =
-      `${blocked.length} pair${blocked.length === 1 ? "" : "s"} have not cleared the skill gate ` +
-      `and hold no position, so they have no equity curve yet: ` + names.join(", ") + ".";
+    const blocked = idle.filter(p => p.trade_count === 0);
+    const rebased = idle.filter(p => p.trade_count > 0);
+    const parts = [];
+    if (blocked.length) {
+      parts.push(
+        `${blocked.length} pair${blocked.length === 1 ? " has" : "s have"} never traded ` +
+        `— not cleared by the skill gate.`
+      );
+    }
+    if (rebased.length) {
+      parts.push(
+        `${rebased.length} pair${rebased.length === 1 ? " has" : "s have"} trade history ` +
+        `on an earlier capital basis but nothing since being rebased, so there is no ` +
+        `curve to draw against today's starting value.`
+      );
+    }
+    note.textContent = "Nothing is currently trading. " + parts.join(" ");
     container.appendChild(note);
   }
 
-  if (!traded.length) {
-    const none = document.createElement("div");
-    none.className = "blocked-note";
-    none.textContent =
-      "No pair has traded yet, so there are no equity curves to draw. " +
-      "Latest prices are in the table below.";
-    container.appendChild(none);
-  }
-
-  // One price chart per instrument, not per book. Two predictors on the same
-  // coin share one price series, and drawing it twice was pure duplication.
-  const pricedInstruments = new Set();
+  // Price charts render for every instrument regardless of whether anything is
+  // trading it. The market is worth watching even when the book is idle, and
+  // tying them to the equity loop meant an idle book hid the market entirely.
+  const instruments = [];
+  portfolios.forEach(p => {
+    if (!instruments.some(i => i.instrument === p.instrument)) {
+      instruments.push({ instrument: p.instrument, price_series: p.price_series });
+    }
+  });
 
   traded.forEach(p => {
     const row = document.createElement("div");
     row.className = "bigchart-row";
     row.style.marginBottom = "20px";
-
     const equityValues = (p.equity_curve_full || []).map(pt => pt.equity);
     row.appendChild(
       bigChartCard(
@@ -689,21 +724,27 @@ function renderBigCharts(portfolios) {
         { referenceValue: p.starting_equity, valuePrefix: "$" }
       )
     );
-
     const priceValues = (p.price_series || []).map(pt => pt.close);
-    if (!pricedInstruments.has(p.instrument)) {
-      pricedInstruments.add(p.instrument);
-      row.appendChild(
-        bigChartCard(
-          `${p.instrument} Price (real market)`,
-          priceValues,
-          { valuePrefix: "$" }
-        )
-      );
-    }
-
+    row.appendChild(
+      bigChartCard(`${p.instrument} Price (real market)`, priceValues, { valuePrefix: "$" })
+    );
     container.appendChild(row);
   });
+
+  const shown = new Set(traded.map(p => p.instrument));
+  const remaining = instruments.filter(i => !shown.has(i.instrument));
+  for (let n = 0; n < remaining.length; n += 2) {
+    const row = document.createElement("div");
+    row.className = "bigchart-row";
+    row.style.marginBottom = "20px";
+    remaining.slice(n, n + 2).forEach(i => {
+      const priceValues = (i.price_series || []).map(pt => pt.close);
+      row.appendChild(
+        bigChartCard(`${i.instrument} Price (real market)`, priceValues, { valuePrefix: "$" })
+      );
+    });
+    container.appendChild(row);
+  }
 }
 
 async function refresh() {

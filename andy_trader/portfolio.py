@@ -203,6 +203,14 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
             "ALTER TABLE paper_portfolio_state "
             f"ADD COLUMN starting_cash REAL NOT NULL DEFAULT {DEFAULT_STARTING_CASH}"
         )
+    if "basis_started_at" not in columns:
+        # When a book's capital basis is reset, its old equity points belong to
+        # a different book and must not be drawn against the new starting value.
+        # Without this, rebasing from $10,000 to $15.97 rendered as a vertical
+        # cliff that read like a 99.8% loss instead of an accounting change.
+        connection.execute(
+            "ALTER TABLE paper_portfolio_state ADD COLUMN basis_started_at TEXT"
+        )
     connection.commit()
 
 
