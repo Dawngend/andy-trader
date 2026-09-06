@@ -43,9 +43,45 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import sqlite3
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 DEFAULT_STARTING_CASH = 10_000.0
+
+# Environment override for the stake a NEW paper portfolio opens with.
+#
+# The number is deliberately not cosmetic. Every cost in this module is charged
+# in basis points, so percentage returns are scale-invariant: $80,000 and $128
+# produce the identical return curve. What the stake size actually changes is
+# what it makes VISIBLE. A book funded with a real, losable amount exposes
+# constraints that a large round number hides -- most importantly that real
+# venues enforce a minimum order notional (commonly $5-10 on spot), so a stake
+# spread thin enough per instrument could not be executed at all. Simulating a
+# size you would not really trade is a quiet way to get an unexecutable result.
+STARTING_CASH_ENV = "CRYPTO_PAPER_STARTING_CASH"
+
+
+def configured_starting_cash(environ: "Mapping[str, str] | None" = None) -> float:
+    """Starting stake for a new paper portfolio, overridable by environment.
+
+    Existing portfolios are untouched: `starting_cash` is stored per row, so
+    changing this never silently rewrites the basis of a book already running.
+    """
+
+    import os
+
+    source = environ if environ is not None else os.environ
+    raw = str(source.get(STARTING_CASH_ENV, "")).strip()
+    if not raw:
+        return DEFAULT_STARTING_CASH
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise PortfolioError(
+            f"{STARTING_CASH_ENV} must be a number, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise PortfolioError(f"{STARTING_CASH_ENV} must be positive, got {value!r}")
+    return value
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
@@ -508,7 +544,7 @@ def run_paper_cycle(
     now_iso: str,
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
-    starting_cash: float = DEFAULT_STARTING_CASH,
+    starting_cash: float | None = None,
 ) -> PaperCycleResult:
     """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
@@ -532,6 +568,12 @@ def run_paper_cycle(
     """
 
     from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
+
+    # Resolved here rather than as a default argument: a default is bound once at
+    # import, so an environment change would not take effect until the process
+    # restarted, and the two would silently disagree.
+    if starting_cash is None:
+        starting_cash = configured_starting_cash()
 
     current_state = get_or_create_state(
         connection,
