@@ -37,12 +37,15 @@ from andy_trader.registry import (
     fetch_latest_promoted_model,
     fetch_registry_entries,
     initialize_registry,
+    is_demoted,
+    record_demotion,
     record_registry_entry,
 )
 from andy_trader.store import (
     Prediction,
     connect,
     default_database_path,
+    fetch_settled,
     horizon_delta,
     record_prediction,
     utc_now_iso,
@@ -55,6 +58,7 @@ DEFAULT_LOOKBACK = 24
 DEFAULT_TRAIN_BARS = 168  # 7 days of 1h bars
 DEFAULT_HOLDOUT_BARS = 24  # 24 hours holdout
 DEFAULT_RETRAIN_INTERVAL_BARS = 24
+DEFAULT_MINIMUM_LIVE_CALLS_FOR_DEMOTION = 30
 MODELS_DIR = REPO_ROOT / "models"  # gitignored, same treatment as the .db file
 
 
@@ -435,13 +439,18 @@ def load_promoted_model(
     """Load the most recently promoted model for live use, or None if there isn't one.
 
     Returns None (never raises) whenever there is nothing to load: no model
-    has ever been promoted for this pair, or the on-disk weights file is
-    missing (e.g. moved, or trained on a machine other than this one). A
-    missing model is simply a reason not to trade it, not a crash.
+    has ever been promoted for this pair, the latest promotion was later
+    demoted, or the on-disk weights file is missing (e.g. moved, or trained
+    on a machine other than this one). A missing model is simply a reason not
+    to trade it, not a crash.
     """
 
     entry = fetch_latest_promoted_model(connection, instrument, horizon, interval=interval)
-    if entry is None or not entry.weights_path:
+    if entry is None:
+        return None
+    if is_demoted(connection, model_id=entry.model_id):
+        return None
+    if not entry.weights_path:
         return None
     weights_file = Path(entry.weights_path)
     if not weights_file.exists():
@@ -475,7 +484,14 @@ def predict_with_promoted_model(
     """
 
     entry = fetch_latest_promoted_model(connection, instrument, horizon, interval=interval)
-    if entry is None or not entry.weights_path:
+    if entry is None:
+        return {"predicted": False, "reason": "no promoted model for this pair yet"}
+    if is_demoted(connection, model_id=entry.model_id):
+        return {
+            "predicted": False,
+            "reason": f"promoted model {entry.model_id} has been demoted",
+        }
+    if not entry.weights_path:
         return {"predicted": False, "reason": "no promoted model for this pair yet"}
 
     weights_file = Path(entry.weights_path)
@@ -516,6 +532,188 @@ def predict_with_promoted_model(
         ),
     )
     return {"predicted": True, "model_id": entry.model_id, "probability_up": probability_up}
+
+
+def check_live_performance_and_demote(
+    connection: sqlite3.Connection,
+    *,
+    instrument: str,
+    horizon: str = "1h",
+    interval: str = "1h",
+    minimum_calls: int = DEFAULT_MINIMUM_LIVE_CALLS_FOR_DEMOTION,
+    now_iso: str | None = None,
+) -> dict[str, object]:
+    """Check whether the effective promoted model still clears its live gate.
+
+    Settled ``model:promoted`` calls are isolated by their recorded underlying
+    model_id and scored against ``baseline:base_rate`` over the same live time
+    window. Once at least ``minimum_calls`` exist, a non-degenerate model whose
+    skill is no better than the baseline gets a new append-only demotion fact.
+    The original registry promotion row is never changed.
+
+    The public boundary intentionally converts every failure into a described
+    no-demotion result, so it is safe to call every cycle even when there is no
+    promoted model or a legacy audit row is malformed.
+    """
+    try:
+        return _check_live_performance_and_demote(
+            connection,
+            instrument=instrument,
+            horizon=horizon,
+            interval=interval,
+            minimum_calls=minimum_calls,
+            now_iso=now_iso,
+        )
+    except Exception as exc:  # noqa: BLE001 - this cycle guard must never raise
+        return {
+            "demoted": False,
+            "status": "error",
+            "reason": f"live demotion check failed: {exc}",
+        }
+
+
+def _check_live_performance_and_demote(
+    connection: sqlite3.Connection,
+    *,
+    instrument: str,
+    horizon: str,
+    interval: str,
+    minimum_calls: int,
+    now_iso: str | None,
+) -> dict[str, object]:
+    if minimum_calls < 1:
+        return {
+            "demoted": False,
+            "status": "invalid_minimum_calls",
+            "reason": f"minimum_calls must be at least 1, got {minimum_calls}",
+        }
+
+    entry = fetch_latest_promoted_model(connection, instrument, horizon, interval=interval)
+    if entry is None:
+        return {
+            "demoted": False,
+            "status": "no_promoted_model",
+            "reason": "no promoted model for this pair yet",
+        }
+    if is_demoted(connection, model_id=entry.model_id):
+        return {
+            "demoted": False,
+            "status": "already_demoted",
+            "model_id": entry.model_id,
+            "reason": f"promoted model {entry.model_id} is already demoted",
+        }
+
+    promoted_rows = fetch_settled(
+        connection,
+        predictor=LIVE_MODEL_PREDICTOR_NAME,
+        instrument=instrument,
+        horizon=horizon,
+    )
+    model_rows = []
+    for row in promoted_rows:
+        try:
+            features = json.loads(row["features_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(features, dict) and features.get("underlying_model_id") == entry.model_id:
+            model_rows.append(row)
+
+    live_call_count = len(model_rows)
+    common = {
+        "demoted": False,
+        "model_id": entry.model_id,
+        "live_call_count": live_call_count,
+    }
+    if live_call_count < minimum_calls:
+        return {
+            **common,
+            "status": "not_enough_calls",
+            "minimum_calls": minimum_calls,
+            "reason": f"need {minimum_calls} settled live calls, have {live_call_count}",
+        }
+
+    candidate_report = evaluate(
+        [float(row["probability_up"]) for row in model_rows],
+        [int(row["outcome_up"]) for row in model_rows],
+    )
+    if candidate_report.degenerate:
+        return {
+            **common,
+            "status": "degenerate",
+            "live_skill": candidate_report.brier_skill_score,
+            "reason": "settled model calls all have the same outcome; more evidence is required",
+        }
+
+    window_start = str(model_rows[0]["created_at"])
+    window_end = str(model_rows[-1]["created_at"])
+    base_rate_rows = fetch_settled(
+        connection,
+        predictor="baseline:base_rate",
+        instrument=instrument,
+        horizon=horizon,
+    )
+    base_rate_rows = [
+        row for row in base_rate_rows
+        if window_start <= str(row["created_at"]) <= window_end
+    ]
+    if not base_rate_rows:
+        return {
+            **common,
+            "status": "not_enough_base_rate_calls",
+            "live_skill": candidate_report.brier_skill_score,
+            "reason": "no settled base-rate calls exist in the model's live window",
+        }
+
+    base_rate_report = evaluate(
+        [float(row["probability_up"]) for row in base_rate_rows],
+        [int(row["outcome_up"]) for row in base_rate_rows],
+    )
+    if base_rate_report.degenerate:
+        return {
+            **common,
+            "status": "degenerate",
+            "live_skill": candidate_report.brier_skill_score,
+            "base_rate_live_skill": base_rate_report.brier_skill_score,
+            "reason": "settled base-rate calls all have the same outcome; more evidence is required",
+        }
+
+    live_skill = candidate_report.brier_skill_score
+    base_rate_live_skill = base_rate_report.brier_skill_score
+    scored = {
+        **common,
+        "live_skill": live_skill,
+        "base_rate_live_skill": base_rate_live_skill,
+    }
+    if live_skill > base_rate_live_skill:
+        return {
+            **scored,
+            "status": "still_clears_bar",
+            "reason": "live model skill still beats live base-rate skill",
+        }
+
+    demotion_reason = (
+        f"live Brier skill {live_skill:+.6f} no longer beats "
+        f"baseline:base_rate {base_rate_live_skill:+.6f}"
+    )
+    demotion_id = record_demotion(
+        connection,
+        model_id=entry.model_id,
+        instrument=instrument,
+        horizon=horizon,
+        interval=interval,
+        demoted_at=now_iso or utc_now_iso(),
+        live_skill=live_skill,
+        live_call_count=candidate_report.count,
+        base_rate_live_skill=base_rate_live_skill,
+        reason=demotion_reason,
+    )
+    return {
+        **scored,
+        "demoted": True,
+        "status": "newly_demoted",
+        "demotion_id": demotion_id,
+        "reason": demotion_reason,
+    }
 
 
 def run_walk_forward_retraining(

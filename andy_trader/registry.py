@@ -74,6 +74,91 @@ def initialize_registry(connection: sqlite3.Connection) -> None:
         connection.execute(index_sql)
 
 
+def initialize_demotions(connection: sqlite3.Connection) -> None:
+    """Create the append-only model demotion audit table."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_demotions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id TEXT NOT NULL,
+            instrument TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            demoted_at TEXT NOT NULL,
+            live_skill REAL NOT NULL,
+            live_call_count INTEGER NOT NULL,
+            base_rate_live_skill REAL NOT NULL,
+            reason TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS model_demotions_model_id "
+        "ON model_demotions(model_id)"
+    )
+
+
+def is_demoted(connection: sqlite3.Connection, *, model_id: str) -> bool:
+    """Return whether a model has an immutable demotion fact recorded."""
+    initialize_demotions(connection)
+    row = connection.execute(
+        "SELECT 1 FROM model_demotions WHERE model_id = ? LIMIT 1",
+        (model_id,),
+    ).fetchone()
+    return row is not None
+
+
+def record_demotion(
+    connection: sqlite3.Connection,
+    *,
+    model_id: str,
+    instrument: str,
+    horizon: str,
+    interval: str,
+    demoted_at: str,
+    live_skill: float,
+    live_call_count: int,
+    base_rate_live_skill: float,
+    reason: str,
+) -> int:
+    """Append one demotion fact and return its primary key.
+
+    The unique model_id index makes concurrent or repeated checks idempotent
+    without changing the original promotion record or an existing demotion.
+    """
+    initialize_demotions(connection)
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO model_demotions
+        (model_id, instrument, horizon, interval, demoted_at, live_skill,
+         live_call_count, base_rate_live_skill, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            model_id,
+            instrument,
+            horizon,
+            interval,
+            demoted_at,
+            float(live_skill),
+            int(live_call_count),
+            float(base_rate_live_skill),
+            reason,
+        ),
+    )
+    connection.commit()
+    if cursor.rowcount == 1:
+        return int(cursor.lastrowid)
+
+    existing = connection.execute(
+        "SELECT id FROM model_demotions WHERE model_id = ?",
+        (model_id,),
+    ).fetchone()
+    if existing is None:  # pragma: no cover - only reachable on a corrupted store
+        raise sqlite3.IntegrityError("Demotion was neither inserted nor found")
+    return int(existing["id"])
+
+
 def record_registry_entry(
     connection: sqlite3.Connection, entry: ModelRegistryEntry
 ) -> int:
