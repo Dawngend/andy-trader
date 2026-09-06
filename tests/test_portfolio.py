@@ -403,6 +403,8 @@ def test_cli_uses_the_requested_horizon_and_wall_clock_execution_time(
             "1h",
             "--database",
             str(database),
+            # This test is about horizon plumbing, not the skill gate.
+            "--ignore-skill-gate",
         ]
     ) == 0
 
@@ -495,7 +497,13 @@ def test_paper_trade_once_trades_a_fresh_prediction(tmp_path: Path) -> None:
                 created_at=call_time, resolves_at=(now + timedelta(minutes=59)).isoformat(),
             ),
         )
-        attempt = paper_trade_once(connection, predictor="baseline:test", instrument="BTC-USD", now=now)
+        # Bypassing the skill gate deliberately: this test is about the trading
+        # mechanics, and baseline:test has no settled history to earn its way
+        # through. The gate itself is covered in test_paper_gate.py.
+        attempt = paper_trade_once(
+            connection, predictor="baseline:test", instrument="BTC-USD",
+            now=now, skill_gate_disabled=True,
+        )
 
     assert attempt.skipped_reason is None
     assert attempt.trade is not None

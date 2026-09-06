@@ -98,19 +98,16 @@ def test_paper_trade_is_opt_in_and_runs_when_explicitly_configured(monkeypatch, 
     assert result == 0
     entries = [json.loads(line) for line in journal.read_text().splitlines()]
     paper_event = next(entry for entry in entries if entry["event"] == "paper_trade_completed")
-    assert paper_event["attempts"] == [
-        {
-            "predictor": "baseline:coin_flip",
-            "instrument": "BTC-USD",
-            "traded": False,  # coin_flip's 0.5 sits exactly at the flat threshold
-            "side": None,
-            "equity": 10_000.0,
-            "skipped_reason": None,
-            "risk_allowed": True,
-            "risk_reason": "within all configured limits",
-            "forced_exit": False,
-        }
-    ]
+    # The unattended paper path respects the skill gate. A predictor named in
+    # --paper-trade with no settled history has proven nothing yet, so it is
+    # refused rather than handed capital: being listed in config is not evidence.
+    assert len(paper_event["attempts"]) == 1
+    attempt = paper_event["attempts"][0]
+    assert attempt["predictor"] == "baseline:coin_flip"
+    assert attempt["instrument"] == "BTC-USD"
+    assert attempt["traded"] is False
+    assert attempt["side"] is None
+    assert "skill gate" in attempt["skipped_reason"]
 
 
 def test_paper_trade_malformed_entry_is_ignored_not_fatal(monkeypatch, tmp_path: Path, capsys) -> None:

@@ -783,6 +783,7 @@ def paper_trade_once(
     now: datetime | None = None,
     max_prediction_age_minutes: float = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     max_data_age_minutes: float | None = None,
+    skill_gate_disabled: bool = False,
 ) -> PaperTradeAttempt:
     """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
 
@@ -849,6 +850,30 @@ def paper_trade_once(
             ),
         )
 
+    # A predictor that has not beaten the base rate may not OPEN a position, but
+    # is never prevented from closing one. Same asymmetry as the risk interlock:
+    # an entry adds exposure and needs permission, an exit removes exposure and
+    # must always be allowed through. Trapping a position inside a gate that has
+    # just closed would be a new failure mode invented by the safety check.
+    if not skill_gate_disabled:
+        from andy_trader.paper_gate import evaluate_paper_eligibility
+
+        state = get_or_create_state(
+            connection, predictor=predictor, instrument=instrument, now_iso=now_iso
+        )
+        if state.position_qty == 0:
+            verdict = evaluate_paper_eligibility(
+                connection, predictor=predictor, instrument=instrument, horizon=horizon
+            )
+            if not verdict.eligible:
+                return PaperTradeAttempt(
+                    predictor=predictor, instrument=instrument, horizon=horizon,
+                    price=latest_price, price_at=latest_time,
+                    prediction_created_at=row["created_at"], executed_at=now_iso,
+                    trade=None, equity=None,
+                    skipped_reason=f"skill gate: {verdict.reason}",
+                )
+
     result = run_paper_cycle(
         connection,
         predictor=predictor,
@@ -880,6 +905,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--horizon", default="1h")
     parser.add_argument("--database", help="Override database path")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--ignore-skill-gate",
+        action="store_true",
+        help=(
+            "Open a position even if the predictor has not beaten the base rate. "
+            "For backtests and debugging: the gate exists because a predictor that "
+            "loses to the base rate lost real (simulated) money for days before "
+            "anything objected."
+        ),
+    )
     args = parser.parse_args(argv)
 
     load_env_file(REPO_ROOT / ".env")
@@ -892,6 +927,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             instrument=args.instrument,
             interval=args.interval,
             horizon=args.horizon,
+            skill_gate_disabled=args.ignore_skill_gate,
         )
         if attempt.skipped_reason:
             print(attempt.skipped_reason)
