@@ -9,6 +9,7 @@
 # is a record of one machine's run rather than part of the project.
 .session-run.log
 .cycle-run.jsonl
+.fast-run.jsonl
 
 # Saved weights for promoted CT-07 models. Regenerable by re-running the
 # training/promotion pipeline against the (also gitignored) database; the

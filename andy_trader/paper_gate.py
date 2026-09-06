@@ -27,6 +27,18 @@ one regime is not a licence to trade 53% the other way; that is fitting the
 sign to the sample, which is the same error as trusting a stranger's screenshot.
 If an inverted momentum has an edge it can be added as its own predictor, log
 its own calls, and clear this same gate on its own evidence.
+
+A SECOND hole was found the same day, once the first pair ever cleared this
+gate: `baseline:momentum` on LINK-USD reached 200 settled 1h calls at +0.0006
+Brier skill and a 57.8% hit rate -- genuinely better than the base rate, by the
+only test this module originally ran. But `andy_trader.economics` had already
+established that 1h round-trip costs are ~30bps against LINK-USD's own ~46bps
+average move, which needs an **82.6%** hit rate just to break even. Beating the
+base rate is a statistical claim; covering costs is an economic one, and they
+are not the same test. A predictor can clear the first and fail the second by a
+wide margin, and until this fix the gate could not tell the difference. It now
+checks both, because a pair that would still lose money net has not actually
+earned anything.
 """
 
 from __future__ import annotations
@@ -35,13 +47,23 @@ from dataclasses import dataclass
 import sqlite3
 
 from andy_trader.calibration import CalibrationError, evaluate
-from andy_trader.store import fetch_settled
+from andy_trader.economics import DEFAULT_ROUND_TRIP_BPS, evaluate_horizon
+from andy_trader.store import FAST_HORIZONS, fetch_settled
 
 # A predictor needs a real sample before its score means anything. At 1h across
 # the live instruments this is a few weeks of history, which is the point: the
 # gate should be slow to open, and it costs nothing to wait because the thing
 # being withheld is permission to lose money.
 MINIMUM_SETTLED_CALLS = 200
+
+
+def _observation_interval_for(horizon: str) -> str:
+    """The price-observation interval a horizon's economics must be measured
+    against. Only the sub-hourly fast-continuation horizons diverge from their
+    own name: they predict a horizon (e.g. "2m") for which no observation
+    series exists, trading instead on the close of a 1m bar."""
+
+    return "1m" if horizon in FAST_HORIZONS else horizon
 
 
 @dataclass(frozen=True)
@@ -55,6 +77,7 @@ class EligibilityVerdict:
     sample_size: int
     brier_skill_score: float | None = None
     hit_rate: float | None = None
+    break_even_win_rate: float | None = None
 
 
 def evaluate_paper_eligibility(
@@ -64,6 +87,7 @@ def evaluate_paper_eligibility(
     instrument: str,
     horizon: str = "1h",
     minimum_calls: int = MINIMUM_SETTLED_CALLS,
+    round_trip_bps: float = DEFAULT_ROUND_TRIP_BPS,
 ) -> EligibilityVerdict:
     """Decide whether `predictor` may open new positions in `instrument`.
 
@@ -130,17 +154,66 @@ def evaluate_paper_eligibility(
             hit_rate=report.hit_rate,
         )
 
+    # Beating the base rate is a STATISTICAL claim. Covering the cost of
+    # trading is an ECONOMIC one, and they are not the same test: a predictor
+    # can be genuinely better than guessing and still lose money on every
+    # trade if its edge is smaller than what a round trip costs. Found for
+    # real on 2026-09-06 -- baseline:momentum cleared the statistical bar on
+    # LINK-USD at 1h (+0.0006 skill, 57.8% hit rate) while needing an 82.6%
+    # hit rate just to break even against that horizon's own average move.
+    econ = evaluate_horizon(
+        connection,
+        instrument=instrument,
+        interval=_observation_interval_for(horizon),
+        round_trip_bps=round_trip_bps,
+    )
+    if econ is None:
+        return EligibilityVerdict(
+            eligible=False,
+            reason=(
+                f"{predictor} on {instrument} beats the base rate statistically, but "
+                f"there is not enough {_observation_interval_for(horizon)} price history "
+                f"to verify it can cover a round trip's cost -- statistical evidence "
+                f"without economic verification is not enough to deploy capital"
+            ),
+            predictor=predictor,
+            instrument=instrument,
+            sample_size=sample_size,
+            brier_skill_score=report.brier_skill_score,
+            hit_rate=report.hit_rate,
+        )
+
+    if report.hit_rate < econ.break_even_win_rate:
+        return EligibilityVerdict(
+            eligible=False,
+            reason=(
+                f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
+                f"skill) but its {report.hit_rate:.1%} hit rate is below the "
+                f"{econ.break_even_win_rate:.1%} needed to cover a {econ.round_trip_bps:.0f}bps "
+                f"round trip against this horizon's {econ.average_move_bps:.1f}bps average move -- "
+                f"statistically better than guessing is not the same as economically profitable"
+            ),
+            predictor=predictor,
+            instrument=instrument,
+            sample_size=sample_size,
+            brier_skill_score=report.brier_skill_score,
+            hit_rate=report.hit_rate,
+            break_even_win_rate=econ.break_even_win_rate,
+        )
+
     return EligibilityVerdict(
         eligible=True,
         reason=(
-            f"{predictor} on {instrument} beats the base rate: "
-            f"{report.brier_skill_score:+.4f} skill over {sample_size} calls"
+            f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
+            f"skill) AND its {report.hit_rate:.1%} hit rate clears the "
+            f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} calls"
         ),
         predictor=predictor,
         instrument=instrument,
         sample_size=sample_size,
         brier_skill_score=report.brier_skill_score,
         hit_rate=report.hit_rate,
+        break_even_win_rate=econ.break_even_win_rate,
     )
 
 
@@ -153,7 +226,14 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     from andy_trader.store import connect, default_database_path
 
     parser = argparse.ArgumentParser(description="Who has earned the right to trade?")
-    parser.add_argument("--horizon", default="1h")
+    parser.add_argument(
+        "--horizon",
+        help=(
+            "Limit to one horizon, e.g. 1h or 2m. Omit to report every horizon "
+            "with settled history -- the 2m fast-continuation strategy and the "
+            "1h baselines are different questions and both belong on this list."
+        ),
+    )
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
     parser.add_argument("--predictor", help="Limit to one predictor")
     parser.add_argument(
@@ -178,16 +258,28 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     db_path = Path(args.database) if args.database else default_database_path()
     connection = connect(db_path)
 
-    pairs = connection.execute(
-        """
-        SELECT DISTINCT predictor, instrument FROM crypto_predictions
-        WHERE settled_at IS NOT NULL AND horizon = ?
-        ORDER BY predictor, instrument
-        """,
-        (args.horizon,),
-    ).fetchall()
+    if args.horizon:
+        pairs = connection.execute(
+            """
+            SELECT DISTINCT predictor, instrument, horizon FROM crypto_predictions
+            WHERE settled_at IS NOT NULL AND horizon = ?
+            ORDER BY predictor, instrument
+            """,
+            (args.horizon,),
+        ).fetchall()
+    else:
+        pairs = connection.execute(
+            """
+            SELECT DISTINCT predictor, instrument, horizon FROM crypto_predictions
+            WHERE settled_at IS NOT NULL
+            ORDER BY horizon, predictor, instrument
+            """
+        ).fetchall()
 
-    print(f"{'predictor':<28} {'instrument':<11} {'n':>5} {'skill':>9} {'hit':>7}  verdict")
+    print(
+        f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} {'skill':>9} "
+        f"{'hit':>7} {'need':>7}  verdict"
+    )
     allowed = 0
     for row in pairs:
         if args.predictor and row["predictor"] != args.predictor:
@@ -196,7 +288,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             connection,
             predictor=row["predictor"],
             instrument=row["instrument"],
-            horizon=args.horizon,
+            horizon=row["horizon"],
         )
         skill = (
             f"{verdict.brier_skill_score:+.4f}"
@@ -204,11 +296,16 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             else "--"
         )
         hit = f"{verdict.hit_rate:.1%}" if verdict.hit_rate is not None else "--"
+        need = (
+            f"{verdict.break_even_win_rate:.1%}"
+            if verdict.break_even_win_rate is not None
+            else "--"
+        )
         mark = "MAY TRADE" if verdict.eligible else "blocked"
         allowed += 1 if verdict.eligible else 0
         print(
-            f"{row['predictor']:<28} {row['instrument']:<11} {verdict.sample_size:>5} "
-            f"{skill:>9} {hit:>7}  {mark}"
+            f"{row['predictor']:<28} {row['instrument']:<11} {row['horizon']:>7} "
+            f"{verdict.sample_size:>5} {skill:>9} {hit:>7} {need:>7}  {mark}"
         )
     print(f"\n{allowed} pair(s) currently allowed to open new positions.")
 
@@ -216,7 +313,6 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         _propose(
             connection,
             pairs=pairs,
-            horizon=args.horizon,
             wanted=args.propose,
             stake_php=args.stake_php,
             php_per_usd=args.php_per_usd,
@@ -229,7 +325,6 @@ def _propose(
     connection: sqlite3.Connection,
     *,
     pairs: "list",
-    horizon: str,
     wanted: int,
     stake_php: float,
     php_per_usd: float,
@@ -255,7 +350,11 @@ def _propose(
             connection,
             predictor=row["predictor"],
             instrument=row["instrument"],
-            horizon=horizon,
+            # Each row's own horizon, not one shared value: pairs can now span
+            # multiple horizons (2m fast-continuation alongside 1h baselines),
+            # and scoring a 2m predictor's calls as if they were 1h would
+            # silently answer a different question than the one being asked.
+            horizon=row["horizon"],
         )
         if verdict.brier_skill_score is not None:
             verdicts.append(verdict)

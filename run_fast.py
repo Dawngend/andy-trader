@@ -29,17 +29,27 @@ from typing import Sequence
 from andy_trader.collector import FetchSettings, collect
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.fast_momentum import (
+    PREDICTOR_NAME,
     build_rounds,
     fit_continuation_curve,
     load_minute_closes,
     predict_round_once,
     settle_fast_predictions,
 )
+from andy_trader.portfolio import paper_trade_once
 from andy_trader.store import connect, default_database_path, record_observations
 
 FAST_LOG_PATH = REPO_ROOT / ".fast-run.jsonl"
 DEFAULT_INSTRUMENTS = ("BTC-USD",)
 FAST_VENUE = "binance"
+FAST_HORIZON = "2m"
+
+# A round's decision point is 2 minutes before it closes; the call is only ever
+# actionable inside that window. The 20-minute default freshness tolerance
+# elsewhere in this project assumes a 15-minute cycle and would happily "trade"
+# a call from a round that closed several cycles ago.
+MAX_PREDICTION_AGE_MINUTES = 2.5
+MAX_DATA_AGE_MINUTES = 2.5
 
 
 def _journal(event: str, **details: object) -> None:
@@ -79,7 +89,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         settled = settle_fast_predictions(connection)
 
+        moment = datetime.now(UTC)
         calls: list[dict[str, object]] = []
+        trades: list[dict[str, object]] = []
         for instrument in instruments:
             # Fitted only on rounds that already settled, so the curve never
             # sees the round it is about to call.
@@ -97,6 +109,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
 
+            # Every pass, not only one that just made a new call: the decision
+            # window spans the ~2 minutes between the call and the round
+            # closing, and this task runs once a minute, so the pass right
+            # after a call is exactly when it needs to be actionable. Gated by
+            # the same skill gate as every other predictor -- this strategy
+            # gets no exemption for being the newest one.
+            attempt = paper_trade_once(
+                connection,
+                predictor=PREDICTOR_NAME,
+                instrument=instrument,
+                interval="1m",
+                horizon=FAST_HORIZON,
+                now=moment,
+                max_prediction_age_minutes=MAX_PREDICTION_AGE_MINUTES,
+                max_data_age_minutes=MAX_DATA_AGE_MINUTES,
+            )
+            trades.append(
+                {
+                    "instrument": instrument,
+                    "traded": attempt.trade is not None,
+                    "side": attempt.trade.side if attempt.trade else None,
+                    "skipped_reason": attempt.skipped_reason,
+                }
+            )
+
         _journal(
             "fast_pass",
             instruments=list(instruments),
@@ -105,8 +142,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             settled=settled.get("settled", 0),
             unresolvable=settled.get("unresolvable", 0),
             calls=calls,
+            trades=trades,
         )
-        if not args.quiet or problems:
+        traded_now = [t for t in trades if t["traded"]]
+        if not args.quiet or problems or traded_now:
             print(
                 f"fast: candles={len(candles)} problems={len(problems)} "
                 f"settled={settled.get('settled', 0)} calls={len(calls)}"
@@ -116,6 +155,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  CALL {call['instrument']} p(up)={call['probability_up']:.4f} "
                     f"move={call['move_bps']}bps resolves={call['resolves_at']}"
                 )
+            for trade in traded_now:
+                print(f"  TRADE {trade['instrument']} -> {trade['side']}")
         return 0
     except Exception as exc:  # noqa: BLE001 - a minute-cadence task must not die loudly
         _journal("fast_pass_failed", error_type=type(exc).__name__, error=str(exc)[:400])

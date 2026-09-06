@@ -64,6 +64,30 @@ def _settled_calls(
     connection.commit()
 
 
+def _price_history(
+    connection: sqlite3.Connection, *, instrument: str = "BTC-USD", bars: int = 40
+) -> None:
+    """A real price series so the economics check has a move to measure. A
+    predictor claiming skill with no price history behind it cannot have its
+    break-even verified, which the gate correctly refuses to treat as proof."""
+
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    price = 100.0
+    for index in range(bars):
+        price *= 1.02 if index % 2 == 0 else (1.0 / 1.02)
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument=instrument, venue="binance", interval="1h",
+                    open_time=(base + timedelta(hours=index)).isoformat(),
+                    open=price, high=price, low=price, close=price, volume=1.0,
+                )
+            ],
+        )
+    connection.commit()
+
+
 def test_a_predictor_with_too_little_history_has_not_proven_anything() -> None:
     connection = _conn()
     _settled_calls(connection, predictor="baseline:new", count=20, probability=0.9, correct=True)
@@ -100,8 +124,77 @@ def test_a_predictor_that_loses_to_the_base_rate_may_not_deploy_capital() -> Non
     assert "has not earned the right to deploy capital" in verdict.reason
 
 
+def test_beating_the_base_rate_statistically_is_not_enough_if_it_cannot_cover_costs() -> None:
+    """The second real gap found on 2026-09-06: baseline:momentum reached 200
+    settled 1h calls on LINK-USD at +0.0006 Brier skill and a 57.8% hit rate --
+    genuinely better than the base rate -- while needing an 82.6% hit rate just
+    to break even against that horizon's own ~46bps average move. Statistically
+    better than guessing and economically profitable are different claims, and
+    a gate that only checked the first would have let this pair start trading
+    real (simulated) capital it could not actually keep."""
+    connection = _conn()
+    instrument = "LINK-USD"
+    predictor = "baseline:borderline"
+
+    # ~100bps average move -> break-even of ~65% at the default 30bps round trip.
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    price = 100.0
+    for index in range(40):
+        price *= 1.01 if index % 2 == 0 else (1.0 / 1.01)
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument=instrument, venue="binance", interval="1h",
+                    open_time=(base + timedelta(hours=index)).isoformat(),
+                    open=price, high=price, low=price, close=price, volume=1.0,
+                )
+            ],
+        )
+
+    # A genuine but weak edge: right 55% of the time, confidence matched to
+    # that rate rather than overstated, so Brier skill comes out positive
+    # instead of being punished for confident wrongness.
+    total = MINIMUM_SETTLED_CALLS + 40
+    for index in range(total):
+        outcome_up = index % 2
+        correct = (index % 20) < 11  # exactly 55% of calls
+        leaning_up = bool(outcome_up) if correct else not bool(outcome_up)
+        probability_up = 0.55 if leaning_up else 0.45
+        created = base + timedelta(hours=index)
+        record_prediction(
+            connection,
+            Prediction(
+                predictor=predictor, instrument=instrument, horizon="1h",
+                probability_up=probability_up, reference_price=100.0,
+                created_at=created.isoformat(),
+                resolves_at=(created + timedelta(hours=1)).isoformat(),
+            ),
+        )
+    connection.execute(
+        """
+        UPDATE crypto_predictions
+        SET settled_at = ?, settle_price = 100.0,
+            outcome_up = CASE WHEN (id % 2) = 1 THEN 0 ELSE 1 END
+        WHERE predictor = ? AND settled_at IS NULL
+        """,
+        (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), predictor),
+    )
+    connection.commit()
+
+    verdict = evaluate_paper_eligibility(connection, predictor=predictor, instrument=instrument)
+
+    assert verdict.brier_skill_score is not None and verdict.brier_skill_score > 0
+    assert verdict.hit_rate is not None and 0.5 < verdict.hit_rate < 0.6
+    assert verdict.break_even_win_rate is not None
+    assert verdict.break_even_win_rate > verdict.hit_rate
+    assert not verdict.eligible
+    assert "economically profitable" in verdict.reason
+
+
 def test_a_predictor_that_beats_the_base_rate_is_allowed_through() -> None:
     connection = _conn()
+    _price_history(connection)
     _settled_calls(
         connection,
         predictor="baseline:good",
@@ -116,12 +209,15 @@ def test_a_predictor_that_beats_the_base_rate_is_allowed_through() -> None:
 
     assert verdict.eligible
     assert verdict.brier_skill_score is not None and verdict.brier_skill_score > 0
+    assert verdict.hit_rate is not None and verdict.break_even_win_rate is not None
+    assert verdict.hit_rate >= verdict.break_even_win_rate
 
 
 def test_the_gate_is_judged_per_instrument_not_per_predictor() -> None:
     """Working on BTC is not evidence about DOGE. A predictor carried by one
     instrument must not trade the other seven on that reputation."""
     connection = _conn()
+    _price_history(connection, instrument="BTC-USD")
     _settled_calls(
         connection,
         predictor="baseline:mixed",
