@@ -392,6 +392,9 @@ _PAGE = """<!doctype html>
   .bigchart-svg-wrap { position:relative; }
   .bigchart-svg-wrap svg { width:100%; height:auto; display:block; }
   .bigchart-empty { color:#5c7080; font-size:12px; padding:40px 0; text-align:center; }
+  .blocked-note { color:#7a8b99; font-size:12px; line-height:1.5; padding:10px 14px;
+                  margin-bottom:16px; border:1px solid #1e2a35; border-radius:6px;
+                  background:#0d141b; }
   .summary-strip { display:flex; gap:24px; flex-wrap:wrap; background:#11161d; border:1px solid #1e2833; border-radius:8px; padding:16px 20px; margin-bottom:20px; }
   .summary-item { display:flex; flex-direction:column; gap:2px; }
   .summary-label { font-size:11px; color:#8fa3b0; text-transform:uppercase; letter-spacing:.05em; }
@@ -642,35 +645,62 @@ function renderSummary(summary) {
 function renderBigCharts(portfolios) {
   const container = document.getElementById("bigcharts");
   container.innerHTML = "";
-  portfolios.forEach(p => {
+
+  // A book that has never traded has no equity curve to draw, and rendering a
+  // full-height empty panel for each one buried the books that DO have history
+  // under a wall of blank boxes. Blocked pairs are still worth knowing about,
+  // so they are summarised in one line instead of eight charts.
+  const traded = portfolios.filter(p => p.trade_count > 0);
+  const blocked = portfolios.filter(p => p.trade_count === 0);
+
+  if (blocked.length) {
+    const note = document.createElement("div");
+    note.className = "blocked-note";
+    const names = blocked.map(p => `${p.predictor.replace(/^baseline:/, "")} on ${p.instrument}`);
+    note.textContent =
+      `${blocked.length} pair${blocked.length === 1 ? "" : "s"} have not cleared the skill gate ` +
+      `and hold no position, so they have no equity curve yet: ` + names.join(", ") + ".";
+    container.appendChild(note);
+  }
+
+  if (!traded.length) {
+    const none = document.createElement("div");
+    none.className = "blocked-note";
+    none.textContent =
+      "No pair has traded yet, so there are no equity curves to draw. " +
+      "Latest prices are in the table below.";
+    container.appendChild(none);
+  }
+
+  // One price chart per instrument, not per book. Two predictors on the same
+  // coin share one price series, and drawing it twice was pure duplication.
+  const pricedInstruments = new Set();
+
+  traded.forEach(p => {
     const row = document.createElement("div");
     row.className = "bigchart-row";
     row.style.marginBottom = "20px";
 
     const equityValues = (p.equity_curve_full || []).map(pt => pt.equity);
-    // "not enough data points yet" implies waiting will fix it. For a book the
-    // skill gate has never let trade, waiting will not: it has no equity curve
-    // because it has never had a position, and it will stay that way until it
-    // beats the base rate. Say that instead of implying a loading state.
-    const emptyMessage = p.trade_count === 0
-      ? "no trades yet — this pair has not cleared the skill gate"
-      : null;
     row.appendChild(
       bigChartCard(
         `Equity — ${p.predictor} on ${p.instrument} (PAPER)`,
         equityValues,
-        { referenceValue: p.starting_equity, valuePrefix: "$", emptyMessage }
+        { referenceValue: p.starting_equity, valuePrefix: "$" }
       )
     );
 
     const priceValues = (p.price_series || []).map(pt => pt.close);
-    row.appendChild(
-      bigChartCard(
-        `${p.instrument} Price (real market)`,
-        priceValues,
-        { valuePrefix: "$" }
-      )
-    );
+    if (!pricedInstruments.has(p.instrument)) {
+      pricedInstruments.add(p.instrument);
+      row.appendChild(
+        bigChartCard(
+          `${p.instrument} Price (real market)`,
+          priceValues,
+          { valuePrefix: "$" }
+        )
+      );
+    }
 
     container.appendChild(row);
   });
