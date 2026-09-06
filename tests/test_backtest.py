@@ -181,6 +181,106 @@ def test_results_are_ranked_by_brier_skill_score(tmp_path: Path) -> None:
     assert results[0].report.brier_skill_score > results[1].report.brier_skill_score
 
 
+def test_default_conviction_threshold_trades_every_non_neutral_call(tmp_path: Path) -> None:
+    """0.5 must reproduce CT-04's original behaviour exactly: any call away from
+    a dead-even 0.5 opens a position. This is the backward-compatibility anchor
+    for the whole feature -- every existing caller passes no threshold at all."""
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series([100.0, 101.0, 99.0, 102.0]))
+        result = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            # Barely above 0.5: under the old logic this still trades.
+            predictors=(Baseline("weak", lambda _closes: 0.51, minimum_history=1),),
+            minimum_train_bars=1,
+        )[0]
+
+    assert result.trades == result.windows
+
+
+def test_a_high_threshold_declines_a_weak_call_the_default_would_take(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series([100.0, 101.0, 99.0, 102.0]))
+        result = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            predictors=(Baseline("weak", lambda _closes: 0.51, minimum_history=1),),
+            minimum_train_bars=1,
+            conviction_threshold=0.6,
+        )[0]
+
+    assert result.trades == 0
+    assert result.gross_return == 0.0
+    assert result.net_return == 0.0
+
+
+def test_a_threshold_admits_a_short_symmetrically_with_a_long(tmp_path: Path) -> None:
+    """probability < 1 - threshold must open a short exactly as readily as
+    probability > threshold opens a long, or a sweep would silently be biased
+    toward one side of the market."""
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series([100.0, 90.0, 100.0, 90.0]))
+        result = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            predictors=(Baseline("bear", lambda _closes: 0.25, minimum_history=1),),
+            minimum_train_bars=1,
+            conviction_threshold=0.7,
+        )[0]
+
+    assert result.trades == result.windows
+
+
+def test_conviction_threshold_never_changes_calibration_only_which_trades_fire(
+    tmp_path: Path,
+) -> None:
+    """Raising the bar for what gets TRADED must not change what gets SCORED.
+    A predictor's calibration is a claim about every call it makes; judging it
+    only on the calls it happened to act on would let a threshold hide a badly
+    calibrated predictor by simply trading less of it."""
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series([100.0, 101.0, 99.0, 102.0, 98.0]))
+        traded_a_lot = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            predictors=(Baseline("weak", lambda _closes: 0.51, minimum_history=1),),
+            minimum_train_bars=1,
+            conviction_threshold=0.5,
+        )[0]
+        traded_none = run_backtest(
+            connection,
+            instrument="BTC-USD",
+            predictors=(Baseline("weak", lambda _closes: 0.51, minimum_history=1),),
+            minimum_train_bars=1,
+            conviction_threshold=0.9,
+        )[0]
+
+    assert traded_a_lot.report.as_dict() == traded_none.report.as_dict()
+    assert traded_a_lot.windows == traded_none.windows
+    assert traded_a_lot.trades > traded_none.trades == 0
+
+
+def test_conviction_threshold_out_of_range_is_rejected(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        record_observations(connection, _series([100.0, 101.0, 99.0]))
+        with pytest.raises(BacktestError, match="conviction_threshold"):
+            run_backtest(
+                connection,
+                instrument="BTC-USD",
+                predictors=(Baseline("x", lambda _closes: 0.9, minimum_history=1),),
+                minimum_train_bars=1,
+                conviction_threshold=0.49,
+            )
+        with pytest.raises(BacktestError, match="conviction_threshold"):
+            run_backtest(
+                connection,
+                instrument="BTC-USD",
+                predictors=(Baseline("x", lambda _closes: 0.9, minimum_history=1),),
+                minimum_train_bars=1,
+                conviction_threshold=1.0,
+            )
+
+
 def test_backtest_rejects_a_fractional_horizon_bar(tmp_path: Path) -> None:
     with connect(tmp_path / "c.db") as connection:
         record_observations(connection, _series([100.0] * 5, interval="4h"))

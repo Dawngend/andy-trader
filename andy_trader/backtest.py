@@ -119,6 +119,7 @@ def run_backtest(
     slippage_bps: float = 5.0,
     window: str = "expanding",
     minimum_train_bars: int = 100,
+    conviction_threshold: float = 0.5,
 ) -> list[BacktestResult]:
     """Replay each predictor without ever exposing a future close.
 
@@ -127,12 +128,24 @@ def run_backtest(
     the existing argument doubles as the rolling length because the public CT-04
     signature has no separate window-size parameter.
 
-    Calibration scores every forecast window, including overlapping horizons.
+    Calibration scores every forecast window, including overlapping horizons --
+    `conviction_threshold` never touches this. A predictor's calibration is
+    about every call it makes, not just the ones it acted on.
+
     Equity uses one fixed-size long or short position at a time: when a trade
     spans multiple bars, accounting advances by that many bars before deploying
-    the same capital again. A probability of exactly 0.5 is no trade. Fee and
-    slippage are each charged once on entry and once on exit, so net period
-    return is gross less two round trips in bps.
+    the same capital again. Fee and slippage are each charged once on entry and
+    once on exit, so net period return is gross less two round trips in bps.
+
+    `conviction_threshold` (default 0.5) gates which calls are actually TRADED.
+    A call only opens a position when probability > threshold (long) or
+    probability < 1 - threshold (short); anything in between is treated as no
+    edge worth paying a round trip for, exactly as a probability of precisely
+    0.5 always was. Raising it cannot manufacture skill a predictor does not
+    have -- the trades it keeps are unchanged -- but it can matter enormously
+    for net return when the round-trip cost is comparable to the average move,
+    because trading indiscriminately pays that cost on every call whether or
+    not the edge behind it was large enough to be worth it.
     """
 
     if window not in {"expanding", "rolling"}:
@@ -141,6 +154,10 @@ def run_backtest(
         raise BacktestError("minimum_train_bars must be at least 1")
     if fee_bps < 0 or slippage_bps < 0:
         raise BacktestError("fee_bps and slippage_bps cannot be negative")
+    if not 0.5 <= conviction_threshold < 1.0:
+        raise BacktestError(
+            f"conviction_threshold must be in [0.5, 1.0), got {conviction_threshold!r}"
+        )
     if not predictors:
         raise BacktestError("At least one predictor is required")
 
@@ -189,7 +206,11 @@ def run_backtest(
             run.probabilities.append(probability)
             run.outcomes.append(outcome)
 
-            direction = 1 if probability > 0.5 else -1 if probability < 0.5 else 0
+            direction = (
+                1 if probability > conviction_threshold
+                else -1 if probability < (1.0 - conviction_threshold)
+                else 0
+            )
             # The 4h incident originally compounded every hourly 4h forecast as
             # though four overlapping positions could each reuse 100% of the
             # same equity. Keep those forecasts for calibration, but execute
@@ -265,6 +286,40 @@ def _format_results(results: Sequence[BacktestResult], baseline_names: set[str])
     return "\n".join(lines)
 
 
+def _format_sweep(sweep: Mapping[float, Sequence[BacktestResult]]) -> str:
+    """One block per predictor, one row per threshold.
+
+    The question a sweep answers that a single run cannot: does raising the bar
+    for what counts as a real signal recover a predictor whose gross return was
+    fine and whose net return was destroyed by trading too often? If net return
+    climbs as trades fall, the edge was real and overtrading was the problem. If
+    net return stays negative at every threshold, the edge was not real at any
+    frequency and a threshold cannot manufacture one.
+    """
+
+    predictor_names: list[str] = []
+    for results in sweep.values():
+        for result in results:
+            if result.predictor not in predictor_names:
+                predictor_names.append(result.predictor)
+
+    lines: list[str] = []
+    for name in predictor_names:
+        lines.append(f"\n{name}")
+        lines.append(
+            f"  {'threshold':>9} {'gross':>10} {'net':>10} {'trades':>7} {'drawdown':>10}"
+        )
+        for threshold in sorted(sweep):
+            result = next((r for r in sweep[threshold] if r.predictor == name), None)
+            if result is None:
+                continue
+            lines.append(
+                f"  {threshold:>9.2f} {result.gross_return:>+10.2%} "
+                f"{result.net_return:>+10.2%} {result.trades:>7} {result.max_drawdown:>10.2%}"
+            )
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument", required=True, help="Instrument, e.g. BTC-USD")
@@ -275,6 +330,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--slippage-bps", type=float, help="Slippage on entry and exit")
     parser.add_argument("--window", choices=("expanding", "rolling"), default="expanding")
     parser.add_argument("--minimum-train-bars", type=int, default=100)
+    parser.add_argument(
+        "--conviction-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Only trade when probability exceeds this (long) or falls below "
+            "1 minus this (short). Default 0.5 trades every non-neutral call, "
+            "matching CT-04's original behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--conviction-sweep",
+        help=(
+            "Comma-separated thresholds, e.g. 0.5,0.55,0.6,0.65,0.7. Runs the "
+            "backtest once per threshold and reports gross/net/trades side by "
+            "side, so a real edge spent entirely on overtrading is visible "
+            "directly rather than inferred from one run at one threshold."
+        ),
+    )
     parser.add_argument(
         "--include-model",
         action="store_true",
@@ -311,6 +385,40 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         predictors += default_signal_predictors()
 
+    if args.conviction_sweep:
+        try:
+            thresholds = [float(t.strip()) for t in args.conviction_sweep.split(",") if t.strip()]
+        except ValueError as exc:
+            raise BacktestError(f"--conviction-sweep values must be numbers: {exc}") from exc
+        with connect(database_path) as connection:
+            sweep: dict[float, list[BacktestResult]] = {}
+            for threshold in thresholds:
+                sweep[threshold] = run_backtest(
+                    connection,
+                    instrument=args.instrument,
+                    interval=args.interval,
+                    horizon=args.horizon,
+                    predictors=predictors,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    window=args.window,
+                    minimum_train_bars=args.minimum_train_bars,
+                    conviction_threshold=threshold,
+                )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        str(threshold): [result.as_dict() for result in results]
+                        for threshold, results in sweep.items()
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(_format_sweep(sweep))
+        return 0
+
     with connect(database_path) as connection:
         results = run_backtest(
             connection,
@@ -322,6 +430,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             slippage_bps=slippage_bps,
             window=args.window,
             minimum_train_bars=args.minimum_train_bars,
+            conviction_threshold=args.conviction_threshold,
         )
     if args.json:
         print(json.dumps([result.as_dict() for result in results], indent=2))

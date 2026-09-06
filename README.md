@@ -168,7 +168,7 @@ columns filled in. Any other update to that table is a bug.
 | Intra-round continuation (1m) | built; collecting, not yet enough evidence to score |
 | Unattended paper trading | scheduled every 15m; fast path scheduled every 1m |
 
-276 tests. `python -m pytest tests/ -q`.
+281 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -336,6 +336,44 @@ python -m andy_trader.economics --intervals 1m,1h,4h,1d
 
 This is worth running before building a predictor, not after. It is the cheapest
 question in the project and it invalidates the most work.
+
+## Trading less often does not rescue it either
+
+The next honest question, once the daily horizon reopened profit in principle:
+was every baseline losing simply because it traded on every call, including weak
+ones? A predictor with a real but small edge, forced to pay a round trip on
+every signal regardless of strength, can lose money net while being genuinely
+right more often than not. That is a distinct failure from having no edge at
+all, and it deserves a distinct test rather than being waved away.
+
+`run_backtest` now takes a `conviction_threshold`: only trade when probability
+exceeds it (long) or falls below its mirror (short), leaving calibration
+scoring untouched so a threshold cannot hide a badly calibrated predictor by
+simply trading it less. Swept 0.50 through 0.75 on daily BTC-USD:
+
+| Predictor | Net at 0.50 | Best net (any threshold) | Trades at best |
+| --- | --- | --- | --- |
+| `momentum` | -66.25% | **-53.21%** at 0.55 | 335 of 399 |
+| `ema_crossover_12_26` | -71.43% | **-32.29%** at 0.60 | 209 of 399 |
+| `random` | -66.54% | -38.29% at 0.65 (non-monotonic — noise) | 272 of 399 |
+
+Gross return actually improved as the bar rose — `momentum` reached **+27.96%**
+gross at 0.55, meaning its most confident calls really were more often right.
+Net return never got near zero regardless. The edge concentrated in a
+predictor's strongest calls is real but too small to survive a single round
+trip once isolated, let alone the hundreds this repository's baselines still
+take even at a raised threshold.
+
+(Baselines cap confidence at 0.65 by design, which is why every baseline but
+`random` shows zero trades above that point — there is no higher-conviction
+tier of momentum or EMA-crossover calls left to test.)
+
+```bash
+python -m andy_trader.backtest --instrument BTC-USD --interval 1d --horizon 1d \
+  --conviction-sweep 0.50,0.55,0.60,0.65,0.70,0.75
+```
+
+So this was not overtrading masking a real edge. It was checked, not assumed.
 
 ## The skill gate
 
