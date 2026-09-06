@@ -155,7 +155,7 @@ def connect(database_path: Path) -> sqlite3.Connection:
 
 
 def initialize_database(connection: sqlite3.Connection) -> None:
-    """Create both tables. Modelled directly on job_posting_observations."""
+    """Create the append-only observation and prediction tables."""
 
     connection.execute(
         """
@@ -217,6 +217,35 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS crypto_predictions_predictor ON crypto_predictions(predictor)",
     ):
         connection.execute(index_sql)
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complete_set_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            target_notional REAL NOT NULL,
+            up_best_ask REAL,
+            down_best_ask REAL,
+            up_best_ask_depth_shares REAL,
+            down_best_ask_depth_shares REAL,
+            up_best_ask_depth_notional REAL,
+            down_best_ask_depth_notional REAL,
+            naive_combined_cost REAL,
+            up_fill_shares REAL NOT NULL,
+            down_fill_shares REAL NOT NULL,
+            up_fill_cost REAL,
+            down_fill_cost REAL,
+            combined_cost REAL,
+            mispriced INTEGER CHECK (mispriced IN (0, 1) OR mispriced IS NULL),
+            unmeasurable_reason TEXT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS complete_set_observations_round "
+        "ON complete_set_observations(round_id, observed_at)"
+    )
 
 
 def record_observations(connection: sqlite3.Connection, candles: Iterable[Candle]) -> tuple[int, int]:
