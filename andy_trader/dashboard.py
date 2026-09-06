@@ -230,12 +230,19 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
         # its explicit migration. The only pre-migration bankroll was the
         # original fixed $10,000 default.
         starting_cash_sql = (
-            "starting_cash" if "starting_cash" in columns else "10000.0 AS starting_cash"
+            "s.starting_cash" if "starting_cash" in columns else "10000.0 AS starting_cash"
         )
+        # Books that have actually traded sort first. Ordering alphabetically
+        # put eight brand-new, never-traded pairs above eight with a hundred
+        # points of history each, so the monitor opened on a wall of empty
+        # charts and looked broken when it was merely sorted badly.
         rows = connection.execute(
-            f"SELECT predictor, instrument, {starting_cash_sql}, cash, position_qty, "
-            "avg_entry_price, updated_at FROM paper_portfolio_state "
-            "ORDER BY predictor, instrument"
+            f"SELECT s.predictor, s.instrument, {starting_cash_sql}, "
+            "s.cash, s.position_qty, s.avg_entry_price, s.updated_at "
+            "FROM paper_portfolio_state s "
+            "ORDER BY (SELECT COUNT(*) FROM paper_trades t "
+            "          WHERE t.predictor = s.predictor AND t.instrument = s.instrument) DESC, "
+            "s.predictor, s.instrument"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # no paper trade has ever run yet
@@ -474,7 +481,7 @@ function bigLineChart(values, opts) {
   if (!values || values.length < 2) {
     const empty = document.createElement("div");
     empty.className = "bigchart-empty";
-    empty.textContent = "not enough data points yet";
+    empty.textContent = opts.emptyMessage || "not enough data points yet";
     wrap.appendChild(empty);
     return wrap;
   }
@@ -641,11 +648,18 @@ function renderBigCharts(portfolios) {
     row.style.marginBottom = "20px";
 
     const equityValues = (p.equity_curve_full || []).map(pt => pt.equity);
+    // "not enough data points yet" implies waiting will fix it. For a book the
+    // skill gate has never let trade, waiting will not: it has no equity curve
+    // because it has never had a position, and it will stay that way until it
+    // beats the base rate. Say that instead of implying a loading state.
+    const emptyMessage = p.trade_count === 0
+      ? "no trades yet — this pair has not cleared the skill gate"
+      : null;
     row.appendChild(
       bigChartCard(
         `Equity — ${p.predictor} on ${p.instrument} (PAPER)`,
         equityValues,
-        { referenceValue: p.starting_equity, valuePrefix: "$" }
+        { referenceValue: p.starting_equity, valuePrefix: "$", emptyMessage }
       )
     );
 
