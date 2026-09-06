@@ -28,6 +28,12 @@ from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
 from andy_trader.training import predict_with_promoted_model, run_retrain_window, should_retrain
 
+try:
+    from andy_trader.training import check_live_performance_and_demote
+except ImportError:  # pragma: no cover - landing in a parallel commit; degrade gracefully until it exists
+    def check_live_performance_and_demote(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"demoted": False, "reason": "check_live_performance_and_demote not available yet"}
+
 DEFAULT_INSTRUMENTS = (
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
     "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
@@ -213,6 +219,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             if retrain_results:
                 _journal("retrain_completed", attempts=retrain_results)
 
+            # Always on, for every scheduled instrument, no opt-in: a promoted
+            # model's live performance can fail long before its next
+            # scheduled retrain notices, and a gate that only protects at
+            # retrain time is a gate with a blind spot in between. Checked
+            # BEFORE this cycle's live-serving step below, so a demotion
+            # detected right now takes effect immediately -- the same cycle
+            # never serves a model it just pulled the badge from.
+            demotion_results: list[dict[str, object]] = []
+            for instrument in instruments:
+                outcome = check_live_performance_and_demote(
+                    connection, instrument=instrument, horizon=reference_interval, interval=reference_interval,
+                )
+                if outcome.get("demoted"):
+                    demotion_results.append({"instrument": instrument, **outcome})
+            if demotion_results:
+                _journal("live_demotions", attempts=demotion_results)
+
             # Always on, for every scheduled instrument, regardless of the
             # retrain opt-in above: this is the actual release mechanism. A
             # model starts being scored under the stable "model:promoted"
@@ -296,6 +319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"  retrain: {attempt['instrument']} {attempt['model_id']} {verdict} "
                 f"(skill={attempt['holdout_brier_skill']:+.4f} vs base={attempt['base_rate_brier_skill']:+.4f})"
             )
+    for attempt in demotion_results:
+        print(f"  DEMOTED: {attempt['instrument']} {attempt.get('model_id', '?')} -- {attempt.get('reason', 'no reason given')}")
     for attempt in live_model_results:
         print(
             f"  model:promoted {attempt['instrument']} -> p(up)={attempt['probability_up']:.4f} "
