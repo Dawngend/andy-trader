@@ -168,7 +168,7 @@ columns filled in. Any other update to that table is a bug.
 | Intra-round continuation (1m) | built; collecting, not yet enough evidence to score |
 | Unattended paper trading | scheduled every 15m; fast path scheduled every 1m |
 
-268 tests. `python -m pytest tests/ -q`.
+276 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -296,6 +296,46 @@ forecasts. Future live and paper decisions also abstain on stale input. Each
 network request is capped at one eight-second attempt because the next
 15-minute scheduled pass is the retry; this bounds a fully hung cycle below its
 cadence instead of compounding retries inside retries.
+
+## The horizon was closed before any model existed
+
+The most useful result here was not about a predictor. It came from asking what
+accuracy *any* predictor would need at a given horizon merely to break even:
+
+```
+EV per trade = M(2p - 1) - C          break-even  =>  p = 0.5 + C / (2M)
+    M = average absolute move over the horizon
+    C = round-trip cost (fee + slippage, entry and exit)
+```
+
+`C` is a flat ~30 bps whatever you trade. `M` is not — it grows with the horizon.
+Measured on this repository's own BTC history:
+
+| Interval | Average move | Cost as share of move | Break-even win rate | |
+| --- | --- | --- | --- | --- |
+| 1m | 1.4 bps | 2128% | 1114% | impossible |
+| 1h | 23.6 bps | 127% | **113%** | impossible |
+| 4h | 48.8 bps | 62% | 81% | very hard |
+| 1d | 151.7 bps | 20% | 60% | plausible |
+
+**At the 1h horizon this project spent months trading, the cost of a round trip
+is larger than the average move being traded.** The break-even win rate is above
+100%: a predictor that was right *every single time* would still lose money. No
+model, threshold or gate can repair that, because it is not a modelling problem.
+
+Best directional accuracy observed across every predictor here is about 52%.
+
+So the six negative results above were over-determined. Even had one of them
+found real signal, the horizon it was pointed at could not have paid for it.
+Collection and prediction now include 1d, the shortest horizon where profit is
+available at all — at the honest cost that evidence accrues 24x more slowly.
+
+```bash
+python -m andy_trader.economics --intervals 1m,1h,4h,1d
+```
+
+This is worth running before building a predictor, not after. It is the cheapest
+question in the project and it invalidates the most work.
 
 ## The skill gate
 

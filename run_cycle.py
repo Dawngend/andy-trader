@@ -38,8 +38,22 @@ DEFAULT_INSTRUMENTS = (
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
     "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
 )
-DEFAULT_INTERVALS = ("1h", "4h")
-DEFAULT_HORIZONS = ("1h", "4h")
+# 1d is here because of a hard result measured 2026-09-06, not because more data
+# is generally nicer. Round-trip cost is a flat ~30 bps at every horizon, while
+# the average absolute move grows with the horizon, so the break-even win rate
+# is 0.5 + cost/(2*move):
+#
+#     1m    1.4 bps move  ->  break-even  1115%   impossible
+#     1h   23.6 bps move  ->  break-even   113%   impossible
+#     4h   48.8 bps move  ->  break-even    81%   very hard
+#
+# At 1h the cost of trading exceeds the average move being traded, so a PERFECT
+# predictor still loses money. No gate, model or threshold can repair that; it
+# is arithmetic. 1d is the shortest horizon where profit is even available, and
+# it is added so the system is at least pointed somewhere winnable. Evidence
+# accrues 24x slower there, which is the honest price of the change.
+DEFAULT_INTERVALS = ("1h", "4h", "1d")
+DEFAULT_HORIZONS = ("1h", "4h", "1d")
 CYCLE_LOG_PATH = REPO_ROOT / ".cycle-run.jsonl"
 
 
