@@ -82,6 +82,8 @@ def configured_starting_cash(environ: "Mapping[str, str] | None" = None) -> floa
     if value <= 0:
         raise PortfolioError(f"{STARTING_CASH_ENV} must be positive, got {value!r}")
     return value
+
+
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
@@ -209,9 +211,17 @@ def get_or_create_state(
     *,
     predictor: str,
     instrument: str,
-    starting_cash: float = DEFAULT_STARTING_CASH,
+    starting_cash: float | None = None,
     now_iso: str,
 ) -> PortfolioState:
+    # Resolved here, not as a default argument, because this function is the
+    # single place a portfolio row is born. A hardcoded default here silently
+    # wins over the configured stake for any caller that does not pass one --
+    # which is exactly how the skill gate, whose only interest is "is there a
+    # position open", ended up creating eight books at $10,000 apiece after
+    # the stake had been set to PHP 1,000.
+    if starting_cash is None:
+        starting_cash = configured_starting_cash()
     initialize_portfolio(connection)
     row = connection.execute(
         "SELECT * FROM paper_portfolio_state WHERE predictor = ? AND instrument = ?",
@@ -308,7 +318,7 @@ def execute_paper_trade(
     reason: str,
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
-    starting_cash: float = DEFAULT_STARTING_CASH,
+    starting_cash: float | None = None,
 ) -> Trade | None:
     """Move the paper position to target_side if it is not already there.
 
@@ -495,7 +505,7 @@ def mark_to_market(
     instrument: str,
     price: float,
     now_iso: str,
-    starting_cash: float = DEFAULT_STARTING_CASH,
+    starting_cash: float | None = None,
 ) -> float:
     """Record one equity-curve snapshot at the current price. Returns total equity."""
 

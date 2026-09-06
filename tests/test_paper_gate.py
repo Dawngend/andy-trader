@@ -220,6 +220,56 @@ def test_paper_trade_refuses_to_open_for_an_unproven_predictor() -> None:
     assert "skill gate" in attempt.skipped_reason
 
 
+def test_the_gate_does_not_create_a_book_at_the_wrong_stake(monkeypatch) -> None:
+    """A real bug, found on the live dashboard 2026-09-06.
+
+    The gate calls get_or_create_state purely to ask "is a position open". That
+    call BIRTHS the portfolio row, and it was not passing a stake, so the row
+    was created at the hardcoded $10,000 default even though the configured
+    stake was $15.97. Adding one predictor to the candidate list silently
+    created eight books at $10,000 each and the dashboard jumped to $80,127.76.
+
+    The gate is a read-only question. It must never be the thing that decides
+    how much capital a book starts with.
+    """
+    monkeypatch.setenv("CRYPTO_PAPER_STARTING_CASH", "15.97")
+    connection = _conn()
+    now = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+    record_observations(
+        connection,
+        [
+            Candle(
+                instrument="BTC-USD", venue="binance", interval="1h",
+                open_time=now.isoformat(), open=100.0, high=100.0, low=100.0,
+                close=100.0, volume=1.0,
+            )
+        ],
+    )
+    record_prediction(
+        connection,
+        Prediction(
+            predictor="baseline:ema_crossover_12_26", instrument="BTC-USD",
+            horizon="1h", probability_up=0.80, reference_price=100.0,
+            created_at=now.isoformat(),
+            resolves_at=(now + timedelta(hours=1)).isoformat(),
+        ),
+    )
+
+    attempt = paper_trade_once(
+        connection,
+        predictor="baseline:ema_crossover_12_26",
+        instrument="BTC-USD",
+        now=now,
+    )
+
+    assert "skill gate" in (attempt.skipped_reason or "")
+    row = connection.execute(
+        "SELECT starting_cash, cash FROM paper_portfolio_state WHERE instrument = 'BTC-USD'"
+    ).fetchone()
+    assert row["starting_cash"] == 15.97, "gate created the book at the wrong stake"
+    assert row["cash"] == 15.97
+
+
 def test_the_gate_can_be_bypassed_explicitly_for_backtests() -> None:
     connection = _conn()
     now = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
