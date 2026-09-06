@@ -4,6 +4,35 @@ A calibrated-forecast harness for short-horizon crypto directional prediction.
 
 The point of this project is not the model. It is the measurement.
 
+## The result
+
+Six strategies. ~2,800 settled out-of-sample predictions across eight instruments.
+**Not one of them beat predicting the base rate.**
+
+| Predictor | Brier skill | Verdict |
+| --- | --- | --- |
+| `baseline:base_rate` | -0.027 | no skill |
+| `baseline:coin_flip` | -0.024 | no skill |
+| `baseline:momentum` | -0.039 | worse than the base rate |
+| `baseline:ema_crossover_12_26` | -0.051 | worse |
+| `model:promoted` (PyTorch) | -0.118 | worse, and later demoted |
+| `baseline:random` | -0.416 | as designed |
+
+A separate walk-forward backtest reached the same conclusion independently: across 120
+out-of-sample windows nothing beat the base rate, everything that traded lost roughly a
+quarter of its capital to round-trip costs, and `coin_flip` "won" by never trading at all.
+
+That is a negative result, and this repository exists to record one rather than to tune
+until the number looks good. The harness now **refuses to trade**: a skill gate blocks any
+predictor that has not beaten the base rate on a real sample from deploying capital, and
+as of this writing every pair is blocked.
+
+The interesting engineering question was never "can it predict crypto." It was **"would I
+be able to tell if it couldn't?"** Most of this repository is the machinery required to
+answer that honestly: blind settlement, prediction logging that precedes the outcome,
+walk-forward evaluation, a promotion gate that rejected its own first candidate, and a
+live-performance demotion path that pulled a promoted model back out of service.
+
 ## The one design decision that matters
 
 **The evaluation layer was built before any strategy existed.**
@@ -131,12 +160,15 @@ columns filled in. Any other update to that table is a bug.
 | CT-05 PyTorch predictor | evaluated, did not clear CT-03; remains opt-in |
 | Positioning and sentiment predictors | evaluated, none beat the base rate |
 | CT-07 walk-forward retraining and promotion gate | built; first candidate rejected |
-| CT-08 paper portfolio | built, long-or-flat and simulated only |
+| CT-08 paper portfolio | built; long, flat or short at 1x, simulated only |
 | CT-09 local dashboard | built, read-only on `127.0.0.1:8787` |
 | CT-10 risk interlock | built; evaluated every cycle, not only on entry |
-| Unattended paper trading | enabled on the scheduled task: `baseline:momentum` on BTC-USD |
+| Live-performance demotion | built; a promoted model that stops beating the base rate is pulled |
+| Skill gate on paper trading | built; every pair currently blocked |
+| Intra-round continuation (1m) | built; collecting, not yet enough evidence to score |
+| Unattended paper trading | scheduled every 15m; fast path scheduled every 1m |
 
-204 tests. `python -m pytest tests/ -q`.
+268 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -265,17 +297,75 @@ network request is capped at one eight-second attempt because the next
 15-minute scheduled pass is the retry; this bounds a fully hung cycle below its
 cadence instead of compounding retries inside retries.
 
+## The skill gate
+
+CT-07 gates machine-learned models hard: a candidate may not serve until it beats
+`baseline:base_rate` on a holdout. Paper-trading a *hand-written* baseline was gated by
+nothing at all. It was a config string, so any predictor named on the scheduled task began
+deploying capital immediately and kept deploying it no matter how it scored.
+
+What that cost: `baseline:momentum` ran eight instruments to -3.28% with zero winners. Its
+calibration bins say why, and it is not fees. Over 2,818 settled calls it scored -0.0390
+skill with a **47.1% hit rate**, and it was inverted at the extremes — when most confident
+price would fall, price rose 56-65% of the time.
+
+`andy_trader/paper_gate.py` now applies the same bar to everything, judged per instrument,
+since "works on BTC" is not evidence about DOGE. It blocks entries only and never exits;
+trapping a position inside a safety check would be a failure mode invented by the check.
+
+```bash
+python -m andy_trader.paper_gate
+```
+
+Deliberately **not** included: inverting momentum. A 47% hit rate over one regime is not a
+licence to trade 53% the other way. That is fitting the sign to the sample.
+
+## Intra-round continuation, and why a real signal still loses
+
+A widely-shared bot claimed to turn $250 into $13,000 trading Polymarket's 5-minute BTC
+market: with two minutes left in a round, if price has already moved, bet the move
+continues. Rather than argue about it, it was measured.
+
+On 30 days of 1-minute bars (8,640 clock-aligned rounds) the signal is **real** and
+monotone in the size of the move:
+
+| Move at the 2-minutes-left mark | Rounds | Continued |
+| --- | --- | --- |
+| $20-40 | 1,885 | 82.0% |
+| $40-70 | 1,438 | 88.1% |
+| $70-100 (the bot's own filter) | 676 | **91.7%** |
+| $100-150 | 510 | 96.7% |
+
+The signal was never the problem. Against 400 real resolved Polymarket rounds, the
+favourite won 94.16% at an average price of $0.9266 — an edge of +1.5 points, which is
+**inside its own standard error (±1.59) and smaller than the spread crossed to enter**.
+
+And more decisively: at the source bot's stated 50%-of-bankroll stake, that edge produces
+**negative compound growth despite positive expected value**, because 50% is roughly 2.5x
+the Kelly-optimal stake and past 2x Kelly growth turns negative by construction. Winning
+94% of trades and still reaching zero is the actual failure mode.
+
+`andy_trader/fast_momentum.py` keeps the signal and replaces the sizing with capped
+fractional Kelly that stakes nothing without a measured edge and ignores any band with
+fewer than 30 samples. `tests/test_fast_momentum.py` encodes the finding as an assertion.
+
 ## Honest expectations
 
-The likely outcome of CT-05 is that the model does **not** beat the base rate net of costs. That is a
-real result and this repository is built to record it rather than to tune until the number looks
-good. Most apparent short-horizon edge turns out to be round-trip cost that was never subtracted.
+CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
+result and this repository was built to record it rather than to tune until the number looked good.
+Most apparent short-horizon edge turns out to be round-trip cost that was never subtracted.
 
 The durable value here is the engineering: scheduled collectors, append-only history, blind
-settlement, walk-forward evaluation, and calibrated prediction logging. That survives either outcome.
+settlement, walk-forward evaluation, and calibrated prediction logging. That survives either outcome,
+which is the point of building the measurement before the model.
 
 ## Scope
 
 This project reads public market data and scores forecasts. It does not connect to an account, hold
-credentials, or place orders. Execution is deliberately out of scope and gated behind a risk
-interlock that does not exist yet.
+credentials, or place orders, and no code path exists that could. Every venue is a keyless public
+endpoint. The paper portfolio is arithmetic over a SQLite table.
+
+Position sizes are held at a stake the author would genuinely risk rather than a large round number,
+because scale-invariant percentage returns hide a real constraint: live venues enforce a minimum
+order notional, so a book funded too thinly per instrument produces trades that could never actually
+be placed. Simulating a size you would not really trade is a quiet way to get an unexecutable result.

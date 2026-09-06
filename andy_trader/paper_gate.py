@@ -156,6 +156,23 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     parser.add_argument("--horizon", default="1h")
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
     parser.add_argument("--predictor", help="Limit to one predictor")
+    parser.add_argument(
+        "--propose",
+        type=int,
+        metavar="N",
+        help=(
+            "Rank candidates and report whether the top N have earned a real "
+            "deployment. Ranking alone is not evidence: see the selection premium "
+            "this prints."
+        ),
+    )
+    parser.add_argument(
+        "--stake-php",
+        type=float,
+        default=1000.0,
+        help="Stake per selected instrument, in pesos (default 1000)",
+    )
+    parser.add_argument("--php-per-usd", type=float, default=62.62)
     args = parser.parse_args(argv)
 
     db_path = Path(args.database) if args.database else default_database_path()
@@ -194,7 +211,109 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             f"{skill:>9} {hit:>7}  {mark}"
         )
     print(f"\n{allowed} pair(s) currently allowed to open new positions.")
+
+    if args.propose:
+        _propose(
+            connection,
+            pairs=pairs,
+            horizon=args.horizon,
+            wanted=args.propose,
+            stake_php=args.stake_php,
+            php_per_usd=args.php_per_usd,
+            only_predictor=args.predictor,
+        )
     return 0
+
+
+def _propose(
+    connection: sqlite3.Connection,
+    *,
+    pairs: "list",
+    horizon: str,
+    wanted: int,
+    stake_php: float,
+    php_per_usd: float,
+    only_predictor: str | None,
+) -> None:
+    """Rank candidates and say plainly whether a deployment is justified yet.
+
+    The warning this prints is the whole point. Ranking N candidates and funding
+    the best few is a selection procedure, and selection manufactures apparent
+    edge out of nothing: the maximum of N noisy measurements sits above the truth
+    even when every candidate's true edge is exactly zero. Funding the top of a
+    leaderboard is therefore not the same as funding something that works, and
+    the difference is invisible unless you say it out loud.
+    """
+
+    import math
+
+    verdicts = []
+    for row in pairs:
+        if only_predictor and row["predictor"] != only_predictor:
+            continue
+        verdict = evaluate_paper_eligibility(
+            connection,
+            predictor=row["predictor"],
+            instrument=row["instrument"],
+            horizon=horizon,
+        )
+        if verdict.brier_skill_score is not None:
+            verdicts.append(verdict)
+
+    stake_usd = round(stake_php / php_per_usd, 2)
+    total_php = stake_php * wanted
+
+    print("\n" + "=" * 74)
+    print(
+        f"PROPOSED DEPLOYMENT: top {wanted} at PHP {stake_php:,.0f} each "
+        f"(${stake_usd} each, PHP {total_php:,.0f} total)"
+    )
+    print("=" * 74)
+
+    if not verdicts:
+        print(
+            "\nNothing is scoreable yet -- every candidate is still below the minimum\n"
+            f"sample of {MINIMUM_SETTLED_CALLS} settled calls. There is no ranking to make."
+        )
+        print("\nRECOMMENDATION: deploy nothing. Wait for evidence.")
+        return
+
+    ranked = sorted(verdicts, key=lambda v: v.brier_skill_score or -9e9, reverse=True)
+    candidates = len(ranked)
+
+    # Expected maximum of N standard normals: how much apparent edge pure
+    # selection hands you for free. Sound approximation for small N.
+    selection_premium = (
+        math.sqrt(2.0 * math.log(candidates)) if candidates > 1 else 0.0
+    )
+
+    print(f"\n{'rank':>4} {'predictor':<26} {'instrument':<11} {'skill':>9}  eligible")
+    for index, verdict in enumerate(ranked[:wanted], start=1):
+        print(
+            f"{index:>4} {verdict.predictor:<26} {verdict.instrument:<11} "
+            f"{verdict.brier_skill_score:>+9.4f}  {'yes' if verdict.eligible else 'NO'}"
+        )
+
+    qualified = [v for v in ranked[:wanted] if v.eligible]
+    print(
+        f"\nSelection premium: ranking {candidates} candidates and taking the best "
+        f"inflates\napparent skill by roughly {selection_premium:.2f} standard errors "
+        "even when every\ncandidate's true edge is exactly zero. A leaderboard is not evidence."
+    )
+
+    if len(qualified) < wanted:
+        print(
+            f"\nRECOMMENDATION: deploy nothing. {len(qualified)} of {wanted} proposed "
+            f"instruments\nclear the gate on their own evidence. Being top-{wanted} of "
+            f"{candidates} losers is still a loser."
+        )
+        return
+
+    print(
+        f"\n{wanted} of {wanted} clear the gate independently. Before funding these with "
+        "real money,\nvalidate them on a FRESH window they were not selected on: if the "
+        "edge was\nselection noise it disappears in round two, and if it is real it survives."
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -139,6 +139,55 @@ def test_the_gate_is_judged_per_instrument_not_per_predictor() -> None:
     ).eligible
 
 
+def test_propose_refuses_to_rank_when_nothing_is_scoreable(tmp_path, capsys) -> None:
+    """A leaderboard built from unscoreable candidates is not a leaderboard, and
+    presenting one would invite funding the top of a list of noise."""
+    from andy_trader.paper_gate import main
+    from andy_trader.store import connect
+
+    database = tmp_path / "gate.db"
+    connection = connect(database)
+    initialize_database(connection)
+    _settled_calls(connection, predictor="baseline:a", count=10, probability=0.7, correct=True)
+    connection.close()
+
+    assert main(["--database", str(database), "--propose", "3"]) == 0
+
+    output = capsys.readouterr().out
+    assert "There is no ranking to make" in output
+    assert "deploy nothing" in output
+
+
+def test_propose_warns_about_the_selection_premium_before_recommending(
+    tmp_path, capsys
+) -> None:
+    """Picking the best of N candidates inflates apparent skill even when every
+    candidate's true edge is zero. That warning must appear next to any ranking,
+    or the ranking reads as evidence when it is not."""
+    from andy_trader.paper_gate import main
+    from andy_trader.store import connect
+
+    database = tmp_path / "gate.db"
+    connection = connect(database)
+    initialize_database(connection)
+    for name in ("baseline:a", "baseline:b", "baseline:c", "baseline:d"):
+        _settled_calls(
+            connection,
+            predictor=name,
+            count=MINIMUM_SETTLED_CALLS + 20,
+            probability=0.75,
+            correct=False,
+        )
+    connection.close()
+
+    assert main(["--database", str(database), "--propose", "3"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Selection premium" in output
+    assert "standard errors" in output
+    assert "deploy nothing" in output  # none of them clear the gate on their own
+
+
 def test_paper_trade_refuses_to_open_for_an_unproven_predictor() -> None:
     connection = _conn()
     now = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
