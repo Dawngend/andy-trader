@@ -169,7 +169,32 @@ def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # table does not exist yet: no model has ever been trained
-    return [dict(row) for row in rows]
+
+    entries = [dict(row) for row in rows]
+    try:
+        demotions = {
+            row["model_id"]: dict(row)
+            for row in connection.execute(
+                "SELECT * FROM model_demotions ORDER BY demoted_at ASC"
+            )
+        }
+    except sqlite3.OperationalError:
+        demotions = {}  # no model has ever been demoted yet
+
+    # A row's original "promoted" verdict is an honest historical fact and is
+    # never rewritten (see andy_trader.training's design note); this only
+    # adds what happened *since*, so the dashboard never shows a model as
+    # still live-serving when a later, separate fact says it was pulled.
+    for entry in entries:
+        demotion = demotions.get(entry["model_id"])
+        if demotion is not None:
+            entry["demoted"] = True
+            entry["demoted_at"] = demotion["demoted_at"]
+            entry["live_skill_at_demotion"] = demotion["live_skill"]
+            entry["demotion_reason"] = demotion["reason"]
+        else:
+            entry["demoted"] = False
+    return entries
 
 
 def _portfolio_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
@@ -719,8 +744,14 @@ async function refresh() {
     s.registry.forEach(m => {
       const verdict = document.createElement("td");
       const pill = document.createElement("span");
-      pill.className = "pill " + (m.promoted ? "promoted" : "rejected");
-      pill.textContent = m.promoted ? "PROMOTED" : "REJECTED";
+      if (m.demoted) {
+        pill.className = "pill rejected";
+        pill.textContent = "PROMOTED → DEMOTED";
+        pill.title = `Live skill ${m.live_skill_at_demotion.toFixed(4)} at demotion (${fmtTime(m.demoted_at)}): ${m.demotion_reason}`;
+      } else {
+        pill.className = "pill " + (m.promoted ? "promoted" : "rejected");
+        pill.textContent = m.promoted ? "PROMOTED" : "REJECTED";
+      }
       verdict.appendChild(pill);
       regBody.appendChild(row([
         td(m.model_id), td(fmtTime(m.trained_at)),

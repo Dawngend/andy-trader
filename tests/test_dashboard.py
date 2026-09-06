@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
-from andy_trader.dashboard import _collector_health, _json_safe, _latest_prices, _portfolios
+from andy_trader.dashboard import _collector_health, _json_safe, _latest_prices, _portfolios, _registry
 from andy_trader.portfolio import run_paper_cycle
 from andy_trader.risk import initialize_risk
 from andy_trader.store import Candle, initialize_database, record_observations
@@ -176,3 +176,59 @@ def test_build_dashboard_state_survives_a_real_degenerate_scoreboard_report() ->
     # This must not raise -- the real historical bug was that build_dashboard_state
     # itself was fine; only json.dumps of its output silently produced invalid JSON.
     json.dumps(_json_safe(state))
+
+
+def test_registry_shows_a_demoted_model_as_demoted_not_still_promoted() -> None:
+    """The original promotion row is an honest historical fact and must never
+    be rewritten -- but the dashboard still needs to show that a later,
+    separate fact (demotion) happened, or it would keep displaying a model
+    as live-serving after it was actually pulled."""
+    from andy_trader.registry import ModelRegistryEntry, record_demotion, record_registry_entry
+
+    connection = _conn()
+    entry = ModelRegistryEntry(
+        model_id="btc_model_1", trained_at="2026-09-05T00:00:00+00:00",
+        instrument="BTC-USD", interval="1h", horizon="1h",
+        train_start_time="2026-09-01T00:00:00+00:00", train_end_time="2026-09-04T00:00:00+00:00",
+        train_bars=72, holdout_start_time="2026-09-04T00:00:00+00:00",
+        holdout_end_time="2026-09-05T00:00:00+00:00", holdout_bars=24,
+        hyperparameters={}, holdout_brier=0.24, holdout_brier_reference=0.25,
+        holdout_brier_skill=0.05, base_rate_brier_skill=0.0,
+        promoted=True, promotion_reason="cleared the gate", weights_path=None,
+    )
+    record_registry_entry(connection, entry)
+    record_demotion(
+        connection, model_id="btc_model_1", instrument="BTC-USD", horizon="1h", interval="1h",
+        demoted_at="2026-09-06T01:32:29+00:00", live_skill=-0.0796,
+        live_call_count=70, base_rate_live_skill=-0.0057,
+        reason="live Brier skill -0.079600 no longer beats baseline:base_rate -0.005700",
+    )
+
+    rows = _registry(connection)
+
+    assert len(rows) == 1
+    assert rows[0]["promoted"] == 1  # the original fact, unchanged
+    assert rows[0]["demoted"] is True
+    assert rows[0]["live_skill_at_demotion"] == -0.0796
+    assert "no longer beats" in rows[0]["demotion_reason"]
+
+
+def test_registry_shows_an_undemoted_promoted_model_as_still_promoted() -> None:
+    from andy_trader.registry import ModelRegistryEntry, record_registry_entry
+
+    connection = _conn()
+    entry = ModelRegistryEntry(
+        model_id="btc_model_2", trained_at="2026-09-05T00:00:00+00:00",
+        instrument="BTC-USD", interval="1h", horizon="1h",
+        train_start_time="2026-09-01T00:00:00+00:00", train_end_time="2026-09-04T00:00:00+00:00",
+        train_bars=72, holdout_start_time="2026-09-04T00:00:00+00:00",
+        holdout_end_time="2026-09-05T00:00:00+00:00", holdout_bars=24,
+        hyperparameters={}, holdout_brier=0.24, holdout_brier_reference=0.25,
+        holdout_brier_skill=0.05, base_rate_brier_skill=0.0,
+        promoted=True, promotion_reason="cleared the gate", weights_path=None,
+    )
+    record_registry_entry(connection, entry)
+
+    rows = _registry(connection)
+
+    assert rows[0]["demoted"] is False
