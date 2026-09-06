@@ -50,7 +50,18 @@ _KRAKEN_PAIRS = {
 # This is exactly why every fetch failure becomes a degraded row instead of an
 # exception: over a long collection window some passes will simply lose DNS,
 # and the record has to show that honestly rather than silently thinning out.
-# CoinGecko has never been blocked in testing and is the reliable fallback.
+#
+# Confirmed 2026-09-06 by decoding the certificate rather than trusting the
+# error message: bybit, kraken and coinbase all present subject=<real-host>,
+# issuer=CN=blocking-page-authority, while api.binance.com in the same pass
+# presents a genuine DigiCert-issued cert. This is an ISP-level interception
+# forging the hostname it blocks, not a local trust-store problem -- so there
+# is no code fix, and disabling verification to "fix" it would mean trusting
+# the intercepting box with every response, the opposite of a repair. The
+# degraded-row fallback below IS the correct handling, not a placeholder for
+# one. CoinGecko has never been blocked in testing and is the reliable
+# fallback; Binance is a second reliable venue as of the same probe, and is
+# the only one of these four not intercepted on this connection.
 _COINGECKO_IDS = {
     "BTC-USD": "bitcoin",
     "ETH-USD": "ethereum",
