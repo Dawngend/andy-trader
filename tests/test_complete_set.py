@@ -8,10 +8,16 @@ import andy_trader.complete_set as complete_set
 from andy_trader.complete_set import (
     CRYPTO_TAKER_FEE_RATE,
     CompleteSetError,
+    PaperAccountError,
     _http_json,
     collect_current_round,
+    get_or_create_paper_account,
     observe_complete_set,
+    open_paper_trade,
+    paper_account_summary,
     record_complete_set_observation,
+    resolve_round_outcome,
+    settle_due_paper_trades,
     summarize_history,
     taker_fee,
     walk_ask_book,
@@ -396,3 +402,193 @@ def test_complete_set_table_is_strictly_append_only_for_the_same_round(tmp_path:
     assert report.naive_mispriced_rounds == 1
     assert report.mispriced_rounds == 1
     assert report.mispriced_costs == pytest.approx((0.97,))
+
+
+def _event(*, closed: bool, outcomes=("Up", "Down"), prices=None) -> list:
+    market: dict = {"outcomes": list(outcomes), "closed": closed}
+    if prices is not None:
+        market["outcomePrices"] = list(prices)
+    return [{"markets": [market]}]
+
+
+def _observation(round_id: str, *, up_price: float, down_price: float, target: float = 10.0):
+    return observe_complete_set(
+        round_id,
+        "2026-09-07T00:00:00+00:00",
+        _book((up_price, 100)),
+        _book((down_price, 100)),
+        target_notional=target,
+    )
+
+
+# --------------------------------------------------------------------------
+# Resolution reading
+# --------------------------------------------------------------------------
+
+
+def test_resolve_round_outcome_reads_a_genuinely_settled_up_win() -> None:
+    payload = _event(closed=True, prices=["1", "0"])
+    assert resolve_round_outcome(payload) == "up"
+
+
+def test_resolve_round_outcome_reads_a_genuinely_settled_down_win() -> None:
+    payload = _event(closed=True, prices=["0", "1"])
+    assert resolve_round_outcome(payload) == "down"
+
+
+def test_resolve_round_outcome_is_none_while_still_open() -> None:
+    payload = _event(closed=False, prices=["1", "0"])
+    assert resolve_round_outcome(payload) is None
+
+
+def test_resolve_round_outcome_is_none_when_closed_but_not_yet_priced() -> None:
+    """Gamma can mark a market closed before it has published outcomePrices.
+    That gap must read as unresolved, not as an accidental winner."""
+    payload = _event(closed=True, prices=None)
+    assert resolve_round_outcome(payload) is None
+
+
+def test_resolve_round_outcome_refuses_an_ambiguous_result() -> None:
+    """A genuine dispute or void round would not look like a clean 1/0 split.
+    This must not guess a side from whichever price happens to be higher."""
+    payload = _event(closed=True, prices=["0.5", "0.5"])
+    assert resolve_round_outcome(payload) is None
+
+
+# --------------------------------------------------------------------------
+# Paper account lifecycle
+# --------------------------------------------------------------------------
+
+
+def test_a_fresh_account_starts_at_the_requested_balance(tmp_path: Path) -> None:
+    with connect(tmp_path / "paper.db") as connection:
+        account = get_or_create_paper_account(connection, starting_cash=50.0)
+        again = get_or_create_paper_account(connection, starting_cash=999.0)
+
+    assert account.cash == account.starting_cash == 50.0
+    assert again.cash == 50.0
+
+
+def test_a_gross_mispriced_but_not_net_mispriced_round_is_never_traded(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-1", up_price=0.48, down_price=0.51)
+    assert observation.mispriced is True
+    assert observation.net_mispriced is False
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        trade = open_paper_trade(connection, observation)
+        summary = paper_account_summary(connection)
+
+    assert trade is None
+    assert summary["total_trades"] == 0
+    assert summary["cash"] == 100.0
+
+
+def test_a_net_mispriced_round_opens_a_position_debited_at_true_cost(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-2", up_price=0.50, down_price=0.44)
+    assert observation.net_mispriced is True
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        trade = open_paper_trade(connection, observation)
+        summary = paper_account_summary(connection)
+
+    assert trade is not None
+    assert trade.total_debit == pytest.approx(observation.combined_cost * 10 + trade.fee)
+    assert trade.cost + trade.fee == pytest.approx(trade.total_debit)
+    assert summary["cash"] == pytest.approx(100.0 - trade.total_debit)
+    assert summary["open_trades"] == 1
+
+
+def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-3", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        first = open_paper_trade(connection, observation)
+        second = open_paper_trade(connection, observation)
+        summary = paper_account_summary(connection)
+
+    assert first is not None
+    assert second is None
+    assert summary["total_trades"] == 1
+
+
+def test_a_trade_the_account_cannot_afford_is_refused_not_partially_filled(
+    tmp_path: Path,
+) -> None:
+    observation = _observation("btc-updown-5m-4", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=1.0)
+        trade = open_paper_trade(connection, observation)
+        summary = paper_account_summary(connection)
+
+    assert trade is None
+    assert summary["cash"] == 1.0
+    assert summary["total_trades"] == 0
+
+
+def test_settlement_credits_the_full_target_notional_on_a_real_win(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-5", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        opened = open_paper_trade(connection, observation)
+
+        def fake_http(url: str, _timeout: float) -> object:
+            assert "btc-updown-5m-5" in url
+            return _event(closed=True, prices=["1", "0"])
+
+        result = settle_due_paper_trades(connection, http=fake_http)
+        summary = paper_account_summary(connection)
+
+    assert result == {"due": 1, "settled": 1, "unresolved": 0}
+    assert summary["cash"] == pytest.approx(100.0 - opened.total_debit + 10.0)
+    assert summary["settled_trades"] == 1
+    assert summary["wins"] == 1
+    assert summary["total_pnl"] == pytest.approx(10.0 - opened.total_debit)
+
+
+def test_an_unresolved_round_stays_open_rather_than_being_guessed(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-6", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        open_paper_trade(connection, observation)
+
+        def still_open(_url: str, _timeout: float) -> object:
+            return _event(closed=False, prices=None)
+
+        result = settle_due_paper_trades(connection, http=still_open)
+        summary = paper_account_summary(connection)
+
+    assert result == {"due": 1, "settled": 0, "unresolved": 1}
+    assert summary["open_trades"] == 1
+    assert summary["settled_trades"] == 0
+
+
+def test_settlement_is_idempotent_a_second_pass_does_not_pay_twice(tmp_path: Path) -> None:
+    observation = _observation("btc-updown-5m-7", up_price=0.50, down_price=0.44)
+
+    def resolved(_url: str, _timeout: float) -> object:
+        return _event(closed=True, prices=["1", "0"])
+
+    with connect(tmp_path / "paper.db") as connection:
+        get_or_create_paper_account(connection, starting_cash=100.0)
+        open_paper_trade(connection, observation)
+        settle_due_paper_trades(connection, http=resolved)
+        first_cash = paper_account_summary(connection)["cash"]
+        second_result = settle_due_paper_trades(connection, http=resolved)
+        second_cash = paper_account_summary(connection)["cash"]
+
+    assert second_result == {"due": 0, "settled": 0, "unresolved": 0}
+    assert second_cash == pytest.approx(first_cash)
+
+
+def test_get_or_create_paper_account_rejects_a_non_positive_starting_balance(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "paper.db") as connection:
+        with pytest.raises(PaperAccountError, match="starting_cash"):
+            get_or_create_paper_account(connection, starting_cash=0.0)

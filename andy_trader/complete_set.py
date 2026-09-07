@@ -335,7 +335,14 @@ def _list_field(value: object, label: str) -> list[object]:
     return value
 
 
-def _outcome_tokens(payload: object) -> tuple[str, str]:
+def _up_down_market(payload: object) -> Mapping[str, object]:
+    """The one market object inside a Gamma event whose outcomes are Up/Down.
+
+    Shared by token lookup (for fetching order books) and resolution lookup
+    (for settling paper trades), so both read the exact same event structure
+    rather than two independently-maintained parsers drifting apart.
+    """
+
     if not isinstance(payload, list) or not payload:
         raise CompleteSetError("Gamma returned no event for the current round")
     event = payload[0]
@@ -346,20 +353,63 @@ def _outcome_tokens(payload: object) -> tuple[str, str]:
         raise CompleteSetError("Gamma event contains no markets")
 
     for market in markets:
-        if not isinstance(market, Mapping):
-            continue
-        if "outcomes" not in market or "clobTokenIds" not in market:
+        if not isinstance(market, Mapping) or "outcomes" not in market:
             continue
         outcomes = _list_field(market.get("outcomes"), "market outcomes")
-        tokens = _list_field(market.get("clobTokenIds"), "market clobTokenIds")
-        if len(outcomes) != len(tokens):
-            raise CompleteSetError("market outcomes and token IDs have different lengths")
-        by_outcome = {
-            str(outcome).casefold(): str(token) for outcome, token in zip(outcomes, tokens)
-        }
-        if "up" in by_outcome and "down" in by_outcome:
-            return by_outcome["up"], by_outcome["down"]
+        if {str(o).casefold() for o in outcomes} >= {"up", "down"}:
+            return market
     raise CompleteSetError("Gamma event contains no complementary Up/Down market")
+
+
+def _outcome_tokens(payload: object) -> tuple[str, str]:
+    market = _up_down_market(payload)
+    outcomes = _list_field(market.get("outcomes"), "market outcomes")
+    tokens = _list_field(market.get("clobTokenIds"), "market clobTokenIds")
+    if len(outcomes) != len(tokens):
+        raise CompleteSetError("market outcomes and token IDs have different lengths")
+    by_outcome = {str(outcome).casefold(): str(token) for outcome, token in zip(outcomes, tokens)}
+    return by_outcome["up"], by_outcome["down"]
+
+
+def resolve_round_outcome(payload: object) -> str | None:
+    """Which side actually won, read from Gamma's own settlement record.
+
+    Returns "up", "down", or None when the round has not resolved yet (either
+    still open, or resolved too recently for Gamma to have published it). A
+    paper trade is settled only once this returns a real side -- never
+    inferred from the market having merely closed, and never assumed from the
+    structural "exactly one side must pay $1" argument, because that argument
+    is exactly the kind of assumption a real settlement dispute or a void
+    round would violate. Read the actual record; do not compute the answer
+    from what "should" be true.
+    """
+
+    market = _up_down_market(payload)
+    if not market.get("closed"):
+        return None
+    raw_prices = market.get("outcomePrices")
+    if raw_prices is None:
+        return None
+    outcomes = _list_field(market.get("outcomes"), "market outcomes")
+    prices = _list_field(raw_prices, "market outcomePrices")
+    if len(outcomes) != len(prices):
+        raise CompleteSetError("market outcomes and outcomePrices have different lengths")
+    by_outcome = {
+        str(outcome).casefold(): _decimal(price, "outcomePrices entry")
+        for outcome, price in zip(outcomes, prices)
+    }
+    up_price, down_price = by_outcome.get("up"), by_outcome.get("down")
+    if up_price is None or down_price is None:
+        return None
+    # A genuinely settled round has one side at (or essentially at) 1 and the
+    # other at 0. Anything else -- both near 0.5, both near 0 -- is not a
+    # result this module is willing to interpret, and is left unresolved
+    # rather than guessed at.
+    if up_price >= Decimal("0.99") and down_price <= Decimal("0.01"):
+        return "up"
+    if down_price >= Decimal("0.99") and up_price <= Decimal("0.01"):
+        return "down"
+    return None
 
 
 def collect_current_round(
@@ -399,6 +449,243 @@ def collect_current_round(
         target_notional=float(target),
         fee_rate=fee_rate,
     )
+
+
+# ---------------------------------------------------------------------------
+# Paper trading: simulated cash against the real market, no order ever placed.
+#
+# A complete set is not a directional bet. Once bought, exactly one leg
+# settles at $1/share, so opening the position at cost C for `target_notional`
+# shares of each side has a KNOWN, deterministic payout once resolved -- there
+# is no forecast to grade and no calibration to score, which is why this does
+# not go through the skill gate the rest of the project uses for directional
+# predictors. The only question worth asking here is "did net_mispriced say
+# yes," and settlement is read from Polymarket's own resolution, never assumed
+# from the structural argument that one side "must" pay out -- a disputed or
+# void round would violate exactly that assumption.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PAPER_STARTING_CASH = 100.0
+
+
+class PaperAccountError(CompleteSetError):
+    """Raised when a paper account operation cannot be carried out honestly."""
+
+
+@dataclass(frozen=True)
+class PaperAccountState:
+    cash: float
+    starting_cash: float
+
+
+@dataclass(frozen=True)
+class PaperTrade:
+    id: int
+    round_id: str
+    opened_at: str
+    cost: float
+    fee: float
+    total_debit: float
+    target_notional: float
+    settled_at: str | None
+    outcome: str | None
+    payout: float | None
+    pnl: float | None
+
+
+def initialize_paper_account(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complete_set_paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            cash REAL NOT NULL,
+            starting_cash REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complete_set_paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id TEXT NOT NULL UNIQUE,
+            opened_at TEXT NOT NULL,
+            cost REAL NOT NULL,
+            fee REAL NOT NULL,
+            total_debit REAL NOT NULL,
+            target_notional REAL NOT NULL,
+            settled_at TEXT,
+            outcome TEXT CHECK (outcome IN ('up', 'down') OR outcome IS NULL),
+            payout REAL,
+            pnl REAL
+        )
+        """
+    )
+    connection.commit()
+
+
+def get_or_create_paper_account(
+    connection: sqlite3.Connection,
+    *,
+    starting_cash: float = DEFAULT_PAPER_STARTING_CASH,
+    now_iso: str | None = None,
+) -> PaperAccountState:
+    initialize_paper_account(connection)
+    row = connection.execute(
+        "SELECT cash, starting_cash FROM complete_set_paper_account WHERE id = 1"
+    ).fetchone()
+    if row is not None:
+        return PaperAccountState(cash=float(row["cash"]), starting_cash=float(row["starting_cash"]))
+    if starting_cash <= 0:
+        raise PaperAccountError(f"starting_cash must be positive, got {starting_cash!r}")
+    connection.execute(
+        "INSERT INTO complete_set_paper_account (id, cash, starting_cash, updated_at) "
+        "VALUES (1, ?, ?, ?)",
+        (starting_cash, starting_cash, now_iso or datetime.now(UTC).isoformat()),
+    )
+    connection.commit()
+    return PaperAccountState(cash=starting_cash, starting_cash=starting_cash)
+
+
+def open_paper_trade(
+    connection: sqlite3.Connection,
+    observation: CompleteSetObservation,
+    *,
+    now_iso: str | None = None,
+) -> PaperTrade | None:
+    """Open a paper position on one round, if and only if it is net_mispriced.
+
+    Returns None (never raises) for every reason a real trader would simply
+    not act: the round is not net_mispriced, it was already traded, or the
+    account cannot afford it. Opening is refused rather than partially filled
+    -- there is no partial version of "buy a complete set."
+    """
+
+    if not observation.net_mispriced:
+        return None
+    if observation.up_fill_cost is None or observation.down_fill_cost is None:
+        return None  # pragma: no cover - net_mispriced implies these exist
+    if observation.up_fee_cost is None or observation.down_fee_cost is None:
+        return None  # pragma: no cover - net_mispriced implies these exist
+
+    account = get_or_create_paper_account(connection)
+    existing = connection.execute(
+        "SELECT id FROM complete_set_paper_trades WHERE round_id = ?",
+        (observation.round_id,),
+    ).fetchone()
+    if existing is not None:
+        return None  # this round already has a paper position; never double up
+
+    cost = observation.up_fill_cost + observation.down_fill_cost
+    fee = observation.up_fee_cost + observation.down_fee_cost
+    total_debit = cost + fee
+    if total_debit > account.cash:
+        return None  # cannot invent capital the account does not have
+
+    moment = now_iso or datetime.now(UTC).isoformat()
+    cursor = connection.execute(
+        """
+        INSERT INTO complete_set_paper_trades
+        (round_id, opened_at, cost, fee, total_debit, target_notional)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (observation.round_id, moment, cost, fee, total_debit, observation.target_notional),
+    )
+    connection.execute(
+        "UPDATE complete_set_paper_account SET cash = cash - ?, updated_at = ? WHERE id = 1",
+        (total_debit, moment),
+    )
+    connection.commit()
+    return PaperTrade(
+        id=int(cursor.lastrowid),
+        round_id=observation.round_id,
+        opened_at=moment,
+        cost=cost,
+        fee=fee,
+        total_debit=total_debit,
+        target_notional=observation.target_notional,
+        settled_at=None,
+        outcome=None,
+        payout=None,
+        pnl=None,
+    )
+
+
+def settle_due_paper_trades(
+    connection: sqlite3.Connection,
+    *,
+    timeout_seconds: float = 8.0,
+    http: Callable[[str, float], object] | None = None,
+    now_iso: str | None = None,
+) -> dict[str, int]:
+    """Credit every open paper trade whose round has genuinely resolved.
+
+    A trade is left open, not guessed at, when Polymarket has not yet
+    published a clean settlement for its round -- see `resolve_round_outcome`.
+    """
+
+    get_or_create_paper_account(connection)
+    getter = http or _http_json
+    pending = connection.execute(
+        "SELECT id, round_id, total_debit, target_notional FROM complete_set_paper_trades "
+        "WHERE settled_at IS NULL"
+    ).fetchall()
+
+    settled = 0
+    unresolved = 0
+    for row in pending:
+        event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': row['round_id']})}"
+        try:
+            payload = getter(event_url, timeout_seconds)
+            outcome = resolve_round_outcome(payload)
+        except CompleteSetError:
+            unresolved += 1
+            continue
+        if outcome is None:
+            unresolved += 1
+            continue
+
+        # Exactly `target_notional` shares of each side were bought, and the
+        # winning side pays $1/share -- the payout is target_notional itself.
+        # This is the one place that structural fact is USED, and only after
+        # `resolve_round_outcome` has confirmed a real side actually won.
+        payout = row["target_notional"]
+        pnl = payout - row["total_debit"]
+        moment = now_iso or datetime.now(UTC).isoformat()
+        connection.execute(
+            "UPDATE complete_set_paper_trades "
+            "SET settled_at = ?, outcome = ?, payout = ?, pnl = ? "
+            "WHERE id = ? AND settled_at IS NULL",
+            (moment, outcome, payout, pnl, row["id"]),
+        )
+        connection.execute(
+            "UPDATE complete_set_paper_account SET cash = cash + ?, updated_at = ? WHERE id = 1",
+            (payout, moment),
+        )
+        settled += 1
+    connection.commit()
+    return {"due": len(pending), "settled": settled, "unresolved": unresolved}
+
+
+def paper_account_summary(connection: sqlite3.Connection) -> dict[str, object]:
+    account = get_or_create_paper_account(connection)
+    rows = connection.execute(
+        "SELECT settled_at, pnl FROM complete_set_paper_trades"
+    ).fetchall()
+    settled_rows = [r for r in rows if r["settled_at"] is not None]
+    wins = sum(1 for r in settled_rows if r["pnl"] is not None and r["pnl"] > 0)
+    total_pnl = sum(float(r["pnl"]) for r in settled_rows if r["pnl"] is not None)
+    return {
+        "cash": account.cash,
+        "starting_cash": account.starting_cash,
+        "return_pct": (account.cash / account.starting_cash - 1.0) * 100.0,
+        "total_trades": len(rows),
+        "open_trades": len(rows) - len(settled_rows),
+        "settled_trades": len(settled_rows),
+        "wins": wins,
+        "losses": len(settled_rows) - wins,
+        "total_pnl": total_pnl,
+    }
 
 
 def record_complete_set_observation(
@@ -647,6 +934,17 @@ def _print_report(report: CompleteSetReport) -> None:
         )
 
 
+def _print_paper_summary(summary: Mapping[str, object]) -> None:
+    print("\n--- paper account (simulated cash, real market, no order ever placed) ---")
+    print(f"cash               : ${summary['cash']:.4f} (started at ${summary['starting_cash']:.2f})")
+    print(f"return             : {summary['return_pct']:+.2f}%")
+    print(f"trades             : {summary['total_trades']} total, "
+          f"{summary['open_trades']} open, {summary['settled_trades']} settled")
+    if summary["settled_trades"]:
+        print(f"wins / losses      : {summary['wins']} / {summary['losses']}")
+    print(f"total pnl          : ${summary['total_pnl']:+.4f}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
@@ -658,12 +956,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=8.0)
     parser.add_argument("--report", action="store_true", help="Summarize stored observations")
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help=(
+            "Also settle any due paper trades and open one for this observation "
+            "if it is net_mispriced. Simulated cash only; never places an order."
+        ),
+    )
+    parser.add_argument(
+        "--paper-starting-cash",
+        type=float,
+        default=DEFAULT_PAPER_STARTING_CASH,
+        help="Starting balance for a brand-new paper account; default: $100",
+    )
     args = parser.parse_args(argv)
 
     db_path = Path(args.database) if args.database else default_database_path()
     with connect(db_path) as connection:
         if args.report:
             _print_report(summarize_history(connection, target_notional=args.target_notional))
+            if args.paper:
+                _print_paper_summary(paper_account_summary(connection))
             return 0
         try:
             observation = collect_current_round(
@@ -674,7 +988,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"complete-set collection failed: {exc}", file=sys.stderr)
             return 1
         record_complete_set_observation(connection, observation)
+        if args.paper:
+            get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
+            settlement = settle_due_paper_trades(connection, timeout_seconds=args.timeout)
+            trade = open_paper_trade(connection, observation)
     _print_observation(observation)
+    if args.paper:
+        print(f"\npaper settlement  : {settlement['settled']} settled, "
+              f"{settlement['unresolved']} still unresolved")
+        if trade is not None:
+            print(f"paper trade opened: round {trade.round_id}, debit ${trade.total_debit:.4f}")
+        _print_paper_summary(paper_account_summary(connection))
     return 0
 
 
