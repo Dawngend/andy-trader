@@ -3,7 +3,11 @@
 from datetime import UTC, datetime, timedelta
 import sqlite3
 
-from andy_trader.paper_gate import MINIMUM_SETTLED_CALLS, evaluate_paper_eligibility
+from andy_trader.paper_gate import (
+    DEFAULT_RECENT_WINDOW,
+    MINIMUM_SETTLED_CALLS,
+    evaluate_paper_eligibility,
+)
 from andy_trader.portfolio import paper_trade_once
 from andy_trader.store import (
     Candle,
@@ -190,6 +194,133 @@ def test_beating_the_base_rate_statistically_is_not_enough_if_it_cannot_cover_co
     assert verdict.break_even_win_rate > verdict.hit_rate
     assert not verdict.eligible
     assert "economically profitable" in verdict.reason
+
+
+def _calls_with_explicit_outcomes(
+    connection: sqlite3.Connection,
+    *,
+    predictor: str,
+    confident_correct: int,
+    confident_wrong: int,
+    probability: float = 0.75,
+    instrument: str = "BTC-USD",
+) -> None:
+    """Write `confident_correct` calls that were right, followed in time by
+    `confident_wrong` calls that were confidently wrong -- a predictor whose
+    good history has since decayed. Outcomes are set explicitly per row by id,
+    not by an id-parity trick, so a good block followed by a bad block cannot
+    silently scramble which calls landed which way. Outcomes alternate so
+    neither the lifetime nor the recent slice is ever degenerate."""
+
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    total = confident_correct + confident_wrong
+    row_outcomes: list[tuple[int, int]] = []
+    for index in range(total):
+        outcome_up = index % 2
+        decayed = index >= confident_correct
+        leaning_up = (not bool(outcome_up)) if decayed else bool(outcome_up)
+        probability_up = probability if leaning_up else 1.0 - probability
+        created = base + timedelta(hours=index)
+        row_id = record_prediction(
+            connection,
+            Prediction(
+                predictor=predictor,
+                instrument=instrument,
+                horizon="1h",
+                probability_up=probability_up,
+                reference_price=100.0,
+                created_at=created.isoformat(),
+                resolves_at=(created + timedelta(hours=1)).isoformat(),
+            ),
+        )
+        row_outcomes.append((row_id, outcome_up))
+
+    settled_at = datetime(2026, 9, 1, tzinfo=UTC).isoformat()
+    for row_id, outcome_up in row_outcomes:
+        connection.execute(
+            "UPDATE crypto_predictions SET settled_at = ?, settle_price = 100.0, "
+            "outcome_up = ? WHERE id = ?",
+            (settled_at, outcome_up, row_id),
+        )
+    connection.commit()
+
+
+def test_a_lifetime_average_earned_long_ago_does_not_excuse_recent_decay() -> None:
+    """The exact failure DaviddTech described: his best strategy's equity
+    curve kept looking fine on the lifetime average while a real losing streak
+    was already underway. A predictor with a great early record and a recently
+    inverted one must be blocked, not waved through on its history."""
+    connection = _conn()
+    good_block = MINIMUM_SETTLED_CALLS  # 200 confidently correct calls
+    bad_block = DEFAULT_RECENT_WINDOW  # then 100 confidently wrong calls
+    _calls_with_explicit_outcomes(
+        connection,
+        predictor="baseline:decayed",
+        confident_correct=good_block,
+        confident_wrong=bad_block,
+    )
+    _price_history(connection, instrument="BTC-USD", bars=40)
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:decayed", instrument="BTC-USD"
+    )
+
+    # The lifetime average is still real -- 200 right, 100 wrong nets positive.
+    assert verdict.brier_skill_score is not None and verdict.brier_skill_score > 0
+    # But the most recent DEFAULT_RECENT_WINDOW calls are the wrong ones.
+    assert verdict.recent_sample_size == DEFAULT_RECENT_WINDOW
+    assert verdict.recent_brier_skill_score is not None and verdict.recent_brier_skill_score < 0
+    assert not verdict.eligible
+    assert "stale" in verdict.reason
+
+
+def test_a_predictor_that_is_still_good_recently_is_not_penalized(
+) -> None:
+    """The check must not become paranoid: a predictor whose recent window is
+    exactly as good as its lifetime record should pass both checks and say so."""
+    connection = _conn()
+    _calls_with_explicit_outcomes(
+        connection,
+        predictor="baseline:consistent",
+        confident_correct=MINIMUM_SETTLED_CALLS + DEFAULT_RECENT_WINDOW,
+        confident_wrong=0,
+    )
+    # Give it real price history so the economics check can clear too.
+    _price_history(connection, instrument="BTC-USD", bars=40)
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:consistent", instrument="BTC-USD"
+    )
+
+    assert verdict.eligible
+    assert verdict.recent_sample_size == DEFAULT_RECENT_WINDOW
+    assert verdict.recent_brier_skill_score is not None and verdict.recent_brier_skill_score > 0
+    assert "independently confirm" in verdict.reason
+
+
+def test_recent_window_check_is_skipped_when_there_is_not_enough_recent_history(
+) -> None:
+    """A caller may configure a recent_window larger than minimum_calls; in
+    that case there is no meaningful trailing slice yet and the check must not
+    fire on data that does not exist."""
+    connection = _conn()
+    _calls_with_explicit_outcomes(
+        connection,
+        predictor="baseline:thin",
+        confident_correct=MINIMUM_SETTLED_CALLS,
+        confident_wrong=0,
+    )
+    _price_history(connection, instrument="BTC-USD", bars=40)
+
+    verdict = evaluate_paper_eligibility(
+        connection,
+        predictor="baseline:thin",
+        instrument="BTC-USD",
+        recent_window=MINIMUM_SETTLED_CALLS + 1,
+    )
+
+    assert verdict.eligible
+    assert verdict.recent_sample_size is None
 
 
 def test_a_predictor_that_beats_the_base_rate_is_allowed_through() -> None:

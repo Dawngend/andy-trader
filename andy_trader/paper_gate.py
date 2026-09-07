@@ -39,6 +39,20 @@ are not the same test. A predictor can clear the first and fail the second by a
 wide margin, and until this fix the gate could not tell the difference. It now
 checks both, because a pair that would still lose money net has not actually
 earned anything.
+
+A THIRD gap, prompted by a viewer's own account in a 2026-09-06 AI-trading
+tutorial (DaviddTech, "I Made My Most Profitable AI Trading Bot Even Better"):
+his best-ever strategy ran its equity curve up to +2,181% and he stayed
+attached to it through a losing streak because the *lifetime* average still
+looked fine while the *recent* stretch had already turned. Markets are
+non-stationary; a predictor that earned its lifetime average months ago can
+decay today and hide inside that average for a long time before the
+cumulative number finally turns. His fix, and this module's now: score the
+most recent `recent_window` calls as their own independent sample against the
+exact same bar as the lifetime one. A predictor can pass on paper forever
+while its last hundred calls have already gone cold, and the two checks catch
+different failures -- lifetime average and recent trend are not the same
+claim, the same way statistical skill and economic profit were not.
 """
 
 from __future__ import annotations
@@ -55,6 +69,14 @@ from andy_trader.store import FAST_HORIZONS, fetch_settled
 # gate should be slow to open, and it costs nothing to wait because the thing
 # being withheld is permission to lose money.
 MINIMUM_SETTLED_CALLS = 200
+
+# The trailing sample size checked independently of the lifetime average, so a
+# recent decay cannot hide inside a good all-time number. Deliberately half of
+# MINIMUM_SETTLED_CALLS: large enough that a handful of unlucky calls cannot
+# swing the verdict on their own, small enough that at the 1h horizon it covers
+# roughly four days -- long enough to be a real trend, short enough to still be
+# "recent" rather than another lifetime average in miniature.
+DEFAULT_RECENT_WINDOW = 100
 
 
 def _observation_interval_for(horizon: str) -> str:
@@ -78,6 +100,9 @@ class EligibilityVerdict:
     brier_skill_score: float | None = None
     hit_rate: float | None = None
     break_even_win_rate: float | None = None
+    recent_sample_size: int | None = None
+    recent_brier_skill_score: float | None = None
+    recent_hit_rate: float | None = None
 
 
 def evaluate_paper_eligibility(
@@ -88,6 +113,7 @@ def evaluate_paper_eligibility(
     horizon: str = "1h",
     minimum_calls: int = MINIMUM_SETTLED_CALLS,
     round_trip_bps: float = DEFAULT_ROUND_TRIP_BPS,
+    recent_window: int = DEFAULT_RECENT_WINDOW,
 ) -> EligibilityVerdict:
     """Decide whether `predictor` may open new positions in `instrument`.
 
@@ -201,6 +227,110 @@ def evaluate_paper_eligibility(
             break_even_win_rate=econ.break_even_win_rate,
         )
 
+    # Lifetime average and recent trend are different claims. A predictor can
+    # pass everything above forever on the strength of a good history while its
+    # last `recent_window` calls have already decayed -- exactly the failure
+    # DaviddTech described watching happen to his own best strategy. Judged
+    # against the identical bar as the lifetime check, on the trailing slice
+    # alone, once there is enough recent history for that slice to mean
+    # anything (there always is once sample_size clears minimum_calls, given
+    # recent_window's default is half of MINIMUM_SETTLED_CALLS).
+    if sample_size >= recent_window:
+        recent_rows = rows[-recent_window:]
+        recent_probabilities = [float(row["probability_up"]) for row in recent_rows]
+        recent_outcomes = [int(row["outcome_up"]) for row in recent_rows]
+        try:
+            recent_report = evaluate(recent_probabilities, recent_outcomes)
+        except CalibrationError as exc:
+            return EligibilityVerdict(
+                eligible=False,
+                reason=(
+                    f"{predictor} on {instrument} beats the base rate over its full "
+                    f"{sample_size}-call history, but its most recent {recent_window} calls "
+                    f"cannot be scored ({exc}) -- a lifetime average is not a substitute for "
+                    f"knowing whether it still works right now"
+                ),
+                predictor=predictor,
+                instrument=instrument,
+                sample_size=sample_size,
+                brier_skill_score=report.brier_skill_score,
+                hit_rate=report.hit_rate,
+                break_even_win_rate=econ.break_even_win_rate,
+                recent_sample_size=len(recent_rows),
+            )
+
+        if recent_report.degenerate or not recent_report.beats_base_rate:
+            reason_detail = (
+                "a degenerate recent sample (every outcome identical)"
+                if recent_report.degenerate
+                else (
+                    f"{recent_report.brier_skill_score:+.4f} Brier skill "
+                    f"(hit rate {recent_report.hit_rate:.1%}), which does not beat the base rate"
+                )
+            )
+            return EligibilityVerdict(
+                eligible=False,
+                reason=(
+                    f"{predictor} on {instrument} beats the base rate over its full "
+                    f"{sample_size}-call lifetime ({report.brier_skill_score:+.4f} skill), but "
+                    f"its most recent {recent_window} calls show {reason_detail} -- its lifetime "
+                    f"average is real but stale, and recent performance is what decides whether "
+                    f"it may keep trading"
+                ),
+                predictor=predictor,
+                instrument=instrument,
+                sample_size=sample_size,
+                brier_skill_score=report.brier_skill_score,
+                hit_rate=report.hit_rate,
+                break_even_win_rate=econ.break_even_win_rate,
+                recent_sample_size=len(recent_rows),
+                recent_brier_skill_score=(
+                    None if recent_report.degenerate else recent_report.brier_skill_score
+                ),
+                recent_hit_rate=None if recent_report.degenerate else recent_report.hit_rate,
+            )
+
+        if recent_report.hit_rate < econ.break_even_win_rate:
+            return EligibilityVerdict(
+                eligible=False,
+                reason=(
+                    f"{predictor} on {instrument} beats the base rate over its full "
+                    f"{sample_size}-call lifetime, but its most recent {recent_window} calls hit "
+                    f"only {recent_report.hit_rate:.1%}, below the {econ.break_even_win_rate:.1%} "
+                    f"needed to cover costs -- it used to be economically profitable and, right "
+                    f"now, is not"
+                ),
+                predictor=predictor,
+                instrument=instrument,
+                sample_size=sample_size,
+                brier_skill_score=report.brier_skill_score,
+                hit_rate=report.hit_rate,
+                break_even_win_rate=econ.break_even_win_rate,
+                recent_sample_size=len(recent_rows),
+                recent_brier_skill_score=recent_report.brier_skill_score,
+                recent_hit_rate=recent_report.hit_rate,
+            )
+
+        return EligibilityVerdict(
+            eligible=True,
+            reason=(
+                f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
+                f"lifetime skill) AND its {report.hit_rate:.1%} hit rate clears the "
+                f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} calls -- "
+                f"AND its most recent {recent_window} calls independently confirm this "
+                f"({recent_report.brier_skill_score:+.4f} skill, {recent_report.hit_rate:.1%} hit rate)"
+            ),
+            predictor=predictor,
+            instrument=instrument,
+            sample_size=sample_size,
+            brier_skill_score=report.brier_skill_score,
+            hit_rate=report.hit_rate,
+            break_even_win_rate=econ.break_even_win_rate,
+            recent_sample_size=len(recent_rows),
+            recent_brier_skill_score=recent_report.brier_skill_score,
+            recent_hit_rate=recent_report.hit_rate,
+        )
+
     return EligibilityVerdict(
         eligible=True,
         reason=(
@@ -278,7 +408,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
 
     print(
         f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} {'skill':>9} "
-        f"{'hit':>7} {'need':>7}  verdict"
+        f"{'hit':>7} {'need':>7} {'recent':>9}  verdict"
     )
     allowed = 0
     for row in pairs:
@@ -301,13 +431,20 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             if verdict.break_even_win_rate is not None
             else "--"
         )
+        recent = (
+            f"{verdict.recent_brier_skill_score:+.4f}"
+            if verdict.recent_brier_skill_score is not None
+            else "--"
+        )
         mark = "MAY TRADE" if verdict.eligible else "blocked"
         allowed += 1 if verdict.eligible else 0
         print(
             f"{row['predictor']:<28} {row['instrument']:<11} {row['horizon']:>7} "
-            f"{verdict.sample_size:>5} {skill:>9} {hit:>7} {need:>7}  {mark}"
+            f"{verdict.sample_size:>5} {skill:>9} {hit:>7} {need:>7} {recent:>9}  {mark}"
         )
     print(f"\n{allowed} pair(s) currently allowed to open new positions.")
+    print(f"(recent = Brier skill over the most recent {DEFAULT_RECENT_WINDOW} calls only, "
+          "checked independently of the lifetime average)")
 
     if args.propose:
         _propose(
