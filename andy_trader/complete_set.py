@@ -7,7 +7,7 @@ creating any order path.
 
 **A "mispriced" combined cost under $1 is not yet a net edge.** Polymarket
 charges a taker fee on the main CLOB (confirmed at docs.polymarket.com/trading/fees,
-2026-09-07): `fee = shares * feeRate * price * (1 - price)`, feeRate 0.07 for
+2026-09-18): `fee = shares * feeRate * price * (1 - price)`, feeRate 0.07 for
 Crypto-category markets, makers pay zero. Buying both outcomes means crossing
 two separate asks, so this module treats the fee as charged independently on
 each leg with no netting for holding a complete set -- the docs do not confirm
@@ -46,9 +46,12 @@ GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 USER_AGENT = "andy-trader-complete-set/1.0 (personal research)"
 DEFAULT_TARGET_NOTIONAL = 10.0
+DEFAULT_MIN_EXECUTION_EDGE_BPS = 200.0
+DEFAULT_CONFIRMATION_DELAY_SECONDS = 0.5
+DEFAULT_MAX_CONFIRMATION_AGE_SECONDS = 5.0
 NO_ORDER_BOOK_ERROR = "No orderbook exists for the requested token id"
 
-# docs.polymarket.com/trading/fees, confirmed 2026-09-07. Taker-only; makers pay
+# docs.polymarket.com/trading/fees, confirmed 2026-09-18. Taker-only; makers pay
 # zero. feeRate is category-specific -- 0.07 is Crypto, which a BTC Up/Down
 # market falls under by subject matter, though the docs do not name this
 # specific market series. See the module docstring for what is and is not
@@ -491,6 +494,10 @@ class PaperTrade:
     outcome: str | None
     payout: float | None
     pnl: float | None
+    signal_net_combined_cost: float | None
+    confirmation_net_combined_cost: float | None
+    confirmation_delay_ms: float | None
+    minimum_edge_bps: float | None
 
 
 def initialize_paper_account(connection: sqlite3.Connection) -> None:
@@ -517,10 +524,29 @@ def initialize_paper_account(connection: sqlite3.Connection) -> None:
             settled_at TEXT,
             outcome TEXT CHECK (outcome IN ('up', 'down') OR outcome IS NULL),
             payout REAL,
-            pnl REAL
+            pnl REAL,
+            signal_net_combined_cost REAL,
+            confirmation_net_combined_cost REAL,
+            confirmation_delay_ms REAL,
+            minimum_edge_bps REAL
         )
         """
     )
+    existing_columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(complete_set_paper_trades)")
+    }
+    migrations = {
+        "signal_net_combined_cost": "REAL",
+        "confirmation_net_combined_cost": "REAL",
+        "confirmation_delay_ms": "REAL",
+        "minimum_edge_bps": "REAL",
+    }
+    for column, sql_type in migrations.items():
+        if column not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE complete_set_paper_trades ADD COLUMN {column} {sql_type}"
+            )
     connection.commit()
 
 
@@ -549,18 +575,57 @@ def get_or_create_paper_account(
 
 def open_paper_trade(
     connection: sqlite3.Connection,
-    observation: CompleteSetObservation,
+    signal: CompleteSetObservation,
+    confirmation: CompleteSetObservation,
     *,
+    minimum_edge_bps: float = DEFAULT_MIN_EXECUTION_EDGE_BPS,
+    max_confirmation_age_seconds: float = DEFAULT_MAX_CONFIRMATION_AGE_SECONDS,
     now_iso: str | None = None,
 ) -> PaperTrade | None:
-    """Open a paper position on one round, if and only if it is net_mispriced.
+    """Open only after the same executable edge survives a fresh re-quote.
 
     Returns None (never raises) for every reason a real trader would simply
-    not act: the round is not net_mispriced, it was already traded, or the
-    account cannot afford it. Opening is refused rather than partially filled
-    -- there is no partial version of "buy a complete set."
+    not act: either snapshot lacks the configured edge, the confirmation is
+    stale or from another round, the round was already traded, or the account
+    cannot afford it. This still does not prove a live fill. It deliberately
+    raises the paper bar above a single fleeting quote while the repository has
+    no authenticated execution path or atomic two-leg order.
     """
 
+    if not 0 <= minimum_edge_bps < 10_000:
+        raise PaperAccountError(
+            f"minimum_edge_bps must be in [0, 10000), got {minimum_edge_bps!r}"
+        )
+    if max_confirmation_age_seconds <= 0:
+        raise PaperAccountError(
+            "max_confirmation_age_seconds must be positive, "
+            f"got {max_confirmation_age_seconds!r}"
+        )
+    maximum_cost = 1.0 - minimum_edge_bps / 10_000.0
+    if signal.round_id != confirmation.round_id:
+        return None
+    if signal.target_notional != confirmation.target_notional:
+        return None
+    try:
+        signal_at = datetime.fromisoformat(signal.observed_at)
+        confirmation_at = datetime.fromisoformat(confirmation.observed_at)
+        confirmation_delay_seconds = (confirmation_at - signal_at).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    if not 0 < confirmation_delay_seconds <= max_confirmation_age_seconds:
+        return None
+    for snapshot in (signal, confirmation):
+        if not snapshot.net_mispriced or snapshot.net_combined_cost is None:
+            return None
+        if snapshot.net_combined_cost > maximum_cost:
+            return None
+    if confirmation.up_fill_cost is None or confirmation.down_fill_cost is None:
+        return None  # pragma: no cover - net_mispriced implies these exist
+    if confirmation.up_fee_cost is None or confirmation.down_fee_cost is None:
+        return None  # pragma: no cover - net_mispriced implies these exist
+
+    observation = confirmation
+    confirmation_delay_ms = confirmation_delay_seconds * 1_000.0
     if not observation.net_mispriced:
         return None
     if observation.up_fill_cost is None or observation.down_fill_cost is None:
@@ -586,10 +651,23 @@ def open_paper_trade(
     cursor = connection.execute(
         """
         INSERT INTO complete_set_paper_trades
-        (round_id, opened_at, cost, fee, total_debit, target_notional)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (round_id, opened_at, cost, fee, total_debit, target_notional,
+         signal_net_combined_cost, confirmation_net_combined_cost,
+         confirmation_delay_ms, minimum_edge_bps)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (observation.round_id, moment, cost, fee, total_debit, observation.target_notional),
+        (
+            observation.round_id,
+            moment,
+            cost,
+            fee,
+            total_debit,
+            observation.target_notional,
+            signal.net_combined_cost,
+            confirmation.net_combined_cost,
+            confirmation_delay_ms,
+            minimum_edge_bps,
+        ),
     )
     connection.execute(
         "UPDATE complete_set_paper_account SET cash = cash - ?, updated_at = ? WHERE id = 1",
@@ -608,6 +686,10 @@ def open_paper_trade(
         outcome=None,
         payout=None,
         pnl=None,
+        signal_net_combined_cost=signal.net_combined_cost,
+        confirmation_net_combined_cost=confirmation.net_combined_cost,
+        confirmation_delay_ms=confirmation_delay_ms,
+        minimum_edge_bps=minimum_edge_bps,
     )
 
 
@@ -670,18 +752,32 @@ def settle_due_paper_trades(
 def paper_account_summary(connection: sqlite3.Connection) -> dict[str, object]:
     account = get_or_create_paper_account(connection)
     rows = connection.execute(
-        "SELECT settled_at, pnl FROM complete_set_paper_trades"
+        "SELECT settled_at, pnl, total_debit, target_notional, "
+        "confirmation_net_combined_cost FROM complete_set_paper_trades"
     ).fetchall()
     settled_rows = [r for r in rows if r["settled_at"] is not None]
+    open_rows = [r for r in rows if r["settled_at"] is None]
     wins = sum(1 for r in settled_rows if r["pnl"] is not None and r["pnl"] > 0)
     total_pnl = sum(float(r["pnl"]) for r in settled_rows if r["pnl"] is not None)
+    open_face_value = sum(float(r["target_notional"]) for r in open_rows)
+    open_cost = sum(float(r["total_debit"]) for r in open_rows)
+    marked_equity = account.cash + open_face_value
+    confirmed_trades = sum(
+        1 for r in rows if r["confirmation_net_combined_cost"] is not None
+    )
     return {
         "cash": account.cash,
         "starting_cash": account.starting_cash,
-        "return_pct": (account.cash / account.starting_cash - 1.0) * 100.0,
+        "marked_equity": marked_equity,
+        "return_pct": (marked_equity / account.starting_cash - 1.0) * 100.0,
+        "open_face_value": open_face_value,
+        "open_cost": open_cost,
+        "projected_open_pnl": open_face_value - open_cost,
         "total_trades": len(rows),
-        "open_trades": len(rows) - len(settled_rows),
+        "open_trades": len(open_rows),
         "settled_trades": len(settled_rows),
+        "confirmed_trades": confirmed_trades,
+        "legacy_unconfirmed_trades": len(rows) - confirmed_trades,
         "wins": wins,
         "losses": len(settled_rows) - wins,
         "total_pnl": total_pnl,
@@ -937,12 +1033,17 @@ def _print_report(report: CompleteSetReport) -> None:
 def _print_paper_summary(summary: Mapping[str, object]) -> None:
     print("\n--- paper account (simulated cash, real market, no order ever placed) ---")
     print(f"cash               : ${summary['cash']:.4f} (started at ${summary['starting_cash']:.2f})")
-    print(f"return             : {summary['return_pct']:+.2f}%")
+    print(f"marked equity      : ${summary['marked_equity']:.4f} ({summary['return_pct']:+.2f}%)")
+    if summary["open_trades"]:
+        print(f"open face value    : ${summary['open_face_value']:.4f} "
+              f"(projected pnl ${summary['projected_open_pnl']:+.4f})")
     print(f"trades             : {summary['total_trades']} total, "
           f"{summary['open_trades']} open, {summary['settled_trades']} settled")
+    print(f"execution model    : {summary['confirmed_trades']} re-quoted, "
+          f"{summary['legacy_unconfirmed_trades']} legacy single-snapshot")
     if summary["settled_trades"]:
         print(f"wins / losses      : {summary['wins']} / {summary['losses']}")
-    print(f"total pnl          : ${summary['total_pnl']:+.4f}")
+    print(f"realized pnl       : ${summary['total_pnl']:+.4f}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -952,7 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--target-notional",
         type=float,
         default=DEFAULT_TARGET_NOTIONAL,
-        help="Guaranteed complete-set payout to fill; default: $10",
+        help="Complete-set face payout to fill after a clean resolution; default: $10",
     )
     parser.add_argument("--timeout", type=float, default=8.0)
     parser.add_argument("--report", action="store_true", help="Summarize stored observations")
@@ -970,9 +1071,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_PAPER_STARTING_CASH,
         help="Starting balance for a brand-new paper account; default: $100",
     )
+    parser.add_argument(
+        "--paper-min-edge-bps",
+        type=float,
+        default=DEFAULT_MIN_EXECUTION_EDGE_BPS,
+        help=(
+            "Minimum net edge required in both the signal and confirmation snapshots; "
+            "default: 200 bps"
+        ),
+    )
+    parser.add_argument(
+        "--paper-confirmation-delay",
+        type=float,
+        default=DEFAULT_CONFIRMATION_DELAY_SECONDS,
+        help="Seconds to wait before re-quoting both books; default: 0.5",
+    )
     args = parser.parse_args(argv)
 
+    if args.paper and not 0 <= args.paper_min_edge_bps < 10_000:
+        parser.error("--paper-min-edge-bps must be in [0, 10000)")
+    if args.paper and args.paper_confirmation_delay < 0:
+        parser.error("--paper-confirmation-delay must not be negative")
+
     db_path = Path(args.database) if args.database else default_database_path()
+    confirmation: CompleteSetObservation | None = None
+    confirmation_error: str | None = None
+    trade: PaperTrade | None = None
+    settlement = {"settled": 0, "unresolved": 0}
+    paper_summary: Mapping[str, object] | None = None
     with connect(db_path) as connection:
         if args.report:
             _print_report(summarize_history(connection, target_notional=args.target_notional))
@@ -991,15 +1117,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
             settlement = settle_due_paper_trades(connection, timeout_seconds=args.timeout)
-            trade = open_paper_trade(connection, observation)
+            maximum_cost = 1.0 - args.paper_min_edge_bps / 10_000.0
+            if (
+                observation.net_mispriced
+                and observation.net_combined_cost is not None
+                and observation.net_combined_cost <= maximum_cost
+            ):
+                time.sleep(args.paper_confirmation_delay)
+                try:
+                    confirmation = collect_current_round(
+                        target_notional=args.target_notional,
+                        timeout_seconds=args.timeout,
+                    )
+                except CompleteSetError as exc:
+                    confirmation_error = str(exc)
+                else:
+                    record_complete_set_observation(connection, confirmation)
+                    trade = open_paper_trade(
+                        connection,
+                        observation,
+                        confirmation,
+                        minimum_edge_bps=args.paper_min_edge_bps,
+                    )
+            paper_summary = paper_account_summary(connection)
     _print_observation(observation)
     if args.paper:
         print(f"\npaper settlement  : {settlement['settled']} settled, "
               f"{settlement['unresolved']} still unresolved")
+        if confirmation_error is not None:
+            print(f"paper confirmation: failed closed ({confirmation_error})")
+        elif confirmation is not None and trade is None:
+            print("paper confirmation: edge did not survive the fresh re-quote and margin gate")
         if trade is not None:
-            print(f"paper trade opened: round {trade.round_id}, debit ${trade.total_debit:.4f}")
-        _print_paper_summary(paper_account_summary(connection))
-    return 0
+            print(
+                f"paper trade opened: round {trade.round_id}, debit ${trade.total_debit:.4f}, "
+                f"confirmed after {trade.confirmation_delay_ms:.0f}ms"
+            )
+        if paper_summary is not None:
+            _print_paper_summary(paper_summary)
+    return 1 if confirmation_error is not None else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -167,8 +167,10 @@ columns filled in. Any other update to that table is a bug.
 | Skill gate on paper trading | built; every pair currently blocked |
 | Intra-round continuation (1m) | built; collecting, not yet enough evidence to score |
 | Unattended paper trading | scheduled every 15m; fast path scheduled every 1m |
+| CT-11 complete-set detector | built; fee-aware, depth-aware, paper-only |
+| Live-money readiness gate | built; currently **NOT READY** and exits nonzero |
 
-281 tests. `python -m pytest tests/ -q`.
+327 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -426,6 +428,40 @@ the Kelly-optimal stake and past 2x Kelly growth turns negative by construction.
 `andy_trader/fast_momentum.py` keeps the signal and replaces the sizing with capped
 fractional Kelly that stakes nothing without a measured edge and ignores any band with
 fewer than 30 samples. `tests/test_fast_momentum.py` encodes the finding as an assertion.
+
+## Complete sets are the only surviving research path, not a live strategy yet
+
+CT-11 measures whether equal shares of both outcomes can be bought for less than their
+combined $1 face payout. It walks the full ask depth on both legs and applies Polymarket's
+current 7% Crypto taker-fee formula per price level. It never places an order.
+
+The September 18 audit began with 1,435 observations across 294 rounds and three distinct UTC
+collection days. Forty-four rounds were below $1 before fees; only thirteen survived after
+fees. The paper account ultimately settled six historical positions from single quote snapshots
+for $1.6521 realized profit. Those are simulated quote fills, not evidence that two real orders
+would both have executed.
+
+Every exact post-fee edge in the stored data appeared in only one observation. None remained
+net-mispriced at the following one-minute sample. This matters because Polymarket's batch-order
+response is not atomic: each order can be accepted or rejected independently. Even two FOK
+orders can leave a directional position when one complete leg fills and the other fails.
+
+The paper path now fails closed unless the edge survives a re-quote within five seconds and both
+snapshots retain at least a 200-basis-point all-in margin. New paper trades record both costs and
+their confirmation delay. Historical single-snapshot trades remain labelled as legacy evidence rather
+than being silently upgraded. Paper accounting reports cash and marked equity separately, so an
+open complete set no longer looks like an immediate loss simply because its cash was reserved.
+
+```bash
+python -m andy_trader.complete_set --report --paper
+python -m andy_trader.live_readiness
+```
+
+The readiness command exits nonzero until all blocking evidence exists: execution-host geographic
+eligibility, at least fourteen distinct observation days, at least one hundred settled re-quoted
+paper trades with no non-profitable settlement, an authenticated execution adapter, and verified
+handling for a one-leg-filled / one-leg-failed event. Meeting those minimums would permit a new
+review. It would not guarantee profit.
 
 ## Honest expectations
 

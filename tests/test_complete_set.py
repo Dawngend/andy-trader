@@ -1,3 +1,4 @@
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -421,6 +422,13 @@ def _observation(round_id: str, *, up_price: float, down_price: float, target: f
     )
 
 
+def _confirmation(observation, *, seconds_later: int = 1):
+    return replace(
+        observation,
+        observed_at=f"2026-09-07T00:00:{seconds_later:02d}+00:00",
+    )
+
+
 # --------------------------------------------------------------------------
 # Resolution reading
 # --------------------------------------------------------------------------
@@ -476,7 +484,7 @@ def test_a_gross_mispriced_but_not_net_mispriced_round_is_never_traded(tmp_path:
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        trade = open_paper_trade(connection, observation)
+        trade = open_paper_trade(connection, observation, _confirmation(observation))
         summary = paper_account_summary(connection)
 
     assert trade is None
@@ -490,14 +498,117 @@ def test_a_net_mispriced_round_opens_a_position_debited_at_true_cost(tmp_path: P
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        trade = open_paper_trade(connection, observation)
+        trade = open_paper_trade(connection, observation, _confirmation(observation))
         summary = paper_account_summary(connection)
 
     assert trade is not None
     assert trade.total_debit == pytest.approx(observation.combined_cost * 10 + trade.fee)
     assert trade.cost + trade.fee == pytest.approx(trade.total_debit)
     assert summary["cash"] == pytest.approx(100.0 - trade.total_debit)
+    assert summary["marked_equity"] == pytest.approx(summary["cash"] + 10.0)
+    assert summary["return_pct"] > 0.0
     assert summary["open_trades"] == 1
+    assert summary["confirmed_trades"] == 1
+    assert summary["legacy_unconfirmed_trades"] == 0
+
+
+def test_a_single_fleeting_edge_is_not_enough_for_the_paper_execution_model(
+    tmp_path: Path,
+) -> None:
+    signal = _observation("btc-updown-5m-fleeting", up_price=0.50, down_price=0.44)
+    confirmation = _observation(
+        "btc-updown-5m-fleeting", up_price=0.50, down_price=0.50
+    )
+    confirmation = _confirmation(confirmation)
+
+    with connect(tmp_path / "paper.db") as connection:
+        trade = open_paper_trade(connection, signal, confirmation)
+        summary = paper_account_summary(connection)
+
+    assert signal.net_mispriced is True
+    assert confirmation.net_mispriced is False
+    assert trade is None
+    assert summary["total_trades"] == 0
+
+
+def test_a_net_edge_smaller_than_the_execution_buffer_is_refused(tmp_path: Path) -> None:
+    signal = _observation("btc-updown-5m-thin-edge", up_price=0.46, down_price=0.49)
+    confirmation = _confirmation(signal)
+
+    with connect(tmp_path / "paper.db") as connection:
+        trade = open_paper_trade(connection, signal, confirmation)
+
+    assert signal.net_mispriced is True
+    assert signal.net_combined_cost > 0.98
+    assert trade is None
+
+
+def test_confirmation_must_belong_to_the_same_round(tmp_path: Path) -> None:
+    signal = _observation("btc-updown-5m-a", up_price=0.50, down_price=0.44)
+    confirmation = _confirmation(
+        _observation("btc-updown-5m-b", up_price=0.50, down_price=0.44)
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        trade = open_paper_trade(connection, signal, confirmation)
+
+    assert trade is None
+
+
+def test_confirmation_must_be_fresh_and_use_the_same_target_size(tmp_path: Path) -> None:
+    signal = _observation("btc-updown-5m-fresh", up_price=0.50, down_price=0.44)
+    stale = _confirmation(signal, seconds_later=6)
+    different_size = _confirmation(
+        _observation(
+            "btc-updown-5m-fresh", up_price=0.50, down_price=0.44, target=20.0
+        )
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        assert open_paper_trade(connection, signal, stale) is None
+        assert open_paper_trade(connection, signal, different_size) is None
+
+
+def test_invalid_execution_buffer_is_rejected_as_configuration_error(tmp_path: Path) -> None:
+    signal = _observation("btc-updown-5m-buffer", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        with pytest.raises(PaperAccountError, match="minimum_edge_bps"):
+            open_paper_trade(
+                connection,
+                signal,
+                _confirmation(signal),
+                minimum_edge_bps=10_000,
+            )
+
+
+def test_cli_marks_a_failed_confirmation_as_a_failed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signal = _observation("btc-updown-5m-cli", up_price=0.50, down_price=0.44)
+    calls = 0
+
+    def collect(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return signal
+        raise CompleteSetError("confirmation feed unavailable")
+
+    monkeypatch.setattr(complete_set, "collect_current_round", collect)
+    monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
+
+    result = complete_set.main(
+        [
+            "--database",
+            str(tmp_path / "paper.db"),
+            "--paper",
+            "--paper-confirmation-delay",
+            "0",
+        ]
+    )
+
+    assert result == 1
 
 
 def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:
@@ -505,8 +616,9 @@ def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        first = open_paper_trade(connection, observation)
-        second = open_paper_trade(connection, observation)
+        confirmation = _confirmation(observation)
+        first = open_paper_trade(connection, observation, confirmation)
+        second = open_paper_trade(connection, observation, confirmation)
         summary = paper_account_summary(connection)
 
     assert first is not None
@@ -521,7 +633,7 @@ def test_a_trade_the_account_cannot_afford_is_refused_not_partially_filled(
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=1.0)
-        trade = open_paper_trade(connection, observation)
+        trade = open_paper_trade(connection, observation, _confirmation(observation))
         summary = paper_account_summary(connection)
 
     assert trade is None
@@ -534,7 +646,7 @@ def test_settlement_credits_the_full_target_notional_on_a_real_win(tmp_path: Pat
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        opened = open_paper_trade(connection, observation)
+        opened = open_paper_trade(connection, observation, _confirmation(observation))
 
         def fake_http(url: str, _timeout: float) -> object:
             assert "btc-updown-5m-5" in url
@@ -555,7 +667,7 @@ def test_an_unresolved_round_stays_open_rather_than_being_guessed(tmp_path: Path
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        open_paper_trade(connection, observation)
+        open_paper_trade(connection, observation, _confirmation(observation))
 
         def still_open(_url: str, _timeout: float) -> object:
             return _event(closed=False, prices=None)
@@ -576,7 +688,7 @@ def test_settlement_is_idempotent_a_second_pass_does_not_pay_twice(tmp_path: Pat
 
     with connect(tmp_path / "paper.db") as connection:
         get_or_create_paper_account(connection, starting_cash=100.0)
-        open_paper_trade(connection, observation)
+        open_paper_trade(connection, observation, _confirmation(observation))
         settle_due_paper_trades(connection, http=resolved)
         first_cash = paper_account_summary(connection)["cash"]
         second_result = settle_due_paper_trades(connection, http=resolved)
