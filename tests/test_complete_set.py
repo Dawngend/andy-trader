@@ -12,10 +12,13 @@ from andy_trader.complete_set import (
     PaperAccountError,
     _http_json,
     collect_current_round,
+    confirmation_attempt_summary,
+    evaluate_confirmation,
     get_or_create_paper_account,
     observe_complete_set,
     open_paper_trade,
     paper_account_summary,
+    record_confirmation_attempt,
     record_complete_set_observation,
     resolve_round_outcome,
     settle_due_paper_trades,
@@ -543,6 +546,71 @@ def test_a_net_edge_smaller_than_the_execution_buffer_is_refused(tmp_path: Path)
     assert trade is None
 
 
+def test_confirmation_verdict_explains_why_an_edge_is_not_executable() -> None:
+    signal = _observation("btc-updown-5m-reason", up_price=0.46, down_price=0.49)
+    thin_confirmation = _confirmation(signal)
+    vanished_confirmation = _confirmation(
+        _observation("btc-updown-5m-reason", up_price=0.50, down_price=0.50)
+    )
+
+    thin = evaluate_confirmation(signal, thin_confirmation)
+    vanished = evaluate_confirmation(signal, vanished_confirmation)
+
+    assert thin.eligible is False
+    assert thin.reason == "signal_margin_too_small"
+    assert thin.delay_ms == pytest.approx(1_000)
+    assert vanished.eligible is False
+    assert vanished.reason == "edge_disappeared"
+
+
+def test_confirmation_attempts_preserve_survival_and_failure_evidence(tmp_path: Path) -> None:
+    thin_signal = _observation("btc-updown-5m-thin", up_price=0.46, down_price=0.49)
+    vanished_signal = _observation(
+        "btc-updown-5m-vanished", up_price=0.50, down_price=0.44
+    )
+    vanished_confirmation = _confirmation(
+        _observation("btc-updown-5m-vanished", up_price=0.50, down_price=0.50)
+    )
+    failed_signal = _observation("btc-updown-5m-failed", up_price=0.50, down_price=0.44)
+
+    with connect(tmp_path / "paper.db") as connection:
+        record_confirmation_attempt(
+            connection,
+            thin_signal,
+            confirmation=_confirmation(thin_signal),
+            minimum_edge_bps=200,
+        )
+        record_confirmation_attempt(
+            connection,
+            vanished_signal,
+            confirmation=vanished_confirmation,
+            minimum_edge_bps=200,
+        )
+        record_confirmation_attempt(
+            connection,
+            failed_signal,
+            confirmation=None,
+            minimum_edge_bps=200,
+            error="confirmation feed unavailable",
+        )
+        rows = connection.execute(
+            "SELECT reason, error FROM complete_set_confirmation_attempts ORDER BY id"
+        ).fetchall()
+        summary = confirmation_attempt_summary(connection)
+
+    assert [(row["reason"], row["error"]) for row in rows] == [
+        ("signal_margin_too_small", None),
+        ("edge_disappeared", None),
+        ("confirmation_failed", "confirmation feed unavailable"),
+    ]
+    assert summary.attempts == 3
+    assert summary.confirmation_failures == 1
+    assert summary.net_edges_requoted == 3
+    assert summary.net_edges_survived == 1
+    assert summary.execution_margin_survived == 0
+    assert summary.paper_trades_opened == 0
+
+
 def test_confirmation_must_belong_to_the_same_round(tmp_path: Path) -> None:
     signal = _observation("btc-updown-5m-a", up_price=0.50, down_price=0.44)
     confirmation = _confirmation(
@@ -609,6 +677,50 @@ def test_cli_marks_a_failed_confirmation_as_a_failed_run(
     )
 
     assert result == 1
+    with connect(tmp_path / "paper.db") as connection:
+        row = connection.execute(
+            "SELECT reason, error FROM complete_set_confirmation_attempts"
+        ).fetchone()
+    assert row["reason"] == "confirmation_failed"
+    assert row["error"] == "confirmation feed unavailable"
+
+
+def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signal = _observation("btc-updown-5m-cli-thin", up_price=0.46, down_price=0.49)
+    confirmation = _confirmation(signal)
+    observations = iter((signal, confirmation))
+
+    monkeypatch.setattr(
+        complete_set,
+        "collect_current_round",
+        lambda **_kwargs: next(observations),
+    )
+    monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
+
+    result = complete_set.main(
+        [
+            "--database",
+            str(tmp_path / "paper.db"),
+            "--paper",
+            "--paper-confirmation-delay",
+            "0",
+        ]
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        attempt = connection.execute(
+            "SELECT reason, eligible, paper_trade_id "
+            "FROM complete_set_confirmation_attempts"
+        ).fetchone()
+        summary = paper_account_summary(connection)
+
+    assert result == 0
+    assert attempt["reason"] == "signal_margin_too_small"
+    assert attempt["eligible"] == 0
+    assert attempt["paper_trade_id"] is None
+    assert summary["total_trades"] == 0
 
 
 def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:

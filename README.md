@@ -170,7 +170,7 @@ columns filled in. Any other update to that table is a bug.
 | CT-11 complete-set detector | built; fee-aware, depth-aware, paper-only |
 | Live-money readiness gate | built; currently **NOT READY** and exits nonzero |
 
-327 tests. `python -m pytest tests/ -q`.
+330 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -446,9 +446,12 @@ net-mispriced at the following one-minute sample. This matters because Polymarke
 response is not atomic: each order can be accepted or rejected independently. Even two FOK
 orders can leave a directional position when one complete leg fills and the other fails.
 
-The paper path now fails closed unless the edge survives a re-quote within five seconds and both
-snapshots retain at least a 200-basis-point all-in margin. New paper trades record both costs and
-their confirmation delay. Historical single-snapshot trades remain labelled as legacy evidence rather
+The paper path now re-quotes every post-fee edge, including edges too small to deploy, and stores an
+append-only outcome for every attempt. The learning report separates feed failures, vanished edges,
+surviving net edges, edges that retained the 200-basis-point margin, and simulated trades opened.
+Capital still fails closed unless the same edge survives within five seconds and both snapshots
+retain at least that 200-basis-point all-in margin. New paper trades record both costs and their
+confirmation delay. Historical single-snapshot trades remain labelled as legacy evidence rather
 than being silently upgraded. Paper accounting reports cash and marked equity separately, so an
 open complete set no longer looks like an immediate loss simply because its cash was reserved.
 

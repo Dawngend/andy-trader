@@ -500,6 +500,23 @@ class PaperTrade:
     minimum_edge_bps: float | None
 
 
+@dataclass(frozen=True)
+class ConfirmationVerdict:
+    eligible: bool
+    reason: str
+    delay_ms: float | None
+
+
+@dataclass(frozen=True)
+class ConfirmationAttemptSummary:
+    attempts: int
+    confirmation_failures: int
+    net_edges_requoted: int
+    net_edges_survived: int
+    execution_margin_survived: int
+    paper_trades_opened: int
+
+
 def initialize_paper_account(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -531,6 +548,31 @@ def initialize_paper_account(connection: sqlite3.Connection) -> None:
             minimum_edge_bps REAL
         )
         """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complete_set_confirmation_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id TEXT NOT NULL,
+            attempted_at TEXT NOT NULL,
+            signal_observed_at TEXT NOT NULL,
+            signal_net_combined_cost REAL,
+            confirmation_round_id TEXT,
+            confirmation_observed_at TEXT,
+            confirmation_net_combined_cost REAL,
+            confirmation_delay_ms REAL,
+            minimum_edge_bps REAL NOT NULL,
+            eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+            reason TEXT NOT NULL,
+            paper_trade_id INTEGER,
+            error TEXT,
+            FOREIGN KEY (paper_trade_id) REFERENCES complete_set_paper_trades(id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS complete_set_confirmation_attempts_round "
+        "ON complete_set_confirmation_attempts(round_id, attempted_at)"
     )
     existing_columns = {
         str(row["name"])
@@ -573,6 +615,49 @@ def get_or_create_paper_account(
     return PaperAccountState(cash=starting_cash, starting_cash=starting_cash)
 
 
+def evaluate_confirmation(
+    signal: CompleteSetObservation,
+    confirmation: CompleteSetObservation,
+    *,
+    minimum_edge_bps: float = DEFAULT_MIN_EXECUTION_EDGE_BPS,
+    max_confirmation_age_seconds: float = DEFAULT_MAX_CONFIRMATION_AGE_SECONDS,
+) -> ConfirmationVerdict:
+    """Classify a second snapshot without changing account state."""
+
+    if not 0 <= minimum_edge_bps < 10_000:
+        raise PaperAccountError(
+            f"minimum_edge_bps must be in [0, 10000), got {minimum_edge_bps!r}"
+        )
+    if max_confirmation_age_seconds <= 0:
+        raise PaperAccountError(
+            "max_confirmation_age_seconds must be positive, "
+            f"got {max_confirmation_age_seconds!r}"
+        )
+    if signal.round_id != confirmation.round_id:
+        return ConfirmationVerdict(False, "round_changed", None)
+    if signal.target_notional != confirmation.target_notional:
+        return ConfirmationVerdict(False, "target_changed", None)
+    try:
+        signal_at = datetime.fromisoformat(signal.observed_at)
+        confirmation_at = datetime.fromisoformat(confirmation.observed_at)
+        delay_seconds = (confirmation_at - signal_at).total_seconds()
+    except (TypeError, ValueError):
+        return ConfirmationVerdict(False, "invalid_timestamp", None)
+    delay_ms = delay_seconds * 1_000.0
+    if not 0 < delay_seconds <= max_confirmation_age_seconds:
+        return ConfirmationVerdict(False, "stale_confirmation", delay_ms)
+    if not signal.net_mispriced or signal.net_combined_cost is None:
+        return ConfirmationVerdict(False, "signal_not_net_mispriced", delay_ms)
+    if not confirmation.net_mispriced or confirmation.net_combined_cost is None:
+        return ConfirmationVerdict(False, "edge_disappeared", delay_ms)
+    maximum_cost = 1.0 - minimum_edge_bps / 10_000.0
+    if signal.net_combined_cost > maximum_cost:
+        return ConfirmationVerdict(False, "signal_margin_too_small", delay_ms)
+    if confirmation.net_combined_cost > maximum_cost:
+        return ConfirmationVerdict(False, "confirmation_margin_too_small", delay_ms)
+    return ConfirmationVerdict(True, "eligible", delay_ms)
+
+
 def open_paper_trade(
     connection: sqlite3.Connection,
     signal: CompleteSetObservation,
@@ -592,40 +677,23 @@ def open_paper_trade(
     no authenticated execution path or atomic two-leg order.
     """
 
-    if not 0 <= minimum_edge_bps < 10_000:
-        raise PaperAccountError(
-            f"minimum_edge_bps must be in [0, 10000), got {minimum_edge_bps!r}"
-        )
-    if max_confirmation_age_seconds <= 0:
-        raise PaperAccountError(
-            "max_confirmation_age_seconds must be positive, "
-            f"got {max_confirmation_age_seconds!r}"
-        )
-    maximum_cost = 1.0 - minimum_edge_bps / 10_000.0
-    if signal.round_id != confirmation.round_id:
+    verdict = evaluate_confirmation(
+        signal,
+        confirmation,
+        minimum_edge_bps=minimum_edge_bps,
+        max_confirmation_age_seconds=max_confirmation_age_seconds,
+    )
+    if not verdict.eligible:
         return None
-    if signal.target_notional != confirmation.target_notional:
-        return None
-    try:
-        signal_at = datetime.fromisoformat(signal.observed_at)
-        confirmation_at = datetime.fromisoformat(confirmation.observed_at)
-        confirmation_delay_seconds = (confirmation_at - signal_at).total_seconds()
-    except (TypeError, ValueError):
-        return None
-    if not 0 < confirmation_delay_seconds <= max_confirmation_age_seconds:
-        return None
-    for snapshot in (signal, confirmation):
-        if not snapshot.net_mispriced or snapshot.net_combined_cost is None:
-            return None
-        if snapshot.net_combined_cost > maximum_cost:
-            return None
     if confirmation.up_fill_cost is None or confirmation.down_fill_cost is None:
         return None  # pragma: no cover - net_mispriced implies these exist
     if confirmation.up_fee_cost is None or confirmation.down_fee_cost is None:
         return None  # pragma: no cover - net_mispriced implies these exist
 
     observation = confirmation
-    confirmation_delay_ms = confirmation_delay_seconds * 1_000.0
+    if verdict.delay_ms is None:  # pragma: no cover - eligible guarantees a delay
+        raise PaperAccountError("eligible confirmation is missing its measured delay")
+    confirmation_delay_ms = verdict.delay_ms
     if not observation.net_mispriced:
         return None
     if observation.up_fill_cost is None or observation.down_fill_cost is None:
@@ -690,6 +758,96 @@ def open_paper_trade(
         confirmation_net_combined_cost=confirmation.net_combined_cost,
         confirmation_delay_ms=confirmation_delay_ms,
         minimum_edge_bps=minimum_edge_bps,
+    )
+
+
+def record_confirmation_attempt(
+    connection: sqlite3.Connection,
+    signal: CompleteSetObservation,
+    *,
+    confirmation: CompleteSetObservation | None,
+    minimum_edge_bps: float,
+    verdict: ConfirmationVerdict | None = None,
+    trade: PaperTrade | None = None,
+    error: str | None = None,
+    now_iso: str | None = None,
+) -> int:
+    """Append the result of every second-snapshot attempt, including failures."""
+
+    initialize_paper_account(connection)
+    if not 0 <= minimum_edge_bps < 10_000:
+        raise PaperAccountError(
+            f"minimum_edge_bps must be in [0, 10000), got {minimum_edge_bps!r}"
+        )
+    if confirmation is None:
+        if verdict is not None:
+            raise PaperAccountError("a verdict requires a confirmation snapshot")
+        eligible = False
+        reason = "confirmation_failed"
+        delay_ms = None
+    else:
+        resolved_verdict = verdict or evaluate_confirmation(
+            signal,
+            confirmation,
+            minimum_edge_bps=minimum_edge_bps,
+        )
+        eligible = resolved_verdict.eligible
+        reason = resolved_verdict.reason
+        delay_ms = resolved_verdict.delay_ms
+    if trade is not None and not eligible:
+        raise PaperAccountError("an ineligible confirmation cannot reference a paper trade")
+    cursor = connection.execute(
+        """
+        INSERT INTO complete_set_confirmation_attempts
+        (round_id, attempted_at, signal_observed_at, signal_net_combined_cost,
+         confirmation_round_id, confirmation_observed_at,
+         confirmation_net_combined_cost, confirmation_delay_ms,
+         minimum_edge_bps, eligible, reason, paper_trade_id, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal.round_id,
+            now_iso or datetime.now(UTC).isoformat(),
+            signal.observed_at,
+            signal.net_combined_cost,
+            None if confirmation is None else confirmation.round_id,
+            None if confirmation is None else confirmation.observed_at,
+            None if confirmation is None else confirmation.net_combined_cost,
+            delay_ms,
+            minimum_edge_bps,
+            int(eligible),
+            reason,
+            None if trade is None else trade.id,
+            error,
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def confirmation_attempt_summary(
+    connection: sqlite3.Connection,
+) -> ConfirmationAttemptSummary:
+    initialize_paper_account(connection)
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS attempts,
+               SUM(reason = 'confirmation_failed') AS confirmation_failures,
+               SUM(signal_net_combined_cost < 1) AS net_edges_requoted,
+               SUM(confirmation_round_id = round_id
+                   AND confirmation_net_combined_cost < 1) AS net_edges_survived,
+               SUM(eligible = 1) AS execution_margin_survived,
+               SUM(paper_trade_id IS NOT NULL) AS paper_trades_opened
+        FROM complete_set_confirmation_attempts
+        """
+    ).fetchone()
+    return ConfirmationAttemptSummary(
+        attempts=int(row["attempts"]),
+        confirmation_failures=int(row["confirmation_failures"] or 0),
+        net_edges_requoted=int(row["net_edges_requoted"] or 0),
+        net_edges_survived=int(row["net_edges_survived"] or 0),
+        execution_margin_survived=int(row["execution_margin_survived"] or 0),
+        paper_trades_opened=int(row["paper_trades_opened"] or 0),
     )
 
 
@@ -1046,6 +1204,22 @@ def _print_paper_summary(summary: Mapping[str, object]) -> None:
     print(f"realized pnl       : ${summary['total_pnl']:+.4f}")
 
 
+def _print_confirmation_summary(summary: ConfirmationAttemptSummary) -> None:
+    print("\n--- complete-set confirmation learning ---")
+    print(f"attempts           : {summary.attempts}")
+    print(f"feed failures      : {summary.confirmation_failures}")
+    if summary.net_edges_requoted:
+        survival_pct = 100.0 * summary.net_edges_survived / summary.net_edges_requoted
+        print(
+            f"net edge survived  : {summary.net_edges_survived} / "
+            f"{summary.net_edges_requoted} ({survival_pct:.1f}%)"
+        )
+    else:
+        print("net edge survived  : no net edges re-quoted yet")
+    print(f"retained 2% margin : {summary.execution_margin_survived}")
+    print(f"paper trades opened: {summary.paper_trades_opened}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
@@ -1061,8 +1235,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--paper",
         action="store_true",
         help=(
-            "Also settle any due paper trades and open one for this observation "
-            "if it is net_mispriced. Simulated cash only; never places an order."
+            "Also settle due paper trades, re-quote every net edge for learning, "
+            "and open only after the execution margin gate. Simulated cash only; "
+            "never places an order."
         ),
     )
     parser.add_argument(
@@ -1096,14 +1271,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     db_path = Path(args.database) if args.database else default_database_path()
     confirmation: CompleteSetObservation | None = None
     confirmation_error: str | None = None
+    confirmation_verdict: ConfirmationVerdict | None = None
     trade: PaperTrade | None = None
     settlement = {"settled": 0, "unresolved": 0}
     paper_summary: Mapping[str, object] | None = None
+    confirmation_summary: ConfirmationAttemptSummary | None = None
     with connect(db_path) as connection:
         if args.report:
             _print_report(summarize_history(connection, target_notional=args.target_notional))
             if args.paper:
                 _print_paper_summary(paper_account_summary(connection))
+                _print_confirmation_summary(confirmation_attempt_summary(connection))
             return 0
         try:
             observation = collect_current_round(
@@ -1117,12 +1295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
             settlement = settle_due_paper_trades(connection, timeout_seconds=args.timeout)
-            maximum_cost = 1.0 - args.paper_min_edge_bps / 10_000.0
-            if (
-                observation.net_mispriced
-                and observation.net_combined_cost is not None
-                and observation.net_combined_cost <= maximum_cost
-            ):
+            if observation.net_mispriced and observation.net_combined_cost is not None:
                 time.sleep(args.paper_confirmation_delay)
                 try:
                     confirmation = collect_current_round(
@@ -1131,23 +1304,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 except CompleteSetError as exc:
                     confirmation_error = str(exc)
+                    record_confirmation_attempt(
+                        connection,
+                        observation,
+                        confirmation=None,
+                        minimum_edge_bps=args.paper_min_edge_bps,
+                        error=confirmation_error,
+                    )
                 else:
                     record_complete_set_observation(connection, confirmation)
+                    confirmation_verdict = evaluate_confirmation(
+                        observation,
+                        confirmation,
+                        minimum_edge_bps=args.paper_min_edge_bps,
+                    )
                     trade = open_paper_trade(
                         connection,
                         observation,
                         confirmation,
                         minimum_edge_bps=args.paper_min_edge_bps,
                     )
+                    record_confirmation_attempt(
+                        connection,
+                        observation,
+                        confirmation=confirmation,
+                        minimum_edge_bps=args.paper_min_edge_bps,
+                        verdict=confirmation_verdict,
+                        trade=trade,
+                    )
             paper_summary = paper_account_summary(connection)
+            confirmation_summary = confirmation_attempt_summary(connection)
     _print_observation(observation)
     if args.paper:
         print(f"\npaper settlement  : {settlement['settled']} settled, "
               f"{settlement['unresolved']} still unresolved")
         if confirmation_error is not None:
             print(f"paper confirmation: failed closed ({confirmation_error})")
-        elif confirmation is not None and trade is None:
-            print("paper confirmation: edge did not survive the fresh re-quote and margin gate")
+        elif confirmation_verdict is not None and trade is None:
+            print(f"paper confirmation: no trade ({confirmation_verdict.reason})")
         if trade is not None:
             print(
                 f"paper trade opened: round {trade.round_id}, debit ${trade.total_debit:.4f}, "
@@ -1155,6 +1349,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if paper_summary is not None:
             _print_paper_summary(paper_summary)
+        if confirmation_summary is not None:
+            _print_confirmation_summary(confirmation_summary)
     return 1 if confirmation_error is not None else 0
 
 
