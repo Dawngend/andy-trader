@@ -44,12 +44,17 @@ from andy_trader.store import connect, default_database_path
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
+CLOB_BOOKS_URL = "https://clob.polymarket.com/books"
 USER_AGENT = "andy-trader-complete-set/1.0 (personal research)"
 DEFAULT_TARGET_NOTIONAL = 10.0
 DEFAULT_MIN_EXECUTION_EDGE_BPS = 200.0
 DEFAULT_CONFIRMATION_DELAY_SECONDS = 0.5
 DEFAULT_MAX_CONFIRMATION_AGE_SECONDS = 5.0
+DEFAULT_PAPER_BURST_SAMPLES = 5
+MAX_BATCH_BOOK_SKEW_MS = 250
 NO_ORDER_BOOK_ERROR = "No orderbook exists for the requested token id"
+
+_ROUND_TOKEN_CACHE: tuple[str, str, str] | None = None
 
 # docs.polymarket.com/trading/fees, confirmed 2026-09-18. Taker-only; makers pay
 # zero. feeRate is category-specific -- 0.07 is Crypto, which a BTC Up/Down
@@ -327,6 +332,27 @@ def _http_json(url: str, timeout_seconds: float) -> object:
         raise CompleteSetError(f"GET {url} failed: {type(exc).__name__}: {exc}") from exc
 
 
+def _http_json_post(url: str, payload: object, timeout_seconds: float) -> object:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:400]
+        raise CompleteSetError(f"POST {url} failed: HTTP {exc.code}: {detail}") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise CompleteSetError(f"POST {url} failed: {type(exc).__name__}: {exc}") from exc
+
+
 def _list_field(value: object, label: str) -> list[object]:
     if isinstance(value, str):
         try:
@@ -372,6 +398,54 @@ def _outcome_tokens(payload: object) -> tuple[str, str]:
         raise CompleteSetError("market outcomes and token IDs have different lengths")
     by_outcome = {str(outcome).casefold(): str(token) for outcome, token in zip(outcomes, tokens)}
     return by_outcome["up"], by_outcome["down"]
+
+
+def _books_from_batch(
+    payload: object,
+    up_token: str,
+    down_token: str,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Map a `/books` response by token instead of trusting response order."""
+
+    if not isinstance(payload, list):
+        raise CompleteSetError("CLOB batch order-book payload must be a list")
+    by_token: dict[str, Mapping[str, object]] = {}
+    for index, book in enumerate(payload):
+        if not isinstance(book, Mapping):
+            raise CompleteSetError(f"CLOB batch order book {index} must be an object")
+        token = book.get("asset_id")
+        if token is None:
+            raise CompleteSetError(f"CLOB batch order book {index} is missing asset_id")
+        token_id = str(token)
+        if token_id in by_token:
+            raise CompleteSetError(f"CLOB batch returned duplicate asset_id {token_id}")
+        by_token[token_id] = book
+    missing = [token for token in (up_token, down_token) if token not in by_token]
+    if missing:
+        raise CompleteSetError(
+            "CLOB batch response is missing requested token(s): " + ", ".join(missing)
+        )
+    up_book, down_book = by_token[up_token], by_token[down_token]
+    timestamps: list[int] = []
+    for label, book in (("Up", up_book), ("Down", down_book)):
+        raw_timestamp = book.get("timestamp")
+        try:
+            timestamp = int(str(raw_timestamp))
+        except (TypeError, ValueError) as exc:
+            raise CompleteSetError(
+                f"CLOB batch {label} book has invalid timestamp {raw_timestamp!r}"
+            ) from exc
+        if timestamp < 0:
+            raise CompleteSetError(
+                f"CLOB batch {label} book has invalid timestamp {raw_timestamp!r}"
+            )
+        timestamps.append(timestamp)
+    skew_ms = abs(timestamps[0] - timestamps[1])
+    if skew_ms > MAX_BATCH_BOOK_SKEW_MS:
+        raise CompleteSetError(
+            f"CLOB batch books are {skew_ms}ms apart; limit is {MAX_BATCH_BOOK_SKEW_MS}ms"
+        )
+    return up_book, down_book
 
 
 def resolve_round_outcome(payload: object) -> str | None:
@@ -421,9 +495,18 @@ def collect_current_round(
     timeout_seconds: float = 8.0,
     now: float | None = None,
     http: Callable[[str, float], object] | None = None,
+    batch_http: Callable[[str, object, float], object] | None = None,
     fee_rate: float = CRYPTO_TAKER_FEE_RATE,
 ) -> CompleteSetObservation:
-    """Fetch only the currently open 300-second round and price both books."""
+    """Fetch the current round and price a coherent pair of outcome books.
+
+    Production uses Polymarket's official `/books` batch endpoint so Up and
+    Down arrive in one response rather than two independently timed GETs. The
+    current round's token IDs are cached only inside this short-lived process,
+    avoiding a repeated Gamma lookup during the confirmation burst. Tests and
+    callers that inject only the legacy GET function retain the sequential path
+    for compatibility.
+    """
 
     if timeout_seconds <= 0:
         raise CompleteSetError("timeout_seconds must be positive")
@@ -435,12 +518,28 @@ def collect_current_round(
     round_id = f"btc-updown-5m-{round_start}"
     getter = http or _http_json
 
-    event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': round_id})}"
-    up_token, down_token = _outcome_tokens(getter(event_url, timeout_seconds))
-    up_url = f"{CLOB_BOOK_URL}?{urlencode({'token_id': up_token})}"
-    down_url = f"{CLOB_BOOK_URL}?{urlencode({'token_id': down_token})}"
-    up_book = getter(up_url, timeout_seconds)
-    down_book = getter(down_url, timeout_seconds)
+    global _ROUND_TOKEN_CACHE
+    if http is None and _ROUND_TOKEN_CACHE is not None and _ROUND_TOKEN_CACHE[0] == round_id:
+        _, up_token, down_token = _ROUND_TOKEN_CACHE
+    else:
+        event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': round_id})}"
+        up_token, down_token = _outcome_tokens(getter(event_url, timeout_seconds))
+        if http is None:
+            _ROUND_TOKEN_CACHE = (round_id, up_token, down_token)
+
+    if batch_http is not None or http is None:
+        poster = batch_http or _http_json_post
+        books = poster(
+            CLOB_BOOKS_URL,
+            [{"token_id": up_token}, {"token_id": down_token}],
+            timeout_seconds,
+        )
+        up_book, down_book = _books_from_batch(books, up_token, down_token)
+    else:
+        up_url = f"{CLOB_BOOK_URL}?{urlencode({'token_id': up_token})}"
+        down_url = f"{CLOB_BOOK_URL}?{urlencode({'token_id': down_token})}"
+        up_book = getter(up_url, timeout_seconds)
+        down_book = getter(down_url, timeout_seconds)
     if not isinstance(up_book, Mapping) or not isinstance(down_book, Mapping):
         raise CompleteSetError("CLOB order-book payloads must be objects")
 
@@ -1259,7 +1358,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--paper-confirmation-delay",
         type=float,
         default=DEFAULT_CONFIRMATION_DELAY_SECONDS,
-        help="Seconds to wait before re-quoting both books; default: 0.5",
+        help="Seconds between synchronized batch snapshots; default: 0.5",
+    )
+    parser.add_argument(
+        "--paper-burst-samples",
+        type=int,
+        default=DEFAULT_PAPER_BURST_SAMPLES,
+        help=(
+            "Adjacent confirmation windows to sample per invocation; one additional "
+            "closing snapshot is collected. Default: 5"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1267,6 +1375,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--paper-min-edge-bps must be in [0, 10000)")
     if args.paper and args.paper_confirmation_delay < 0:
         parser.error("--paper-confirmation-delay must not be negative")
+    if args.paper and args.paper_burst_samples < 1:
+        parser.error("--paper-burst-samples must be at least 1")
 
     db_path = Path(args.database) if args.database else default_database_path()
     confirmation: CompleteSetObservation | None = None
@@ -1276,6 +1386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     settlement = {"settled": 0, "unresolved": 0}
     paper_summary: Mapping[str, object] | None = None
     confirmation_summary: ConfirmationAttemptSummary | None = None
+    burst_snapshot_count = 1
+    burst_attempts = 0
     with connect(db_path) as connection:
         if args.report:
             _print_report(summarize_history(connection, target_notional=args.target_notional))
@@ -1295,51 +1407,67 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
             settlement = settle_due_paper_trades(connection, timeout_seconds=args.timeout)
-            if observation.net_mispriced and observation.net_combined_cost is not None:
+            signal = observation
+            for _ in range(args.paper_burst_samples):
                 time.sleep(args.paper_confirmation_delay)
                 try:
-                    confirmation = collect_current_round(
+                    current = collect_current_round(
                         target_notional=args.target_notional,
                         timeout_seconds=args.timeout,
                     )
                 except CompleteSetError as exc:
                     confirmation_error = str(exc)
-                    record_confirmation_attempt(
-                        connection,
-                        observation,
-                        confirmation=None,
-                        minimum_edge_bps=args.paper_min_edge_bps,
-                        error=confirmation_error,
-                    )
+                    if signal.net_mispriced and signal.net_combined_cost is not None:
+                        record_confirmation_attempt(
+                            connection,
+                            signal,
+                            confirmation=None,
+                            minimum_edge_bps=args.paper_min_edge_bps,
+                            error=confirmation_error,
+                        )
+                        burst_attempts += 1
+                    break
                 else:
-                    record_complete_set_observation(connection, confirmation)
-                    confirmation_verdict = evaluate_confirmation(
-                        observation,
-                        confirmation,
-                        minimum_edge_bps=args.paper_min_edge_bps,
-                    )
-                    trade = open_paper_trade(
-                        connection,
-                        observation,
-                        confirmation,
-                        minimum_edge_bps=args.paper_min_edge_bps,
-                    )
-                    record_confirmation_attempt(
-                        connection,
-                        observation,
-                        confirmation=confirmation,
-                        minimum_edge_bps=args.paper_min_edge_bps,
-                        verdict=confirmation_verdict,
-                        trade=trade,
-                    )
+                    record_complete_set_observation(connection, current)
+                    burst_snapshot_count += 1
+                    if signal.net_mispriced and signal.net_combined_cost is not None:
+                        confirmation = current
+                        confirmation_verdict = evaluate_confirmation(
+                            signal,
+                            confirmation,
+                            minimum_edge_bps=args.paper_min_edge_bps,
+                        )
+                        opened_trade = open_paper_trade(
+                            connection,
+                            signal,
+                            confirmation,
+                            minimum_edge_bps=args.paper_min_edge_bps,
+                        )
+                        if trade is None and opened_trade is not None:
+                            trade = opened_trade
+                        record_confirmation_attempt(
+                            connection,
+                            signal,
+                            confirmation=confirmation,
+                            minimum_edge_bps=args.paper_min_edge_bps,
+                            verdict=confirmation_verdict,
+                            trade=opened_trade,
+                        )
+                        burst_attempts += 1
+                    signal = current
+                    observation = current
             paper_summary = paper_account_summary(connection)
             confirmation_summary = confirmation_attempt_summary(connection)
     _print_observation(observation)
     if args.paper:
         print(f"\npaper settlement  : {settlement['settled']} settled, "
               f"{settlement['unresolved']} still unresolved")
+        print(
+            f"paper quote burst : {burst_snapshot_count} synchronized snapshots, "
+            f"{burst_attempts} net-edge confirmation attempts"
+        )
         if confirmation_error is not None:
-            print(f"paper confirmation: failed closed ({confirmation_error})")
+            print(f"paper quote burst : failed closed ({confirmation_error})")
         elif confirmation_verdict is not None and trade is None:
             print(f"paper confirmation: no trade ({confirmation_verdict.reason})")
         if trade is not None:

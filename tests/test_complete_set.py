@@ -141,6 +141,119 @@ def test_collector_resolves_current_round_tokens_and_uses_full_books() -> None:
     assert "slug=btc-updown-5m-1788652800" in calls[0]
 
 
+def test_collector_uses_one_batch_request_and_maps_books_by_asset_id() -> None:
+    get_calls: list[str] = []
+    post_calls: list[tuple[str, object]] = []
+
+    def fake_http(url: str, timeout: float) -> object:
+        get_calls.append(url)
+        assert timeout == 3.0
+        return [
+            {
+                "markets": [
+                    {
+                        "outcomes": '["Up", "Down"]',
+                        "clobTokenIds": '["up-token", "down-token"]',
+                    }
+                ]
+            }
+        ]
+
+    def fake_batch(url: str, payload: object, timeout: float) -> object:
+        post_calls.append((url, payload))
+        assert timeout == 3.0
+        return [
+            {"asset_id": "down-token", "timestamp": "1788652919000", **_book((0.50, 10))},
+            {
+                "asset_id": "up-token",
+                "timestamp": "1788652919000",
+                **_book((0.48, 3), (0.55, 7)),
+            },
+        ]
+
+    observation = collect_current_round(
+        now=1788652919,
+        timeout_seconds=3.0,
+        target_notional=10,
+        http=fake_http,
+        batch_http=fake_batch,
+    )
+
+    assert observation.combined_cost == pytest.approx(1.029)
+    assert len(get_calls) == 1
+    assert post_calls == [
+        (
+            "https://clob.polymarket.com/books",
+            [{"token_id": "up-token"}, {"token_id": "down-token"}],
+        )
+    ]
+
+
+def test_batch_collector_rejects_a_response_missing_one_outcome_book() -> None:
+    def fake_http(_url: str, _timeout: float) -> object:
+        return [
+            {
+                "markets": [
+                    {
+                        "outcomes": '["Up", "Down"]',
+                        "clobTokenIds": '["up-token", "down-token"]',
+                    }
+                ]
+            }
+        ]
+
+    def incomplete_batch(_url: str, _payload: object, _timeout: float) -> object:
+        return [
+            {
+                "asset_id": "up-token",
+                "timestamp": "1788652919000",
+                **_book((0.48, 10)),
+            }
+        ]
+
+    with pytest.raises(CompleteSetError, match="missing requested token"):
+        collect_current_round(
+            now=1788652919,
+            http=fake_http,
+            batch_http=incomplete_batch,
+        )
+
+
+def test_batch_collector_rejects_books_from_materially_different_times() -> None:
+    def fake_http(_url: str, _timeout: float) -> object:
+        return [
+            {
+                "markets": [
+                    {
+                        "outcomes": '["Up", "Down"]',
+                        "clobTokenIds": '["up-token", "down-token"]',
+                    }
+                ]
+            }
+        ]
+
+    def skewed_batch(_url: str, _payload: object, _timeout: float) -> object:
+        return [
+            {
+                "asset_id": "up-token",
+                "timestamp": "1788652919000",
+                **_book((0.48, 10)),
+            },
+            {
+                "asset_id": "down-token",
+                "timestamp": "1788652919501",
+                **_book((0.50, 10)),
+            },
+        ]
+
+    with pytest.raises(CompleteSetError, match="501ms apart"):
+        collect_current_round(
+            now=1788652919,
+            http=fake_http,
+            batch_http=skewed_batch,
+        )
+
+
 def test_clob_no_order_book_response_becomes_an_empty_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -706,6 +819,8 @@ def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
             "--paper",
             "--paper-confirmation-delay",
             "0",
+            "--paper-burst-samples",
+            "1",
         ]
     )
 
@@ -721,6 +836,57 @@ def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
     assert attempt["eligible"] == 0
     assert attempt["paper_trade_id"] is None
     assert summary["total_trades"] == 0
+
+
+def test_cli_burst_can_detect_and_confirm_an_edge_after_the_first_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initial = _observation("btc-updown-5m-cli-burst", up_price=0.50, down_price=0.50)
+    signal = replace(
+        _observation("btc-updown-5m-cli-burst", up_price=0.50, down_price=0.44),
+        observed_at="2026-09-07T00:00:01+00:00",
+    )
+    confirmation = replace(
+        signal,
+        observed_at="2026-09-07T00:00:02+00:00",
+    )
+    observations = iter((initial, signal, confirmation))
+
+    monkeypatch.setattr(
+        complete_set,
+        "collect_current_round",
+        lambda **_kwargs: next(observations),
+    )
+    monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
+
+    result = complete_set.main(
+        [
+            "--database",
+            str(tmp_path / "paper.db"),
+            "--paper",
+            "--paper-confirmation-delay",
+            "0",
+            "--paper-burst-samples",
+            "2",
+        ]
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        observations_count = connection.execute(
+            "SELECT COUNT(*) FROM complete_set_observations"
+        ).fetchone()[0]
+        attempt = connection.execute(
+            "SELECT eligible, reason, paper_trade_id "
+            "FROM complete_set_confirmation_attempts"
+        ).fetchone()
+        summary = paper_account_summary(connection)
+
+    assert result == 0
+    assert observations_count == 3
+    assert attempt["eligible"] == 1
+    assert attempt["reason"] == "eligible"
+    assert attempt["paper_trade_id"] is not None
+    assert summary["confirmed_trades"] == 1
 
 
 def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:
