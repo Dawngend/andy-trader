@@ -18,7 +18,9 @@ from datetime import UTC, datetime
 import json
 import os
 import sys
+import time
 from typing import Sequence
+import uuid
 
 from andy_trader.collector import _http_json, _settings_from_env, collect
 from andy_trader.env import REPO_ROOT, load_env_file
@@ -55,12 +57,21 @@ DEFAULT_INSTRUMENTS = (
 DEFAULT_INTERVALS = ("1h", "4h", "1d")
 DEFAULT_HORIZONS = ("1h", "4h", "1d")
 CYCLE_LOG_PATH = REPO_ROOT / ".cycle-run.jsonl"
+_RUN_ID: str | None = None
+_RUN_STARTED: float | None = None
 
 
 def _journal(event: str, **details: object) -> None:
     """Best-effort phase journal for failures that kill Python externally."""
 
-    payload = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "event": event, **details}
+    elapsed = None if _RUN_STARTED is None else round(time.perf_counter() - _RUN_STARTED, 6)
+    payload = {
+        "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "event": event,
+        "run_id": _RUN_ID,
+        "elapsed_seconds": elapsed,
+        **details,
+    }
     try:
         with CYCLE_LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -79,6 +90,8 @@ SCHEDULED_VENUES = ("bybit",)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _RUN_ID, _RUN_STARTED
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instruments", help="Comma-separated override")
     parser.add_argument("--intervals", help="Comma-separated override")
@@ -121,6 +134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    _RUN_ID = uuid.uuid4().hex
+    _RUN_STARTED = time.perf_counter()
 
     load_env_file(REPO_ROOT / ".env")
     settings = _settings_from_env(os.environ)

@@ -32,6 +32,8 @@ venv/
 # covers per-run variants, which matter when two pytest processes share the
 # repo: concurrent runs against one basetemp collide on Windows cleanup.
 .pytest-tmp*/
+# Some concurrency tests create named basetemps beside the default one.
+pytest-*-tmp/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/

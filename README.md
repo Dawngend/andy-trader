@@ -288,6 +288,12 @@ Coinbase, and Kraken. Certificate verification remains enabled: there is no TLS
 bypass, DNS override, or proxy in this project. The unattended cycle now stops
 retrying a certificate failure, journals each phase to `.cycle-run.jsonl`, and
 uses CoinGecko only for instruments missing a usable 1h primary result.
+Every cycle and fast-pass journal entry includes a per-run `run_id` and
+monotonic `elapsed_seconds`, so events from overlapping scheduler invocations
+can be correlated and slow phases can be identified without an external
+telemetry service. The fast runner records `fast_pass_started` before opening
+SQLite, which preserves evidence when database connection itself is the
+failure.
 
 At 09:32 PHT the real scheduled task completed successfully under that path:
 all 16 Bybit requests failed, CoinGecko recovered seven of eight instruments,

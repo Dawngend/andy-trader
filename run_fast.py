@@ -24,7 +24,9 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Sequence
+import uuid
 
 from andy_trader.collector import FetchSettings, collect
 from andy_trader.env import REPO_ROOT, load_env_file
@@ -43,6 +45,8 @@ FAST_LOG_PATH = REPO_ROOT / ".fast-run.jsonl"
 DEFAULT_INSTRUMENTS = ("BTC-USD",)
 FAST_VENUE = "binance"
 FAST_HORIZON = "2m"
+_RUN_ID: str | None = None
+_RUN_STARTED: float | None = None
 
 # A round's decision point is 2 minutes before it closes; the call is only ever
 # actionable inside that window. The 20-minute default freshness tolerance
@@ -53,7 +57,14 @@ MAX_DATA_AGE_MINUTES = 2.5
 
 
 def _journal(event: str, **details: object) -> None:
-    payload = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "event": event, **details}
+    elapsed = None if _RUN_STARTED is None else round(time.perf_counter() - _RUN_STARTED, 6)
+    payload = {
+        "at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "event": event,
+        "run_id": _RUN_ID,
+        "elapsed_seconds": elapsed,
+        **details,
+    }
     try:
         with FAST_LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -64,20 +75,26 @@ def _journal(event: str, **details: object) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _RUN_ID, _RUN_STARTED
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instruments", help="Comma-separated, defaults to BTC-USD")
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
     parser.add_argument("--quiet", action="store_true", help="Only print on a problem")
     args = parser.parse_args(argv)
+    _RUN_ID = uuid.uuid4().hex
+    _RUN_STARTED = time.perf_counter()
 
     load_env_file(REPO_ROOT / ".env")
     spec = args.instruments or os.environ.get("CRYPTO_FAST_INSTRUMENTS", "")
     instruments = tuple(i.strip() for i in spec.split(",") if i.strip()) or DEFAULT_INSTRUMENTS
 
     db_path = Path(args.database) if args.database else default_database_path()
-    connection = connect(db_path)
+    _journal("fast_pass_started", instruments=list(instruments), database=str(db_path))
+    connection = None
 
     try:
+        connection = connect(db_path)
         candles, problems = collect(
             instruments=instruments,
             intervals=("1m",),
@@ -163,7 +180,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"fast: failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 if __name__ == "__main__":

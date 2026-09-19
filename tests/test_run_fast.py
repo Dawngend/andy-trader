@@ -1,6 +1,7 @@
 """Tests for the 1-minute fast runner."""
 
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,27 @@ def test_a_quiet_pass_still_records_what_it_did(tmp_path: Path, monkeypatch) -> 
     logged = (tmp_path / "fast.jsonl").read_text()
     assert "fast_pass" in logged
     assert '"calls": []' in logged
+    entries = [json.loads(line) for line in logged.splitlines()]
+    assert [entry["event"] for entry in entries] == ["fast_pass_started", "fast_pass"]
+    assert entries[0]["run_id"] == entries[1]["run_id"]
+    assert entries[0]["run_id"] is not None
+    assert entries[0]["elapsed_seconds"] <= entries[1]["elapsed_seconds"]
+
+
+def test_a_database_connection_failure_is_journaled(tmp_path: Path, monkeypatch, capsys) -> None:
+    def _boom(_path):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(run_fast, "connect", _boom)
+    monkeypatch.setattr(run_fast, "FAST_LOG_PATH", tmp_path / "fast.jsonl")
+
+    exit_code = run_fast.main(["--database", _db(tmp_path), "--quiet"])
+
+    assert exit_code == 1
+    assert "database unavailable" in capsys.readouterr().err
+    entries = [json.loads(line) for line in (tmp_path / "fast.jsonl").read_text().splitlines()]
+    assert [entry["event"] for entry in entries] == ["fast_pass_started", "fast_pass_failed"]
+    assert entries[0]["run_id"] == entries[1]["run_id"]
 
 
 def test_collected_bars_are_written_to_the_store(tmp_path: Path, monkeypatch) -> None:
