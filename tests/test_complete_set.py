@@ -11,6 +11,7 @@ from andy_trader.complete_set import (
     CompleteSetError,
     PaperAccountError,
     _http_json,
+    backfill_requote_trials,
     collect_current_round,
     confirmation_attempt_summary,
     evaluate_confirmation,
@@ -20,8 +21,11 @@ from andy_trader.complete_set import (
     paper_account_summary,
     record_confirmation_attempt,
     record_complete_set_observation,
+    record_requote_trial,
+    requote_trial_summary,
     resolve_round_outcome,
     settle_due_paper_trades,
+    settle_due_requote_trials,
     summarize_history,
     taker_fee,
     walk_ask_book,
@@ -724,6 +728,93 @@ def test_confirmation_attempts_preserve_survival_and_failure_evidence(tmp_path: 
     assert summary.paper_trades_opened == 0
 
 
+def test_requote_trial_records_a_rejected_second_quote_without_debiting_cash(
+    tmp_path: Path,
+) -> None:
+    signal = _observation("btc-updown-5m-shadow", up_price=0.50, down_price=0.44)
+    confirmation = _confirmation(
+        _observation("btc-updown-5m-shadow", up_price=0.50, down_price=0.50)
+    )
+    verdict = evaluate_confirmation(signal, confirmation)
+
+    with connect(tmp_path / "paper.db") as connection:
+        starting = get_or_create_paper_account(connection).cash
+        attempt_id = record_confirmation_attempt(
+            connection,
+            signal,
+            confirmation=confirmation,
+            minimum_edge_bps=200,
+            verdict=verdict,
+        )
+        first = record_requote_trial(
+            connection,
+            confirmation_attempt_id=attempt_id,
+            signal=signal,
+            confirmation=confirmation,
+            verdict=verdict,
+        )
+        second = record_requote_trial(
+            connection,
+            confirmation_attempt_id=attempt_id,
+            signal=signal,
+            confirmation=confirmation,
+            verdict=verdict,
+        )
+        row = connection.execute(
+            "SELECT total_debit, deployable FROM complete_set_requote_trials"
+        ).fetchone()
+        ending = paper_account_summary(connection)["cash"]
+
+    assert verdict.reason == "edge_disappeared"
+    assert first is not None
+    assert second is None
+    assert row["total_debit"] == pytest.approx(
+        confirmation.net_combined_cost * confirmation.target_notional
+    )
+    assert row["deployable"] == 0
+    assert ending == starting
+
+
+def test_existing_confirmation_attempts_backfill_once_and_settle_as_shadow_trials(
+    tmp_path: Path,
+) -> None:
+    signal = _observation("btc-updown-5m-backfill", up_price=0.50, down_price=0.44)
+    confirmation = _confirmation(
+        _observation("btc-updown-5m-backfill", up_price=0.50, down_price=0.50)
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        record_complete_set_observation(connection, confirmation)
+        record_confirmation_attempt(
+            connection,
+            signal,
+            confirmation=confirmation,
+            minimum_edge_bps=200,
+        )
+        assert backfill_requote_trials(connection) == 1
+        assert backfill_requote_trials(connection) == 0
+
+        def resolved(_url: str, _timeout: float) -> object:
+            return _event(closed=True, prices=["1", "0"])
+
+        result = settle_due_requote_trials(connection, http=resolved)
+        summary = requote_trial_summary(connection)
+        second_result = settle_due_requote_trials(connection, http=resolved)
+
+    assert result == {"due": 1, "settled": 1, "unresolved": 0}
+    assert second_result == {"due": 0, "settled": 0, "unresolved": 0}
+    assert summary.trials == 1
+    assert summary.open_trials == 0
+    assert summary.settled_trials == 1
+    assert summary.deployable_trials == 0
+    assert summary.profitable_trials == 0
+    assert summary.non_profitable_trials == 1
+    assert summary.total_pnl == pytest.approx(
+        confirmation.target_notional
+        - confirmation.net_combined_cost * confirmation.target_notional
+    )
+
+
 def test_confirmation_must_belong_to_the_same_round(tmp_path: Path) -> None:
     signal = _observation("btc-updown-5m-a", up_price=0.50, down_price=0.44)
     confirmation = _confirmation(
@@ -829,12 +920,16 @@ def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
             "SELECT reason, eligible, paper_trade_id "
             "FROM complete_set_confirmation_attempts"
         ).fetchone()
+        trial = connection.execute(
+            "SELECT deployable FROM complete_set_requote_trials"
+        ).fetchone()
         summary = paper_account_summary(connection)
 
     assert result == 0
     assert attempt["reason"] == "signal_margin_too_small"
     assert attempt["eligible"] == 0
     assert attempt["paper_trade_id"] is None
+    assert trial["deployable"] == 0
     assert summary["total_trades"] == 0
 
 

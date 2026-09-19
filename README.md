@@ -168,9 +168,10 @@ columns filled in. Any other update to that table is a bug.
 | Intra-round continuation (1m) | built; collecting, not yet enough evidence to score |
 | Unattended paper trading | scheduled every 15m; fast path scheduled every 1m |
 | CT-11 complete-set detector | built; fee-aware, depth-aware, paper-only |
+| Re-quote shadow trials | built; settled separately and never debits simulated capital |
 | Live-money readiness gate | built; currently **NOT READY** and exits nonzero |
 
-334 tests. `python -m pytest tests/ -q`.
+337 tests. `python -m pytest tests/ -q`.
 
 ## Walk-forward result
 
@@ -454,7 +455,10 @@ one-minute samples and confirm it on the next snapshot without weakening the exe
 
 Every post-fee edge in that burst, including edges too small to deploy, gets an append-only attempt
 outcome. The learning report separates feed failures, vanished edges, surviving net edges, edges that
-retained the 200-basis-point margin, and simulated trades opened.
+retained the 200-basis-point margin, and simulated trades opened. The first valid re-quote from each
+round also becomes a shadow trial. It is settled against Polymarket's published outcome and reports
+the hypothetical profit or loss at the second quote, even when the deployment gate correctly refused
+the entry. Shadow trials do not debit the paper account and do not count toward live-money readiness.
 Capital still fails closed unless the same edge survives within five seconds and both snapshots
 retain at least that 200-basis-point all-in margin. New paper trades record both costs and their
 confirmation delay. Historical single-snapshot trades remain labelled as legacy evidence rather

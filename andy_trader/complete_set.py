@@ -616,6 +616,17 @@ class ConfirmationAttemptSummary:
     paper_trades_opened: int
 
 
+@dataclass(frozen=True)
+class RequoteTrialSummary:
+    trials: int
+    open_trials: int
+    settled_trials: int
+    deployable_trials: int
+    profitable_trials: int
+    non_profitable_trials: int
+    total_pnl: float
+
+
 def initialize_paper_account(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -672,6 +683,26 @@ def initialize_paper_account(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS complete_set_confirmation_attempts_round "
         "ON complete_set_confirmation_attempts(round_id, attempted_at)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complete_set_requote_trials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            confirmation_attempt_id INTEGER NOT NULL UNIQUE,
+            round_id TEXT NOT NULL UNIQUE,
+            opened_at TEXT NOT NULL,
+            target_notional REAL NOT NULL,
+            confirmation_net_combined_cost REAL NOT NULL,
+            total_debit REAL NOT NULL,
+            deployable INTEGER NOT NULL CHECK (deployable IN (0, 1)),
+            settled_at TEXT,
+            outcome TEXT CHECK (outcome IN ('up', 'down') OR outcome IS NULL),
+            payout REAL,
+            pnl REAL,
+            FOREIGN KEY (confirmation_attempt_id)
+                REFERENCES complete_set_confirmation_attempts(id)
+        )
+        """
     )
     existing_columns = {
         str(row["name"])
@@ -947,6 +978,174 @@ def confirmation_attempt_summary(
         net_edges_survived=int(row["net_edges_survived"] or 0),
         execution_margin_survived=int(row["execution_margin_survived"] or 0),
         paper_trades_opened=int(row["paper_trades_opened"] or 0),
+    )
+
+
+def record_requote_trial(
+    connection: sqlite3.Connection,
+    *,
+    confirmation_attempt_id: int,
+    signal: CompleteSetObservation,
+    confirmation: CompleteSetObservation,
+    verdict: ConfirmationVerdict,
+) -> int | None:
+    """Record one independent shadow trial per round at the second quote.
+
+    These trials measure what would have happened if the first apparent net
+    edge had been entered at its fresh re-quote. They never debit the paper
+    account and never weaken the deployment gate. Rejected re-quotes belong
+    here because their losses are exactly the evidence the learner needs.
+    """
+
+    initialize_paper_account(connection)
+    if not signal.net_mispriced or signal.net_combined_cost is None:
+        return None
+    if signal.round_id != confirmation.round_id:
+        return None
+    if signal.target_notional != confirmation.target_notional:
+        return None
+    if (
+        verdict.delay_ms is None
+        or verdict.delay_ms <= 0
+        or verdict.delay_ms > DEFAULT_MAX_CONFIRMATION_AGE_SECONDS * 1_000
+    ):
+        return None
+    if confirmation.net_combined_cost is None:
+        return None
+    target_notional = confirmation.target_notional
+    total_debit = confirmation.net_combined_cost * target_notional
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO complete_set_requote_trials
+        (confirmation_attempt_id, round_id, opened_at, target_notional,
+         confirmation_net_combined_cost, total_debit, deployable)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            confirmation_attempt_id,
+            confirmation.round_id,
+            confirmation.observed_at,
+            target_notional,
+            confirmation.net_combined_cost,
+            total_debit,
+            int(verdict.eligible),
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid) if cursor.rowcount else None
+
+
+def backfill_requote_trials(connection: sqlite3.Connection) -> int:
+    """Recover shadow trials from fully recorded historical re-quotes.
+
+    The source rows already contain the exact round, confirmation timestamp,
+    normalized all-in cost, and eligibility verdict. The matching observation
+    supplies the target size. Only the earliest valid attempt per round is
+    used, preventing burst sampling from inflating the independent sample.
+    """
+
+    initialize_paper_account(connection)
+    before = connection.total_changes
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO complete_set_requote_trials
+        (confirmation_attempt_id, round_id, opened_at, target_notional,
+         confirmation_net_combined_cost, total_debit, deployable)
+        SELECT a.id, a.round_id, a.confirmation_observed_at, o.target_notional,
+               a.confirmation_net_combined_cost,
+               a.confirmation_net_combined_cost * o.target_notional,
+               a.eligible
+        FROM complete_set_confirmation_attempts AS a
+        JOIN complete_set_observations AS o
+          ON o.round_id = a.confirmation_round_id
+         AND o.observed_at = a.confirmation_observed_at
+        WHERE a.confirmation_round_id = a.round_id
+          AND a.confirmation_net_combined_cost IS NOT NULL
+          AND a.confirmation_delay_ms > 0
+          AND a.confirmation_delay_ms <= ?
+          AND a.id = (
+              SELECT MIN(a2.id)
+              FROM complete_set_confirmation_attempts AS a2
+              WHERE a2.round_id = a.round_id
+                AND a2.confirmation_round_id = a2.round_id
+                AND a2.confirmation_net_combined_cost IS NOT NULL
+                AND a2.confirmation_delay_ms > 0
+                AND a2.confirmation_delay_ms <= ?
+          )
+        """,
+        (
+            DEFAULT_MAX_CONFIRMATION_AGE_SECONDS * 1_000,
+            DEFAULT_MAX_CONFIRMATION_AGE_SECONDS * 1_000,
+        ),
+    )
+    connection.commit()
+    return connection.total_changes - before
+
+
+def settle_due_requote_trials(
+    connection: sqlite3.Connection,
+    *,
+    timeout_seconds: float = 8.0,
+    http: Callable[[str, float], object] | None = None,
+    now_iso: str | None = None,
+) -> dict[str, int]:
+    """Settle shadow trials from the venue's published round outcome."""
+
+    initialize_paper_account(connection)
+    getter = http or _http_json
+    pending = connection.execute(
+        "SELECT id, round_id, total_debit, target_notional "
+        "FROM complete_set_requote_trials WHERE settled_at IS NULL"
+    ).fetchall()
+    settled = 0
+    unresolved = 0
+    for row in pending:
+        event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': row['round_id']})}"
+        try:
+            payload = getter(event_url, timeout_seconds)
+            outcome = resolve_round_outcome(payload)
+        except CompleteSetError:
+            unresolved += 1
+            continue
+        if outcome is None:
+            unresolved += 1
+            continue
+        payout = row["target_notional"]
+        pnl = payout - row["total_debit"]
+        moment = now_iso or datetime.now(UTC).isoformat()
+        connection.execute(
+            "UPDATE complete_set_requote_trials "
+            "SET settled_at = ?, outcome = ?, payout = ?, pnl = ? "
+            "WHERE id = ? AND settled_at IS NULL",
+            (moment, outcome, payout, pnl, row["id"]),
+        )
+        settled += 1
+    connection.commit()
+    return {"due": len(pending), "settled": settled, "unresolved": unresolved}
+
+
+def requote_trial_summary(connection: sqlite3.Connection) -> RequoteTrialSummary:
+    initialize_paper_account(connection)
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS trials,
+               SUM(settled_at IS NULL) AS open_trials,
+               SUM(settled_at IS NOT NULL) AS settled_trials,
+               SUM(deployable = 1) AS deployable_trials,
+               SUM(settled_at IS NOT NULL AND pnl > 0) AS profitable_trials,
+               SUM(settled_at IS NOT NULL AND pnl <= 0) AS non_profitable_trials,
+               SUM(CASE WHEN settled_at IS NOT NULL THEN pnl ELSE 0 END) AS total_pnl
+        FROM complete_set_requote_trials
+        """
+    ).fetchone()
+    return RequoteTrialSummary(
+        trials=int(row["trials"]),
+        open_trials=int(row["open_trials"] or 0),
+        settled_trials=int(row["settled_trials"] or 0),
+        deployable_trials=int(row["deployable_trials"] or 0),
+        profitable_trials=int(row["profitable_trials"] or 0),
+        non_profitable_trials=int(row["non_profitable_trials"] or 0),
+        total_pnl=float(row["total_pnl"] or 0.0),
     )
 
 
@@ -1319,6 +1518,21 @@ def _print_confirmation_summary(summary: ConfirmationAttemptSummary) -> None:
     print(f"paper trades opened: {summary.paper_trades_opened}")
 
 
+def _print_requote_trial_summary(summary: RequoteTrialSummary) -> None:
+    print("\n--- settled re-quote learning (shadow only) ---")
+    print(
+        f"trials             : {summary.trials} total, "
+        f"{summary.open_trials} open, {summary.settled_trials} settled"
+    )
+    print(f"deployable at quote: {summary.deployable_trials}")
+    if summary.settled_trials:
+        print(
+            f"profitable / not   : {summary.profitable_trials} / "
+            f"{summary.non_profitable_trials}"
+        )
+    print(f"shadow pnl         : ${summary.total_pnl:+.4f}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
@@ -1384,8 +1598,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     confirmation_verdict: ConfirmationVerdict | None = None
     trade: PaperTrade | None = None
     settlement = {"settled": 0, "unresolved": 0}
+    requote_settlement = {"settled": 0, "unresolved": 0}
     paper_summary: Mapping[str, object] | None = None
     confirmation_summary: ConfirmationAttemptSummary | None = None
+    requote_summary: RequoteTrialSummary | None = None
     burst_snapshot_count = 1
     burst_attempts = 0
     with connect(db_path) as connection:
@@ -1394,6 +1610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.paper:
                 _print_paper_summary(paper_account_summary(connection))
                 _print_confirmation_summary(confirmation_attempt_summary(connection))
+                _print_requote_trial_summary(requote_trial_summary(connection))
             return 0
         try:
             observation = collect_current_round(
@@ -1406,7 +1623,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         record_complete_set_observation(connection, observation)
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
+            backfill_requote_trials(connection)
             settlement = settle_due_paper_trades(connection, timeout_seconds=args.timeout)
+            requote_settlement = settle_due_requote_trials(
+                connection, timeout_seconds=args.timeout
+            )
             signal = observation
             for _ in range(args.paper_burst_samples):
                 time.sleep(args.paper_confirmation_delay)
@@ -1445,7 +1666,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                         if trade is None and opened_trade is not None:
                             trade = opened_trade
-                        record_confirmation_attempt(
+                        attempt_id = record_confirmation_attempt(
                             connection,
                             signal,
                             confirmation=confirmation,
@@ -1453,15 +1674,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                             verdict=confirmation_verdict,
                             trade=opened_trade,
                         )
+                        record_requote_trial(
+                            connection,
+                            confirmation_attempt_id=attempt_id,
+                            signal=signal,
+                            confirmation=confirmation,
+                            verdict=confirmation_verdict,
+                        )
                         burst_attempts += 1
                     signal = current
                     observation = current
             paper_summary = paper_account_summary(connection)
             confirmation_summary = confirmation_attempt_summary(connection)
+            requote_summary = requote_trial_summary(connection)
     _print_observation(observation)
     if args.paper:
         print(f"\npaper settlement  : {settlement['settled']} settled, "
               f"{settlement['unresolved']} still unresolved")
+        print(
+            f"re-quote settlement: {requote_settlement['settled']} settled, "
+            f"{requote_settlement['unresolved']} still unresolved"
+        )
         print(
             f"paper quote burst : {burst_snapshot_count} synchronized snapshots, "
             f"{burst_attempts} net-edge confirmation attempts"
@@ -1479,6 +1712,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_paper_summary(paper_summary)
         if confirmation_summary is not None:
             _print_confirmation_summary(confirmation_summary)
+        if requote_summary is not None:
+            _print_requote_trial_summary(requote_summary)
     return 1 if confirmation_error is not None else 0
 
 

@@ -105,6 +105,14 @@ def evaluate_live_readiness(
         confirmed_settled = int(row["settled"])
         confirmed_losses = int(row["losses"] or 0)
 
+    settled_learning_trials = 0
+    if _table_exists(connection, "complete_set_requote_trials"):
+        row = connection.execute(
+            "SELECT COUNT(*) AS settled FROM complete_set_requote_trials "
+            "WHERE settled_at IS NOT NULL"
+        ).fetchone()
+        settled_learning_trials = int(row["settled"])
+
     if geoblock is None:
         geo_passed = False
         geo_evidence = "not checked from the intended execution host"
@@ -132,7 +140,9 @@ def evaluate_live_readiness(
                 "confirmed shadow sample",
                 enough_confirmed,
                 f"{confirmed_settled} settled re-quoted paper trades; "
-                f"requires at least {minimum_confirmed_settled_trades}",
+                f"requires at least {minimum_confirmed_settled_trades}; "
+                f"{settled_learning_trials} settled shadow learning trials are reported "
+                "separately and do not count",
             ),
             ReadinessCheck(
                 "confirmed shadow losses",

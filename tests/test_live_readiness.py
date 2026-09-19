@@ -61,6 +61,45 @@ def test_legacy_single_snapshot_trades_do_not_count_as_confirmed(
     assert "0 settled re-quoted" in _check(report, "confirmed shadow sample").evidence
 
 
+def test_settled_learning_trials_are_visible_but_do_not_weaken_the_gate(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "learning.db") as connection:
+        initialize_paper_account(connection)
+        cursor = connection.execute(
+            "INSERT INTO complete_set_confirmation_attempts "
+            "(round_id, attempted_at, signal_observed_at, signal_net_combined_cost, "
+            " confirmation_round_id, confirmation_observed_at, "
+            " confirmation_net_combined_cost, confirmation_delay_ms, "
+            " minimum_edge_bps, eligible, reason) "
+            "VALUES ('round-1', '2026-09-01T00:00:02+00:00', "
+            "'2026-09-01T00:00:01+00:00', 0.95, 'round-1', "
+            "'2026-09-01T00:00:02+00:00', 1.02, 1000, 200, 0, "
+            "'edge_disappeared')"
+        )
+        connection.execute(
+            "INSERT INTO complete_set_requote_trials "
+            "(confirmation_attempt_id, round_id, opened_at, target_notional, "
+            " confirmation_net_combined_cost, total_debit, deployable, settled_at, "
+            " outcome, payout, pnl) "
+            "VALUES (?, 'round-1', '2026-09-01T00:00:02+00:00', 10, 1.02, "
+            "10.2, 0, '2026-09-01T00:05:00+00:00', 'up', 10, -0.2)",
+            (cursor.lastrowid,),
+        )
+        connection.commit()
+        report = evaluate_live_readiness(
+            connection,
+            geoblock={"blocked": False, "country": "PH", "region": "NCR"},
+            minimum_observation_days=1,
+            minimum_confirmed_settled_trades=1,
+        )
+
+    check = _check(report, "confirmed shadow sample")
+    assert check.passed is False
+    assert "0 settled re-quoted paper trades" in check.evidence
+    assert "1 settled shadow learning trials" in check.evidence
+
+
 def test_every_gate_must_pass_even_with_enough_data(tmp_path: Path) -> None:
     with connect(tmp_path / "ready.db") as connection:
         initialize_paper_account(connection)
