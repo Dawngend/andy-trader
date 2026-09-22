@@ -12,6 +12,7 @@ from andy_trader.collector import (
     fetch_coinbase,
     fetch_coingecko,
     fetch_kraken,
+    fetch_tradingview,
 )
 
 SETTINGS = FetchSettings(retries=1, backoff_seconds=0, rate_limit_seconds=0)
@@ -172,6 +173,58 @@ def test_bybit_raises_on_a_non_zero_return_code() -> None:
 
 def test_bybit_returns_nothing_for_an_unmapped_instrument() -> None:
     assert fetch_bybit("NOTACOIN-USD", "1h", SETTINGS, http=_http({})) == []
+
+
+def test_tradingview_parses_validated_bars_from_the_bridge() -> None:
+    seen = {}
+
+    def snapshot(**kwargs):
+        seen.update(kwargs)
+        return {
+            "source": "tradingview",
+            "symbol": "BINANCE:BTCUSDT",
+            "timeframe": "60",
+            "bars": [
+                {
+                    "time": 1_795_000_000,
+                    "open": 100.0,
+                    "high": 102.0,
+                    "low": 99.0,
+                    "close": 101.0,
+                    "volume": 42.0,
+                    "potentially_open": True,
+                }
+            ],
+        }
+
+    candles = fetch_tradingview(
+        "BTC-USD",
+        "1h",
+        SETTINGS,
+        snapshot=snapshot,
+        environ={"TRADINGVIEW_API_ROOT": "D:\\TradingView-API", "TRADINGVIEW_NODE": "node"},
+    )
+
+    assert len(candles) == 1
+    assert candles[0].venue == "tradingview"
+    assert candles[0].close == 101.0
+    assert seen["symbol"] == "BINANCE:BTCUSDT"
+    assert seen["timeframe"] == "60"
+    assert seen["bars"] == 500
+
+
+def test_tradingview_returns_nothing_for_an_unsupported_market() -> None:
+    assert fetch_tradingview(
+        "NOTACOIN-USD", "1h", SETTINGS, environ={"TRADINGVIEW_API_ROOT": "unused"}
+    ) == []
+    assert fetch_tradingview(
+        "BTC-USD", "2h", SETTINGS, environ={"TRADINGVIEW_API_ROOT": "unused"}
+    ) == []
+
+
+def test_tradingview_requires_its_local_api_checkout() -> None:
+    with pytest.raises(CollectorError, match="TRADINGVIEW_API_ROOT"):
+        fetch_tradingview("BTC-USD", "1h", SETTINGS, environ={})
 
 
 def test_collect_records_a_source_failure_as_a_degraded_row() -> None:

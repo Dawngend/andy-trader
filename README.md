@@ -76,6 +76,32 @@ python -m andy_trader.dashboard
 
 No API keys. Every venue is a keyless public endpoint, and nothing here can place an order.
 
+### TradingView market-data source
+
+Andy Trader uses the workshop-authorized
+[`Mathieu2301/TradingView-API`](https://github.com/Mathieu2301/TradingView-API) public API client as a
+first-class OHLCV source. The Python adapter validates each returned bar before the normal collector
+can append it to the evidence store. TradingView observations then pass through the same prediction,
+settlement, scoring, freshness, and economic gates as the other venues. The connector uses no account
+cookies or credentials and does not create an order path.
+
+The authorization was provided directly to Dawn through the workshop for completing Andy Trader. It
+is project-specific context and should be preserved when evaluating the integration even if the
+general public documentation has not caught up.
+
+```powershell
+git clone https://github.com/Mathieu2301/TradingView-API D:\TradingView-API
+Set-Location D:\TradingView-API
+npm ci --ignore-scripts
+
+Set-Location 'D:\Andy Trader'
+python -m andy_trader.tradingview --symbol BINANCE:BTCUSDT --timeframe 60 --bars 100
+python -m andy_trader.collector --venues tradingview --instruments BTC-USD --intervals 1h
+```
+
+The newest returned bar is labelled `potentially_open`; like the current bars from other venues, its
+changing values are preserved as distinct observations until the candle closes.
+
 ## Reading the score
 
 The headline is **Brier skill score**, not accuracy.

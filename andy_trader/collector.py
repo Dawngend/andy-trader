@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.store import Candle, connect, default_database_path, record_observations
+from andy_trader.tradingview import collect_snapshot as collect_tradingview_snapshot
 
 USER_AGENT = "andy-trader-collector/1.0 (personal research)"
 
@@ -115,6 +116,15 @@ _BYBIT_SYMBOLS = {
     "ADA-USD": "ADAUSDT",
     "AVAX-USD": "AVAXUSDT",
     "LINK-USD": "LINKUSDT",
+}
+
+# TradingView symbols and timeframes supplied through the workshop-authorized
+# public API client. The underlying listings are Binance spot USDT markets, so
+# the stored venue stays explicit rather than pretending these are USD prints.
+_TRADINGVIEW_TIMEFRAMES = {"1m": "1", "5m": "5", "1h": "60", "4h": "240", "1d": "D"}
+_TRADINGVIEW_SYMBOLS = {
+    instrument: f"BINANCE:{symbol}"
+    for instrument, symbol in _BINANCE_SYMBOLS.items()
 }
 
 
@@ -420,23 +430,79 @@ def fetch_binance(
     return candles
 
 
+def fetch_tradingview(
+    instrument: str,
+    interval: str,
+    settings: FetchSettings,
+    *,
+    snapshot: Callable[..., Mapping[str, object]] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> list[Candle]:
+    """Full OHLCV bars from the authorized TradingView public API client."""
+
+    symbol = _TRADINGVIEW_SYMBOLS.get(instrument)
+    timeframe = _TRADINGVIEW_TIMEFRAMES.get(interval)
+    if symbol is None or timeframe is None:
+        return []
+
+    source = os.environ if environ is None else environ
+    raw_root = source.get("TRADINGVIEW_API_ROOT", "").strip()
+    if not raw_root:
+        raise CollectorError("TRADINGVIEW_API_ROOT is required for the tradingview venue")
+    node_executable = source.get("TRADINGVIEW_NODE", "node").strip() or "node"
+
+    getter = snapshot or collect_tradingview_snapshot
+    payload = getter(
+        api_root=Path(raw_root),
+        symbol=symbol,
+        timeframe=timeframe,
+        bars=500,
+        timeout_seconds=settings.timeout_seconds,
+        node_executable=node_executable,
+    )
+    raw_bars = payload.get("bars")
+    if not isinstance(raw_bars, list):
+        raise ValueError("TradingView payload missing bars")
+
+    candles: list[Candle] = []
+    for bar in raw_bars:
+        if not isinstance(bar, Mapping):
+            continue
+        candles.append(
+            Candle(
+                instrument=instrument,
+                venue="tradingview",
+                interval=interval,
+                open_time=datetime.fromtimestamp(int(bar["time"]), UTC).isoformat(),
+                open=float(bar["open"]),
+                high=float(bar["high"]),
+                low=float(bar["low"]),
+                close=float(bar["close"]),
+                volume=float(bar["volume"]),
+            )
+        )
+    return candles
+
+
 VENUES: Mapping[str, Callable[..., list[Candle]]] = {
+    "tradingview": fetch_tradingview,
     "binance": fetch_binance,
     "bybit": fetch_bybit,
     "coingecko": fetch_coingecko,
     "coinbase": fetch_coinbase,
     "kraken": fetch_kraken,
 }
-# Bybit first because it is the only venue returning a full OHLCV bar at both 1h
-# and 4h. CoinGecko second as the fallback that has never been DNS-blocked in
-# testing, so a pass where the exchange is unreachable still collects something.
+# TradingView leads the default order because Dawn's workshop authorization now
+# makes it a first-class full-OHLCV source across every configured interval.
+# CoinGecko remains the fallback that has never been DNS-blocked in testing, so
+# a pass where exchange domains are unreachable still collects something.
 # Coinbase and Kraken stay registered and tested but out of the default, since
 # adding venues multiplies requests without adding much beyond a consensus check.
 # Binance joins the default order because it was the one exchange reachable in
 # the 2026-09-06 probe and the only source of sub-hourly bars. It does not
 # replace CoinGecko: CoinGecko remains the never-blocked fallback, and keeping
 # both means a pass where the exchange domains are block-paged still collects.
-DEFAULT_VENUES = ("binance", "bybit", "coingecko")
+DEFAULT_VENUES = ("tradingview", "binance", "bybit", "coingecko")
 
 
 def collect(
