@@ -81,12 +81,11 @@ def _journal(event: str, **details: object) -> None:
         pass
 
 
-# Bybit alone on the schedule, deliberately. It returns full OHLCV for every
-# instrument here, while CoinGecko's free tier starts answering 429 at eight
-# instruments and would contribute two degraded rows every quarter of an hour,
-# roughly two hundred a day of pure noise. CoinGecko stays available as an
-# explicit --venues override and as the fallback when an exchange is DNS-blocked.
-SCHEDULED_VENUES = ("bybit",)
+# TradingView is the workshop-authorized primary source, with Bybit retained as
+# an independent full-OHLCV comparison. CoinGecko's free tier starts answering
+# 429 at eight instruments, so it remains a selective fallback only when both
+# scheduled sources fail to provide the reference interval for an instrument.
+SCHEDULED_VENUES = ("tradingview", "bybit")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -178,10 +177,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _journal("primary_prices_collected", candles=len(candles), problems=len(problems))
 
-        # Bybit is intermittently replaced by a PLDT block page. CoinGecko is
-        # intentionally queried only for instruments whose live reference
-        # interval has no usable primary row, avoiding its free-tier 429s on
-        # healthy passes while still preventing a total price outage.
+        # CoinGecko is intentionally queried only for instruments whose live
+        # reference interval has no usable TradingView or Bybit row, avoiding
+        # its free-tier 429s on healthy passes while still preventing a total
+        # price outage.
         reference_interval = intervals[0]
         usable = {
             (candle.instrument, candle.interval)

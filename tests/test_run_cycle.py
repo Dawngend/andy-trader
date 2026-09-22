@@ -26,7 +26,7 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     def fake_collect(*, instruments, intervals, venues, settings):
         del settings
         calls.append(tuple(venues))
-        if venues == ("bybit",):
+        if venues == ("tradingview", "bybit"):
             return [
                 Candle(
                     instrument=instruments[0], venue="bybit", interval=intervals[0],
@@ -58,7 +58,7 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     )
 
     assert result == 0
-    assert calls == [("bybit",), ("coingecko",)]
+    assert calls == [("tradingview", "bybit"), ("coingecko",)]
     entries = [json.loads(line) for line in journal.read_text().splitlines()]
     events = [entry["event"] for entry in entries]
     assert events == [
