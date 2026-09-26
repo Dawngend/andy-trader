@@ -76,6 +76,11 @@ python -m andy_trader.dashboard
 
 No API keys. Every venue is a keyless public endpoint, and nothing here can place an order.
 
+Bybit remains an OHLCV/reference-data venue for the directional prediction harness. It is not an
+execution destination: every current Bybit predictor/instrument pair is blocked by the statistical
+or economic paper gate. Complete-set monitoring uses Polymarket because complementary outcome shares
+and the fixed $1 payout are properties of that venue's market structure.
+
 ### TradingView market-data source
 
 Andy Trader uses the workshop-authorized
@@ -481,13 +486,16 @@ orders can leave a directional position when one complete leg fills and the othe
 
 The paper path now uses Polymarket's official `/books` batch endpoint, so Up and Down are read in one
 response instead of from independently timed requests. A batch is rejected if the server timestamps
-for its two books differ by more than 250 milliseconds. Each scheduled invocation collects a short,
-bounded burst of these paired snapshots. This can detect an edge that appears between the old
-one-minute samples and confirm it on the next snapshot without weakening the execution gate.
+for its two books differ by more than 250 milliseconds. Each scheduled invocation watches BTC, ETH,
+SOL, and XRP together for approximately one scheduled minute: 51 synchronized full-depth batches at
+the default half-second cadence. Token discovery is cached per five-minute market and all eight outcome books
+share one request per sample. This covers most of each scheduled minute without a new runtime
+dependency and remains far below the documented `/books` request limit.
 
 Every post-fee edge in that burst, including edges too small to deploy, gets an append-only attempt
 outcome. The learning report separates feed failures, vanished edges, surviving net edges, edges that
-retained the 200-basis-point margin, and simulated trades opened. The first valid re-quote from each
+retained 0, 50, 100, and 200 basis points, and simulated trades opened. These intermediate thresholds
+are diagnostics only; only the unchanged 200-basis-point gate can open a paper trade. The first valid re-quote from each
 round also becomes a shadow trial. It is settled against Polymarket's published outcome and reports
 the hypothetical profit or loss at the second quote, even when the deployment gate correctly refused
 the entry. Shadow trials do not debit the paper account and do not count toward live-money readiness.
@@ -499,6 +507,7 @@ open complete set no longer looks like an immediate loss simply because its cash
 
 ```bash
 python -m andy_trader.complete_set --report --paper
+python -m andy_trader.complete_set --paper --assets btc,eth,sol,xrp
 python -m andy_trader.live_readiness
 ```
 

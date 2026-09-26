@@ -13,6 +13,7 @@ from andy_trader.complete_set import (
     _http_json,
     backfill_requote_trials,
     collect_current_round,
+    collect_current_rounds,
     confirmation_attempt_summary,
     evaluate_confirmation,
     get_or_create_paper_account,
@@ -191,6 +192,52 @@ def test_collector_uses_one_batch_request_and_maps_books_by_asset_id() -> None:
             [{"token_id": "up-token"}, {"token_id": "down-token"}],
         )
     ]
+
+
+def test_multi_market_collector_batches_four_complementary_pairs() -> None:
+    get_calls: list[str] = []
+    post_payloads: list[object] = []
+
+    def fake_http(url: str, _timeout: float) -> object:
+        get_calls.append(url)
+        asset = next(name for name in ("btc", "eth", "sol", "xrp") if name in url)
+        return [
+            {
+                "markets": [
+                    {
+                        "outcomes": '["Up", "Down"]',
+                        "clobTokenIds": f'["{asset}-up", "{asset}-down"]',
+                    }
+                ]
+            }
+        ]
+
+    def fake_batch(_url: str, payload: object, _timeout: float) -> object:
+        post_payloads.append(payload)
+        return [
+            {
+                "asset_id": f"{asset}-{side}",
+                "timestamp": "1788652919000",
+                **_book((0.48 if side == "up" else 0.50, 10)),
+            }
+            for asset in ("btc", "eth", "sol", "xrp")
+            for side in ("up", "down")
+        ]
+
+    observations = collect_current_rounds(
+        now=1788652919,
+        timeout_seconds=3.0,
+        target_notional=10,
+        http=fake_http,
+        batch_http=fake_batch,
+    )
+
+    assert tuple(observations) == ("btc", "eth", "sol", "xrp")
+    assert observations["eth"].round_id == "eth-updown-5m-1788652800"
+    assert all(item.net_mispriced is False for item in observations.values())
+    assert len(get_calls) == 4
+    assert len(post_payloads) == 1
+    assert len(post_payloads[0]) == 8
 
 
 def test_batch_collector_rejects_a_response_missing_one_outcome_book() -> None:
@@ -726,6 +773,7 @@ def test_confirmation_attempts_preserve_survival_and_failure_evidence(tmp_path: 
     assert summary.net_edges_survived == 1
     assert summary.execution_margin_survived == 0
     assert summary.paper_trades_opened == 0
+    assert dict(summary.margin_progress) == {0: 1, 50: 1, 100: 1, 200: 0}
 
 
 def test_requote_trial_records_a_rejected_second_quote_without_debiting_cash(
@@ -867,7 +915,11 @@ def test_cli_marks_a_failed_confirmation_as_a_failed_run(
             return signal
         raise CompleteSetError("confirmation feed unavailable")
 
-    monkeypatch.setattr(complete_set, "collect_current_round", collect)
+    monkeypatch.setattr(
+        complete_set,
+        "collect_current_rounds",
+        lambda **kwargs: {"btc": collect(**kwargs)},
+    )
     monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
 
     result = complete_set.main(
@@ -875,6 +927,8 @@ def test_cli_marks_a_failed_confirmation_as_a_failed_run(
             "--database",
             str(tmp_path / "paper.db"),
             "--paper",
+            "--assets",
+            "btc",
             "--paper-confirmation-delay",
             "0",
         ]
@@ -898,8 +952,8 @@ def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
 
     monkeypatch.setattr(
         complete_set,
-        "collect_current_round",
-        lambda **_kwargs: next(observations),
+        "collect_current_rounds",
+        lambda **_kwargs: {"btc": next(observations)},
     )
     monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
 
@@ -908,6 +962,8 @@ def test_cli_requotes_a_thin_net_edge_without_opening_a_trade(
             "--database",
             str(tmp_path / "paper.db"),
             "--paper",
+            "--assets",
+            "btc",
             "--paper-confirmation-delay",
             "0",
             "--paper-burst-samples",
@@ -949,8 +1005,8 @@ def test_cli_burst_can_detect_and_confirm_an_edge_after_the_first_snapshot(
 
     monkeypatch.setattr(
         complete_set,
-        "collect_current_round",
-        lambda **_kwargs: next(observations),
+        "collect_current_rounds",
+        lambda **_kwargs: {"btc": next(observations)},
     )
     monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
 
@@ -959,6 +1015,8 @@ def test_cli_burst_can_detect_and_confirm_an_edge_after_the_first_snapshot(
             "--database",
             str(tmp_path / "paper.db"),
             "--paper",
+            "--assets",
+            "btc",
             "--paper-confirmation-delay",
             "0",
             "--paper-burst-samples",

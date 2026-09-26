@@ -50,11 +50,14 @@ DEFAULT_TARGET_NOTIONAL = 10.0
 DEFAULT_MIN_EXECUTION_EDGE_BPS = 200.0
 DEFAULT_CONFIRMATION_DELAY_SECONDS = 0.5
 DEFAULT_MAX_CONFIRMATION_AGE_SECONDS = 5.0
-DEFAULT_PAPER_BURST_SAMPLES = 5
+DEFAULT_PAPER_BURST_SAMPLES = 50
 MAX_BATCH_BOOK_SKEW_MS = 250
 NO_ORDER_BOOK_ERROR = "No orderbook exists for the requested token id"
+SUPPORTED_CRYPTO_ASSETS = ("btc", "eth", "sol", "xrp")
+DEFAULT_CRYPTO_ASSETS = SUPPORTED_CRYPTO_ASSETS
+MARGIN_PROGRESS_BPS = (0, 50, 100, 200)
 
-_ROUND_TOKEN_CACHE: tuple[str, str, str] | None = None
+_ROUND_TOKEN_CACHE: dict[str, tuple[str, str]] = {}
 
 # docs.polymarket.com/trading/fees, confirmed 2026-09-18. Taker-only; makers pay
 # zero. feeRate is category-specific -- 0.07 is Crypto, which a BTC Up/Down
@@ -400,6 +403,51 @@ def _outcome_tokens(payload: object) -> tuple[str, str]:
     return by_outcome["up"], by_outcome["down"]
 
 
+def _normalize_assets(assets: Sequence[str]) -> tuple[str, ...]:
+    """Validate and de-duplicate configured five-minute crypto market families."""
+
+    normalized: list[str] = []
+    for raw_asset in assets:
+        asset = raw_asset.strip().casefold()
+        if not asset:
+            continue
+        if asset not in SUPPORTED_CRYPTO_ASSETS:
+            supported = ", ".join(SUPPORTED_CRYPTO_ASSETS)
+            raise CompleteSetError(
+                f"unsupported complete-set asset {raw_asset!r}; choose from {supported}"
+            )
+        if asset not in normalized:
+            normalized.append(asset)
+    if not normalized:
+        raise CompleteSetError("at least one complete-set asset is required")
+    return tuple(normalized)
+
+
+def _current_round_id(asset: str, current_time: float) -> str:
+    round_start = int(current_time) // 300 * 300
+    return f"{asset}-updown-5m-{round_start}"
+
+
+def _round_tokens(
+    round_id: str,
+    *,
+    timeout_seconds: float,
+    getter: Callable[[str, float], object],
+    cache: bool,
+) -> tuple[str, str]:
+    if cache and round_id in _ROUND_TOKEN_CACHE:
+        return _ROUND_TOKEN_CACHE[round_id]
+    event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': round_id})}"
+    tokens = _outcome_tokens(getter(event_url, timeout_seconds))
+    if cache:
+        # Only the current five-minute families are useful. Bounding this cache
+        # prevents a long-running process from retaining every historical pair.
+        _ROUND_TOKEN_CACHE[round_id] = tokens
+        while len(_ROUND_TOKEN_CACHE) > len(SUPPORTED_CRYPTO_ASSETS) * 2:
+            del _ROUND_TOKEN_CACHE[next(iter(_ROUND_TOKEN_CACHE))]
+    return tokens
+
+
 def _books_from_batch(
     payload: object,
     up_token: str,
@@ -491,6 +539,7 @@ def resolve_round_outcome(payload: object) -> str | None:
 
 def collect_current_round(
     *,
+    asset: str = "btc",
     target_notional: float = DEFAULT_TARGET_NOTIONAL,
     timeout_seconds: float = 8.0,
     now: float | None = None,
@@ -513,19 +562,16 @@ def collect_current_round(
     target = _decimal(target_notional, "target_notional")
     if target <= 0:
         raise CompleteSetError(f"target_notional must be positive, got {target}")
+    selected_asset = _normalize_assets((asset,))[0]
     current_time = time.time() if now is None else now
-    round_start = int(current_time) // 300 * 300
-    round_id = f"btc-updown-5m-{round_start}"
+    round_id = _current_round_id(selected_asset, current_time)
     getter = http or _http_json
-
-    global _ROUND_TOKEN_CACHE
-    if http is None and _ROUND_TOKEN_CACHE is not None and _ROUND_TOKEN_CACHE[0] == round_id:
-        _, up_token, down_token = _ROUND_TOKEN_CACHE
-    else:
-        event_url = f"{GAMMA_EVENTS_URL}?{urlencode({'slug': round_id})}"
-        up_token, down_token = _outcome_tokens(getter(event_url, timeout_seconds))
-        if http is None:
-            _ROUND_TOKEN_CACHE = (round_id, up_token, down_token)
+    up_token, down_token = _round_tokens(
+        round_id,
+        timeout_seconds=timeout_seconds,
+        getter=getter,
+        cache=http is None,
+    )
 
     if batch_http is not None or http is None:
         poster = batch_http or _http_json_post
@@ -551,6 +597,61 @@ def collect_current_round(
         target_notional=float(target),
         fee_rate=fee_rate,
     )
+
+
+def collect_current_rounds(
+    *,
+    assets: Sequence[str] = DEFAULT_CRYPTO_ASSETS,
+    target_notional: float = DEFAULT_TARGET_NOTIONAL,
+    timeout_seconds: float = 8.0,
+    now: float | None = None,
+    http: Callable[[str, float], object] | None = None,
+    batch_http: Callable[[str, object, float], object] | None = None,
+    fee_rate: float = CRYPTO_TAKER_FEE_RATE,
+) -> dict[str, CompleteSetObservation]:
+    """Collect several current Up/Down markets in one synchronized book request.
+
+    Token discovery is cached per five-minute round. All requested outcome books
+    then share one official ``/books`` response, keeping cross-asset expansion
+    cheap while each complementary pair retains its own timestamp-skew check.
+    """
+
+    if timeout_seconds <= 0:
+        raise CompleteSetError("timeout_seconds must be positive")
+    target = _decimal(target_notional, "target_notional")
+    if target <= 0:
+        raise CompleteSetError(f"target_notional must be positive, got {target}")
+    selected_assets = _normalize_assets(assets)
+    current_time = time.time() if now is None else now
+    getter = http or _http_json
+    poster = batch_http or _http_json_post
+    pairs: dict[str, tuple[str, str, str]] = {}
+    request_books: list[dict[str, str]] = []
+    for asset in selected_assets:
+        round_id = _current_round_id(asset, current_time)
+        up_token, down_token = _round_tokens(
+            round_id,
+            timeout_seconds=timeout_seconds,
+            getter=getter,
+            cache=http is None,
+        )
+        pairs[asset] = (round_id, up_token, down_token)
+        request_books.extend(({"token_id": up_token}, {"token_id": down_token}))
+
+    payload = poster(CLOB_BOOKS_URL, request_books, timeout_seconds)
+    observed_at = datetime.now(UTC).isoformat()
+    observations: dict[str, CompleteSetObservation] = {}
+    for asset, (round_id, up_token, down_token) in pairs.items():
+        up_book, down_book = _books_from_batch(payload, up_token, down_token)
+        observations[asset] = observe_complete_set(
+            round_id,
+            observed_at,
+            up_book,
+            down_book,
+            target_notional=float(target),
+            fee_rate=fee_rate,
+        )
+    return observations
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +715,7 @@ class ConfirmationAttemptSummary:
     net_edges_survived: int
     execution_margin_survived: int
     paper_trades_opened: int
+    margin_progress: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -971,6 +1073,21 @@ def confirmation_attempt_summary(
         FROM complete_set_confirmation_attempts
         """
     ).fetchone()
+    margin_progress: list[tuple[int, int]] = []
+    for edge_bps in MARGIN_PROGRESS_BPS:
+        maximum_cost = 1.0 - edge_bps / 10_000.0
+        operator = "<" if edge_bps == 0 else "<="
+        retained = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM complete_set_confirmation_attempts
+            WHERE confirmation_round_id = round_id
+              AND signal_net_combined_cost {operator} ?
+              AND confirmation_net_combined_cost {operator} ?
+            """,
+            (maximum_cost, maximum_cost),
+        ).fetchone()[0]
+        margin_progress.append((edge_bps, int(retained)))
     return ConfirmationAttemptSummary(
         attempts=int(row["attempts"]),
         confirmation_failures=int(row["confirmation_failures"] or 0),
@@ -978,6 +1095,7 @@ def confirmation_attempt_summary(
         net_edges_survived=int(row["net_edges_survived"] or 0),
         execution_margin_survived=int(row["execution_margin_survived"] or 0),
         paper_trades_opened=int(row["paper_trades_opened"] or 0),
+        margin_progress=tuple(margin_progress),
     )
 
 
@@ -1241,7 +1359,10 @@ def paper_account_summary(connection: sqlite3.Connection) -> dict[str, object]:
 
 
 def record_complete_set_observation(
-    connection: sqlite3.Connection, observation: CompleteSetObservation
+    connection: sqlite3.Connection,
+    observation: CompleteSetObservation,
+    *,
+    commit: bool = True,
 ) -> int:
     """Append one observation even when its round was observed before."""
 
@@ -1280,7 +1401,8 @@ def record_complete_set_observation(
             observation.unmeasurable_reason,
         ),
     )
-    connection.commit()
+    if commit:
+        connection.commit()
     return int(cursor.lastrowid)
 
 
@@ -1514,7 +1636,10 @@ def _print_confirmation_summary(summary: ConfirmationAttemptSummary) -> None:
         )
     else:
         print("net edge survived  : no net edges re-quoted yet")
-    print(f"retained 2% margin : {summary.execution_margin_survived}")
+    for edge_bps, retained in summary.margin_progress:
+        label = "under $1" if edge_bps == 0 else f">= {edge_bps / 100:.1f}% edge"
+        print(f"retained {label:<12}: {retained}")
+    print(f"official 2% gate   : {summary.execution_margin_survived}")
     print(f"paper trades opened: {summary.paper_trades_opened}")
 
 
@@ -1536,6 +1661,14 @@ def _print_requote_trial_summary(summary: RequoteTrialSummary) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Override CRYPTO_DB_PATH")
+    parser.add_argument(
+        "--assets",
+        default=",".join(DEFAULT_CRYPTO_ASSETS),
+        help=(
+            "Comma-separated five-minute crypto markets to observe; "
+            "default: btc,eth,sol,xrp"
+        ),
+    )
     parser.add_argument(
         "--target-notional",
         type=float,
@@ -1579,11 +1712,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         default=DEFAULT_PAPER_BURST_SAMPLES,
         help=(
-            "Adjacent confirmation windows to sample per invocation; one additional "
-            "closing snapshot is collected. Default: 5"
+            "Adjacent synchronized batches to sample per invocation; one additional "
+            "opening batch is collected. Default: 50 (about one scheduled minute)"
         ),
     )
     args = parser.parse_args(argv)
+
+    try:
+        assets = _normalize_assets(args.assets.split(","))
+    except CompleteSetError as exc:
+        parser.error(str(exc))
 
     if args.paper and not 0 <= args.paper_min_edge_bps < 10_000:
         parser.error("--paper-min-edge-bps must be in [0, 10000)")
@@ -1593,10 +1731,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--paper-burst-samples must be at least 1")
 
     db_path = Path(args.database) if args.database else default_database_path()
-    confirmation: CompleteSetObservation | None = None
+    final_observations: dict[str, CompleteSetObservation] = {}
     confirmation_error: str | None = None
-    confirmation_verdict: ConfirmationVerdict | None = None
-    trade: PaperTrade | None = None
+    confirmation_verdicts: dict[str, ConfirmationVerdict] = {}
+    trades: list[PaperTrade] = []
     settlement = {"settled": 0, "unresolved": 0}
     requote_settlement = {"settled": 0, "unresolved": 0}
     paper_summary: Mapping[str, object] | None = None
@@ -1613,14 +1751,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print_requote_trial_summary(requote_trial_summary(connection))
             return 0
         try:
-            observation = collect_current_round(
+            final_observations = collect_current_rounds(
+                assets=assets,
                 target_notional=args.target_notional,
                 timeout_seconds=args.timeout,
             )
         except CompleteSetError as exc:
             print(f"complete-set collection failed: {exc}", file=sys.stderr)
             return 1
-        record_complete_set_observation(connection, observation)
+        for observation in final_observations.values():
+            record_complete_set_observation(connection, observation, commit=False)
+        connection.commit()
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
             backfill_requote_trials(connection)
@@ -1628,48 +1769,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             requote_settlement = settle_due_requote_trials(
                 connection, timeout_seconds=args.timeout
             )
-            signal = observation
+            signals = dict(final_observations)
             for _ in range(args.paper_burst_samples):
                 time.sleep(args.paper_confirmation_delay)
                 try:
-                    current = collect_current_round(
+                    current_observations = collect_current_rounds(
+                        assets=assets,
                         target_notional=args.target_notional,
                         timeout_seconds=args.timeout,
                     )
                 except CompleteSetError as exc:
                     confirmation_error = str(exc)
-                    if signal.net_mispriced and signal.net_combined_cost is not None:
-                        record_confirmation_attempt(
-                            connection,
-                            signal,
-                            confirmation=None,
-                            minimum_edge_bps=args.paper_min_edge_bps,
-                            error=confirmation_error,
-                        )
-                        burst_attempts += 1
+                    for signal in signals.values():
+                        if signal.net_mispriced and signal.net_combined_cost is not None:
+                            record_confirmation_attempt(
+                                connection,
+                                signal,
+                                confirmation=None,
+                                minimum_edge_bps=args.paper_min_edge_bps,
+                                error=confirmation_error,
+                            )
+                            burst_attempts += 1
                     break
-                else:
-                    record_complete_set_observation(connection, current)
-                    burst_snapshot_count += 1
+                for current in current_observations.values():
+                    record_complete_set_observation(connection, current, commit=False)
+                connection.commit()
+                burst_snapshot_count += 1
+                for asset, current in current_observations.items():
+                    signal = signals[asset]
                     if signal.net_mispriced and signal.net_combined_cost is not None:
-                        confirmation = current
                         confirmation_verdict = evaluate_confirmation(
                             signal,
-                            confirmation,
+                            current,
                             minimum_edge_bps=args.paper_min_edge_bps,
                         )
                         opened_trade = open_paper_trade(
                             connection,
                             signal,
-                            confirmation,
+                            current,
                             minimum_edge_bps=args.paper_min_edge_bps,
                         )
-                        if trade is None and opened_trade is not None:
-                            trade = opened_trade
+                        if opened_trade is not None:
+                            trades.append(opened_trade)
                         attempt_id = record_confirmation_attempt(
                             connection,
                             signal,
-                            confirmation=confirmation,
+                            confirmation=current,
                             minimum_edge_bps=args.paper_min_edge_bps,
                             verdict=confirmation_verdict,
                             trade=opened_trade,
@@ -1678,16 +1823,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                             connection,
                             confirmation_attempt_id=attempt_id,
                             signal=signal,
-                            confirmation=confirmation,
+                            confirmation=current,
                             verdict=confirmation_verdict,
                         )
                         burst_attempts += 1
-                    signal = current
-                    observation = current
+                        confirmation_verdicts[asset] = confirmation_verdict
+                signals = current_observations
+                final_observations = current_observations
             paper_summary = paper_account_summary(connection)
             confirmation_summary = confirmation_attempt_summary(connection)
             requote_summary = requote_trial_summary(connection)
-    _print_observation(observation)
+    for asset in assets:
+        print(f"\n=== {asset.upper()} five-minute complete set ===")
+        _print_observation(final_observations[asset])
     if args.paper:
         print(f"\npaper settlement  : {settlement['settled']} settled, "
               f"{settlement['unresolved']} still unresolved")
@@ -1696,14 +1844,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{requote_settlement['unresolved']} still unresolved"
         )
         print(
-            f"paper quote burst : {burst_snapshot_count} synchronized snapshots, "
+            f"paper quote burst : {burst_snapshot_count} synchronized batches across "
+            f"{len(assets)} markets, "
             f"{burst_attempts} net-edge confirmation attempts"
         )
         if confirmation_error is not None:
             print(f"paper quote burst : failed closed ({confirmation_error})")
-        elif confirmation_verdict is not None and trade is None:
-            print(f"paper confirmation: no trade ({confirmation_verdict.reason})")
-        if trade is not None:
+        elif confirmation_verdicts and not trades:
+            reasons = ", ".join(
+                f"{asset.upper()}={verdict.reason}"
+                for asset, verdict in sorted(confirmation_verdicts.items())
+            )
+            print(f"paper confirmation: no new trade ({reasons})")
+        for trade in trades:
             print(
                 f"paper trade opened: round {trade.round_id}, debit ${trade.total_debit:.4f}, "
                 f"confirmed after {trade.confirmation_delay_ms:.0f}ms"
