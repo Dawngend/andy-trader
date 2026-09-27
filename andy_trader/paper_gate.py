@@ -70,7 +70,7 @@ calls -- each one starting at or after the previous one's resolution -- so the
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 import sqlite3
 from typing import Sequence
 
@@ -111,16 +111,29 @@ def independent_calls(rows: Sequence[sqlite3.Row]) -> list[sqlite3.Row]:
     repetitions of one outcome, not new evidence. Greedy earliest-first keeps
     the largest possible set of disjoint windows when every window has the same
     length, which is the case within one horizon.
+
+    Timestamps are compared as UTC instants, not as stored text: `fetch_settled`
+    orders by the string, which is only chronological while every writer uses
+    the same offset, and a naive timestamp (treated as UTC) must not crash the
+    comparison against an aware one.
     """
 
+    ordered = sorted(rows, key=lambda row: _utc(row["created_at"]))
     kept: list[sqlite3.Row] = []
     window_end: datetime | None = None
-    for row in rows:
-        created = datetime.fromisoformat(row["created_at"])
+    for row in ordered:
+        created = _utc(row["created_at"])
         if window_end is None or created >= window_end:
             kept.append(row)
-            window_end = datetime.fromisoformat(row["resolves_at"])
+            window_end = _utc(row["resolves_at"])
     return kept
+
+
+def _utc(stamp: str) -> datetime:
+    parsed = datetime.fromisoformat(stamp)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -278,17 +291,19 @@ def _judge(
             hit_rate=report.hit_rate,
         )
 
-    if report.hit_rate < econ.break_even_win_rate:
+    # At exactly the break-even rate the expected profit is zero, which has not
+    # earned anything either, so a tie is blocked rather than let through.
+    if report.hit_rate <= econ.break_even_win_rate:
         if econ.break_even_win_rate >= 1.0:
             # A "needed" hit rate above 100% reads as a typo; say what it means.
             shortfall = (
                 f"this horizon's {econ.average_move_bps:.1f}bps average move is no bigger "
-                f"than the {econ.round_trip_bps:.0f}bps round trip, so no hit rate covers "
-                f"costs -- even calling every move right would lose money"
+                f"than the {econ.round_trip_bps:.0f}bps round trip, so no hit rate makes "
+                f"money -- even calling every move right would not"
             )
         else:
             shortfall = (
-                f"its {report.hit_rate:.1%} hit rate is below the "
+                f"its {report.hit_rate:.1%} hit rate does not beat the "
                 f"{econ.break_even_win_rate:.1%} needed to cover a {econ.round_trip_bps:.0f}bps "
                 f"round trip against this horizon's {econ.average_move_bps:.1f}bps average move"
             )
@@ -370,13 +385,13 @@ def _judge(
                 recent_hit_rate=None if recent_report.degenerate else recent_report.hit_rate,
             )
 
-        if recent_report.hit_rate < econ.break_even_win_rate:
+        if recent_report.hit_rate <= econ.break_even_win_rate:
             return EligibilityVerdict(
                 eligible=False,
                 reason=(
                     f"{predictor} on {instrument} beats the base rate over its full "
                     f"{sample_size}-call lifetime, but its most recent {recent_window} calls hit "
-                    f"only {recent_report.hit_rate:.1%}, below the {econ.break_even_win_rate:.1%} "
+                    f"only {recent_report.hit_rate:.1%}, not above the {econ.break_even_win_rate:.1%} "
                     f"needed to cover costs -- it used to be economically profitable and, right "
                     f"now, is not"
                 ),
@@ -593,7 +608,7 @@ def _propose(
     if not verdicts:
         print(
             "\nNothing is scoreable yet -- every candidate is still below the minimum\n"
-            f"sample of {MINIMUM_SETTLED_CALLS} settled calls. There is no ranking to make."
+            f"sample of {MINIMUM_SETTLED_CALLS} independent settled calls. There is no ranking to make."
         )
         print("\nRECOMMENDATION: deploy nothing. Wait for evidence.")
         return

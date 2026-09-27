@@ -9,6 +9,7 @@ from andy_trader.paper_gate import (
     evaluate_paper_eligibility,
     independent_calls,
 )
+from andy_trader.economics import evaluate_horizon
 from andy_trader.portfolio import paper_trade_once
 from andy_trader.store import (
     Candle,
@@ -699,5 +700,46 @@ def test_costs_larger_than_the_average_move_are_explained_not_quoted_as_a_percen
 
     assert not verdict.eligible
     assert verdict.break_even_win_rate is not None and verdict.break_even_win_rate > 1.0
-    assert "even calling every move right would lose money" in verdict.reason
+    assert "even calling every move right would not" in verdict.reason
     assert f"{verdict.break_even_win_rate:.1%}" not in verdict.reason
+
+
+def test_a_perfect_record_at_exactly_break_even_has_earned_nothing() -> None:
+    """Found in Codex's review of the independent-calls change: with the round
+    trip equal to the average move, break-even is exactly 100%, and a perfect
+    100% hit rate used to pass the `<` check while expecting zero profit."""
+    connection = _conn()
+    _price_history(connection)
+    _spaced_calls(
+        connection, predictor="baseline:flawless", count=MINIMUM_SETTLED_CALLS,
+        spacing=timedelta(hours=1),
+    )
+    econ = evaluate_horizon(connection, instrument="BTC-USD", interval="1h")
+    assert econ is not None
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:flawless", instrument="BTC-USD",
+        round_trip_bps=econ.average_move_bps,
+    )
+
+    assert verdict.hit_rate == 1.0
+    assert verdict.break_even_win_rate == 1.0
+    assert not verdict.eligible
+
+
+def test_independent_calls_compares_instants_not_stored_text() -> None:
+    """Rows arrive ordered by the stored string. A +08:00 stamp sorts after a
+    UTC one it actually precedes, and a naive stamp (read as UTC) must not
+    crash the comparison against aware ones."""
+    rows = [
+        {"created_at": "2026-08-01T01:00:00+00:00", "resolves_at": "2026-08-01T02:00:00+00:00"},
+        # 00:30 UTC written in Manila time: really the earliest call.
+        {"created_at": "2026-08-01T08:30:00+08:00", "resolves_at": "2026-08-01T09:30:00+08:00"},
+        {"created_at": "2026-08-01T02:00:00", "resolves_at": "2026-08-01T03:00:00"},
+    ]
+
+    kept = independent_calls(rows)  # type: ignore[arg-type]
+
+    assert [row["created_at"] for row in kept] == [
+        "2026-08-01T08:30:00+08:00", "2026-08-01T02:00:00"
+    ]
