@@ -154,18 +154,13 @@ def test_close_price_respects_the_tolerance_window(tmp_path: Path) -> None:
         assert price is None
 
 
-def _snapshots(connection, open_time: str, seen: dict[float, str]) -> None:
-    """Store several snapshots of one still-forming bar, each with the moment it
-    was captured. record_observations stamps the real clock, so the capture
-    time is set afterwards to what the scenario needs."""
+def _snapshots(connection, open_time: str, seen: dict[float, str], interval: str = "1h") -> None:
+    """Store snapshots of one bar, each captured at the moment given."""
 
-    for close, first_seen_at in seen.items():
-        record_observations(connection, [_candle(open_time=open_time, close=close)])
-        connection.execute(
-            "UPDATE crypto_observations SET first_seen_at = ? WHERE open_time = ? AND close = ?",
-            (first_seen_at, open_time, close),
+    for close, observed_at in seen.items():
+        record_observations(
+            connection, [_candle(interval=interval, open_time=open_time, close=close)], observed_at=observed_at
         )
-    connection.commit()
 
 
 def test_settlement_uses_the_first_price_captured_at_or_after_the_resolve_time(tmp_path: Path) -> None:
@@ -199,23 +194,41 @@ def test_settlement_waits_while_only_earlier_prices_exist(tmp_path: Path) -> Non
         assert "waiting" in note
 
 
-def test_settlement_stops_waiting_once_the_tolerance_has_passed(tmp_path: Path) -> None:
-    """From Codex's review: an unchanged refetch never creates a new row and old
-    bars stop being refetched, so a call must not stay pending forever. After
-    the tolerance it settles on the latest earlier price, and says so."""
+def test_settlement_falls_back_only_after_the_grace_period(tmp_path: Path) -> None:
+    """From Codex's reviews: a call must not stay pending forever, but it must
+    not give up the moment the tolerance passes either -- a collector
+    recovering from an outage refetches the missing bar. Only after the grace
+    does it settle on the latest earlier price, and it says so."""
 
     with connect(tmp_path / "c.db") as connection:
         _snapshots(connection, "2026-09-04T01:00:00+00:00", {
             100.0: "2026-09-04T01:02:00+00:00",
             101.0: "2026-09-04T01:10:00+00:00",
         })
+        at = "2026-09-04T01:17:00+00:00"
+
+        early, _ = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-04T03:00:00+00:00")
+        late, note = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-04T10:00:00+00:00")
+
+        assert early is None
+        assert late == 101.0
+        assert "latest price before" in note
+
+
+def test_an_unchanged_refetch_proves_the_price_still_held(tmp_path: Path) -> None:
+    """From Codex's second review: re-fetching an identical bar only updates
+    last_seen_at, which still proves the close was the price at that moment."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T01:02:00+00:00"})
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T01:32:00+00:00"})
 
         price, note = close_price_at(
-            connection, "BTC-USD", "2026-09-04T01:17:00+00:00", now_iso="2026-09-04T03:00:00+00:00"
+            connection, "BTC-USD", "2026-09-04T01:17:00+00:00", now_iso="2026-09-04T01:33:00+00:00"
         )
 
-        assert price == 101.0
-        assert "latest price before" in note
+        assert price == 100.0
+        assert "01:32:00" in note
 
 
 def test_settlement_looks_across_neighbouring_bars(tmp_path: Path) -> None:
@@ -251,15 +264,8 @@ def test_fast_settlement_matches_the_bar_training_uses(tmp_path: Path) -> None:
     one bar later. The 12:04 bar's final close is the price at 12:05."""
 
     with connect(tmp_path / "c.db") as connection:
-        for open_time, close, seen in (
-            ("2026-09-06T12:04:00+00:00", 50_000.0, "2026-09-06T12:05:01+00:00"),
-            ("2026-09-06T12:05:00+00:00", 50_010.0, "2026-09-06T12:05:01+00:00"),
-        ):
-            record_observations(connection, [_candle(interval="1m", open_time=open_time, close=close)])
-            connection.execute(
-                "UPDATE crypto_observations SET first_seen_at = ? WHERE open_time = ?", (seen, open_time)
-            )
-        connection.commit()
+        _snapshots(connection, "2026-09-06T12:04:00+00:00", {50_000.0: "2026-09-06T12:05:01+00:00"}, "1m")
+        _snapshots(connection, "2026-09-06T12:05:00+00:00", {50_010.0: "2026-09-06T12:05:01+00:00"}, "1m")
 
         price, _ = close_price_at(
             connection, "BTC-USD", "2026-09-06T12:05:00+00:00", interval="1m", tolerance_minutes=2

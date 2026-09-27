@@ -270,13 +270,23 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         )
 
 
-def record_observations(connection: sqlite3.Connection, candles: Iterable[Candle]) -> tuple[int, int]:
+def record_observations(
+    connection: sqlite3.Connection,
+    candles: Iterable[Candle],
+    *,
+    observed_at: str | None = None,
+) -> tuple[int, int]:
     """Insert new observations, bumping times_seen for ones already recorded.
 
     Returns (inserted, seen). Nothing is ever overwritten.
+
+    `observed_at` is the capture time stamped on new rows (first_seen_at) and
+    on re-observed ones (last_seen_at). Collectors leave it unset, meaning now;
+    settlement treats these stamps as when each price was true, so tests that
+    walk a simulated clock pass it explicitly instead of rewriting rows.
     """
 
-    now = utc_now_iso()
+    now = observed_at or utc_now_iso()
     inserted = 0
     seen = 0
     for candle in candles:
@@ -360,21 +370,37 @@ def record_prediction(connection: sqlite3.Connection, prediction: Prediction) ->
     return int(existing["id"])
 
 
-def price_moment(row: Mapping[str, object], interval: str) -> datetime:
-    """When a stored close was the market price.
+# How long settlement keeps waiting for a price at or after the resolve time
+# before falling back to the latest earlier one. Collectors refetch history
+# (120 hourly bars, 500 one-minute bars ~ 8.3h), so a bar missed during an
+# outage usually arrives on recovery; 6h stays inside the shortest of those.
+SETTLEMENT_FALLBACK_GRACE = timedelta(hours=6)
 
-    A bar's close is the price at the bar's END, so a completed bar fetched
-    late -- after an outage, say -- still speaks for its end time, not for when
-    it was fetched. A snapshot of a bar that was still forming is the price at
-    the moment it was captured, which is `first_seen_at`: the insertion time of
-    that exact row. That stamp is written once the whole collection pass ends,
-    so it can trail the actual fetch by the length of the pass (about a minute
-    live); it is an approximation, but a small and one-directional one.
+
+def price_moments(row: Mapping[str, object], interval: str) -> tuple[datetime, ...]:
+    """The moments at which a stored close is known to have been the price.
+
+    A row is captured at `first_seen_at` and, if the identical bar was fetched
+    again, last at `last_seen_at`; the same close held at both. A bar's close
+    is the price at the bar's END, so a capture after the bar closed speaks for
+    the end time, not the fetch time -- which is what makes a completed bar
+    fetched late (after an outage) settle correctly. A capture can also not
+    precede the bar's open; a clock-skewed or future-dated bar is clamped.
+
+    Capture stamps are written when the whole collection pass ends, so they
+    can trail the real fetch by the length of the pass (about a minute live):
+    a small, one-directional approximation.
     """
 
-    bar_end = _as_utc(datetime.fromisoformat(str(row["open_time"]))) + horizon_delta(interval)
-    captured = _as_utc(datetime.fromisoformat(str(row["first_seen_at"])))
-    return min(captured, bar_end)
+    bar_open = _as_utc(datetime.fromisoformat(str(row["open_time"])))
+    bar_end = bar_open + horizon_delta(interval)
+    moments = set()
+    for column in ("first_seen_at", "last_seen_at"):
+        stamp = row[column]
+        if stamp:
+            captured = _as_utc(datetime.fromisoformat(str(stamp)))
+            moments.add(min(max(captured, bar_open), bar_end))
+    return tuple(sorted(moments))
 
 
 def close_price_at(
@@ -391,8 +417,8 @@ def close_price_at(
     Returns (price, note). A None price means the store cannot settle this yet,
     which is a legitimate state and must not be filled with a guess.
 
-    Every stored close is given its `price_moment`, and the call settles on the
-    earliest one in [at_iso, at_iso + tolerance], across every bar in range.
+    Every stored close is given its `price_moments`, and the call settles on
+    the earliest one in [at_iso, at_iso + tolerance], across every bar in range.
     Found 2026-09-28: the old rule took the bar whose OPEN time was nearest and
     broke ties between that bar's still-forming snapshots by `times_seen`,
     which is 1 for all of them. 58% of 1h calls settled on a price captured
@@ -403,11 +429,11 @@ def close_price_at(
     02:00 bar's first price comes later.
 
     If nothing at or after `at_iso` has been captured yet, the call waits.
-    Once `now` is past `at_iso + tolerance`, waiting cannot help -- an
-    unchanged refetch never creates a new row, and old bars stop being
-    refetched -- so it settles on the latest price in [at_iso - tolerance,
-    at_iso) instead, and says so in the note, rather than staying pending
-    forever.
+    Once `now` is past `at_iso + tolerance + SETTLEMENT_FALLBACK_GRACE`,
+    waiting cannot help -- old bars stop being refetched -- so it settles on the
+    latest price in [at_iso - tolerance, at_iso) instead, and says so in the
+    note, rather than staying pending forever. The grace leaves room for a
+    collector recovering from an outage to refetch the missing bar first.
     """
 
     target = _as_utc(datetime.fromisoformat(at_iso))
@@ -415,32 +441,39 @@ def close_price_at(
     bar = horizon_delta(interval)
     rows = connection.execute(
         """
-        SELECT open_time, close, venue, times_seen, first_seen_at
+        SELECT content_hash, open_time, close, venue, times_seen, first_seen_at, last_seen_at
         FROM crypto_observations
         WHERE instrument = ? AND interval = ? AND degraded = 0 AND close IS NOT NULL
           AND open_time BETWEEN ? AND ?
         """,
         (instrument, interval, (target - window - bar).isoformat(), (target + window).isoformat()),
     ).fetchall()
-    moments = [(price_moment(row, interval), row) for row in rows]
+    moments = [(moment, row) for row in rows for moment in price_moments(row, interval)]
 
-    def best(candidates: list[tuple[datetime, sqlite3.Row]], latest: bool) -> sqlite3.Row:
-        # Same moment from several rows or venues: the most-confirmed wins, then venue name.
-        chosen = max(candidates, key=lambda m: m[0]) if latest else min(candidates, key=lambda m: m[0])
-        tied = [row for moment, row in candidates if moment == chosen[0]]
-        return sorted(tied, key=lambda r: (-int(r["times_seen"]), str(r["venue"])))[0]
+    def best(candidates: list[tuple[datetime, sqlite3.Row]], latest: bool) -> tuple[datetime, sqlite3.Row]:
+        # Same moment from several rows or venues: most-confirmed, then venue,
+        # then close and content hash, so the choice never depends on row order.
+        chosen = max(m for m, _ in candidates) if latest else min(m for m, _ in candidates)
+        tied = [row for m, row in candidates if m == chosen]
+        row = sorted(
+            tied,
+            key=lambda r: (-int(r["times_seen"]), str(r["venue"]), float(r["close"]), str(r["content_hash"])),
+        )[0]
+        return chosen, row
 
     after = [(m, row) for m, row in moments if target <= m <= target + window]
     if after:
-        row = best(after, latest=False)
-        return float(row["close"]), f"{row['venue']} {interval} close at {row['open_time']}"
+        moment, row = best(after, latest=False)
+        return float(row["close"]), (
+            f"{row['venue']} {interval} close at {row['open_time']}, price as of {moment.isoformat()}"
+        )
 
     now = _as_utc(datetime.fromisoformat(now_iso)) if now_iso else datetime.now(UTC)
     before = [(m, row) for m, row in moments if target - window <= m < target]
-    if now > target + window and before:
-        row = best(before, latest=True)
+    if now > target + window + SETTLEMENT_FALLBACK_GRACE and before:
+        moment, row = best(before, latest=True)
         return float(row["close"]), (
-            f"{row['venue']} {interval} close at {row['open_time']} "
+            f"{row['venue']} {interval} close at {row['open_time']}, price as of {moment.isoformat()} "
             f"(latest price before {at_iso}; nothing was captured after it)"
         )
     if not moments:
