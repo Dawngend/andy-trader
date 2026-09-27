@@ -360,6 +360,23 @@ def record_prediction(connection: sqlite3.Connection, prediction: Prediction) ->
     return int(existing["id"])
 
 
+def price_moment(row: Mapping[str, object], interval: str) -> datetime:
+    """When a stored close was the market price.
+
+    A bar's close is the price at the bar's END, so a completed bar fetched
+    late -- after an outage, say -- still speaks for its end time, not for when
+    it was fetched. A snapshot of a bar that was still forming is the price at
+    the moment it was captured, which is `first_seen_at`: the insertion time of
+    that exact row. That stamp is written once the whole collection pass ends,
+    so it can trail the actual fetch by the length of the pass (about a minute
+    live); it is an approximation, but a small and one-directional one.
+    """
+
+    bar_end = _as_utc(datetime.fromisoformat(str(row["open_time"]))) + horizon_delta(interval)
+    captured = _as_utc(datetime.fromisoformat(str(row["first_seen_at"])))
+    return min(captured, bar_end)
+
+
 def close_price_at(
     connection: sqlite3.Connection,
     instrument: str,
@@ -367,62 +384,68 @@ def close_price_at(
     *,
     interval: str = "1h",
     tolerance_minutes: int = 90,
+    now_iso: str | None = None,
 ) -> tuple[float | None, str]:
-    """Best available close for `instrument` at `at_iso`, and a note explaining it.
+    """The first known price at or after `at_iso`, and a note explaining it.
 
     Returns (price, note). A None price means the store cannot settle this yet,
-    which is a legitimate state and must not be filled with the nearest guess
-    from outside the tolerance window.
+    which is a legitimate state and must not be filled with a guess.
 
-    The bar is the one whose open_time is nearest `at_iso`. That bar is often
-    still forming when a mid-hour call falls due, and the store keeps every
-    snapshot of it (each changed close is a new row). Which snapshot settles
-    the call matters: measured on the live store 2026-09-28, choosing among
-    them by `times_seen` alone -- a tie between one-off snapshots -- settled
-    58% of 1h calls on a price captured BEFORE the call resolved, a median 15
-    and up to 45 minutes early, silently scoring a shorter horizon than the one
-    predicted. So the snapshot used is the earliest one captured at or after
-    `at_iso`. If none exists yet and the bar is still open at `at_iso`, the
-    call waits for the next collection rather than settling early. Only a bar
-    that had already closed by `at_iso` falls back to its most-confirmed close,
-    since no later price for it can ever arrive.
+    Every stored close is given its `price_moment`, and the call settles on the
+    earliest one in [at_iso, at_iso + tolerance], across every bar in range.
+    Found 2026-09-28: the old rule took the bar whose OPEN time was nearest and
+    broke ties between that bar's still-forming snapshots by `times_seen`,
+    which is 1 for all of them. 58% of 1h calls settled on a price captured
+    before they resolved (median 15, up to 45 minutes early), and a completed
+    bar opening exactly at `at_iso` was settled on its close an interval LATE.
+    Codex's review of the first fix showed why choosing the bar first is still
+    wrong: at 01:47 the 01:00 bar may hold a price captured at 01:47 while the
+    02:00 bar's first price comes later.
+
+    If nothing at or after `at_iso` has been captured yet, the call waits.
+    Once `now` is past `at_iso + tolerance`, waiting cannot help -- an
+    unchanged refetch never creates a new row, and old bars stop being
+    refetched -- so it settles on the latest price in [at_iso - tolerance,
+    at_iso) instead, and says so in the note, rather than staying pending
+    forever.
     """
 
-    target = datetime.fromisoformat(at_iso)
+    target = _as_utc(datetime.fromisoformat(at_iso))
     window = timedelta(minutes=tolerance_minutes)
-    low = (target - window).isoformat()
-    high = (target + window).isoformat()
+    bar = horizon_delta(interval)
     rows = connection.execute(
         """
-        SELECT open_time, close, venue, times_seen, first_seen_at,
-               ABS(JULIANDAY(open_time) - JULIANDAY(?)) AS distance
+        SELECT open_time, close, venue, times_seen, first_seen_at
         FROM crypto_observations
         WHERE instrument = ? AND interval = ? AND degraded = 0 AND close IS NOT NULL
           AND open_time BETWEEN ? AND ?
-        ORDER BY distance ASC, times_seen DESC
         """,
-        (at_iso, instrument, interval, low, high),
+        (instrument, interval, (target - window - bar).isoformat(), (target + window).isoformat()),
     ).fetchall()
-    if not rows:
-        return None, f"no non-degraded {interval} close within {tolerance_minutes}m of {at_iso}"
+    moments = [(price_moment(row, interval), row) for row in rows]
 
-    bar_open = rows[0]["open_time"]
-    snapshots = [row for row in rows if row["open_time"] == bar_open]
-    target_utc = _as_utc(target)
-    after = [row for row in snapshots if _as_utc(datetime.fromisoformat(row["first_seen_at"])) >= target_utc]
+    def best(candidates: list[tuple[datetime, sqlite3.Row]], latest: bool) -> sqlite3.Row:
+        # Same moment from several rows or venues: the most-confirmed wins, then venue name.
+        chosen = max(candidates, key=lambda m: m[0]) if latest else min(candidates, key=lambda m: m[0])
+        tied = [row for moment, row in candidates if moment == chosen[0]]
+        return sorted(tied, key=lambda r: (-int(r["times_seen"]), str(r["venue"])))[0]
+
+    after = [(m, row) for m, row in moments if target <= m <= target + window]
     if after:
-        row = min(
-            after,
-            key=lambda r: (_as_utc(datetime.fromisoformat(r["first_seen_at"])), -int(r["times_seen"]), r["venue"]),
+        row = best(after, latest=False)
+        return float(row["close"]), f"{row['venue']} {interval} close at {row['open_time']}"
+
+    now = _as_utc(datetime.fromisoformat(now_iso)) if now_iso else datetime.now(UTC)
+    before = [(m, row) for m, row in moments if target - window <= m < target]
+    if now > target + window and before:
+        row = best(before, latest=True)
+        return float(row["close"]), (
+            f"{row['venue']} {interval} close at {row['open_time']} "
+            f"(latest price before {at_iso}; nothing was captured after it)"
         )
-    elif _as_utc(datetime.fromisoformat(bar_open)) + horizon_delta(interval) <= target_utc:
-        row = snapshots[0]  # already ordered by times_seen DESC
-    else:
-        return None, (
-            f"{interval} bar at {bar_open} has no price captured at or after {at_iso} yet; "
-            f"waiting rather than settling on an earlier snapshot"
-        )
-    return float(row["close"]), f"{row['venue']} {interval} close at {row['open_time']}"
+    if not moments:
+        return None, f"no non-degraded {interval} close within {tolerance_minutes}m of {at_iso}"
+    return None, f"no {interval} price captured at or after {at_iso} yet; waiting"
 
 
 def _as_utc(moment: datetime) -> datetime:
@@ -486,6 +509,7 @@ def settle_due_predictions(
             row["resolves_at"],
             interval=interval,
             tolerance_minutes=tolerance_minutes,
+            now_iso=now,
         )
         if price is None:
             unresolvable += 1

@@ -187,26 +187,85 @@ def test_settlement_uses_the_first_price_captured_at_or_after_the_resolve_time(t
         assert between == 102.0
 
 
-def test_settlement_waits_when_a_forming_bar_has_only_earlier_prices(tmp_path: Path) -> None:
+def test_settlement_waits_while_only_earlier_prices_exist(tmp_path: Path) -> None:
     with connect(tmp_path / "c.db") as connection:
         _snapshots(connection, "2026-09-04T01:00:00+00:00", {101.0: "2026-09-04T01:02:00+00:00"})
 
-        price, note = close_price_at(connection, "BTC-USD", "2026-09-04T01:17:00+00:00")
+        price, note = close_price_at(
+            connection, "BTC-USD", "2026-09-04T01:17:00+00:00", now_iso="2026-09-04T01:20:00+00:00"
+        )
 
         assert price is None
         assert "waiting" in note
 
 
-def test_a_bar_that_closed_before_the_resolve_time_still_settles(tmp_path: Path) -> None:
-    """No later price for a finished bar can ever arrive, so waiting would leave
-    the call unsettled forever; its most-confirmed close is used."""
+def test_settlement_stops_waiting_once_the_tolerance_has_passed(tmp_path: Path) -> None:
+    """From Codex's review: an unchanged refetch never creates a new row and old
+    bars stop being refetched, so a call must not stay pending forever. After
+    the tolerance it settles on the latest earlier price, and says so."""
 
     with connect(tmp_path / "c.db") as connection:
-        _snapshots(connection, "2026-09-04T00:00:00+00:00", {100.0: "2026-09-04T00:59:00+00:00"})
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {
+            100.0: "2026-09-04T01:02:00+00:00",
+            101.0: "2026-09-04T01:10:00+00:00",
+        })
 
-        price, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:20:00+00:00")
+        price, note = close_price_at(
+            connection, "BTC-USD", "2026-09-04T01:17:00+00:00", now_iso="2026-09-04T03:00:00+00:00"
+        )
+
+        assert price == 101.0
+        assert "latest price before" in note
+
+
+def test_settlement_looks_across_neighbouring_bars(tmp_path: Path) -> None:
+    """From Codex's review: at 01:47 the 01:00 bar can hold a price captured at
+    01:47 while the nearer-by-open-time 02:00 bar's first price comes later."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {102.0: "2026-09-04T01:47:30+00:00"})
+        _snapshots(connection, "2026-09-04T02:00:00+00:00", {105.0: "2026-09-04T02:02:00+00:00"})
+
+        price, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:47:00+00:00")
+
+        assert price == 102.0
+
+
+def test_a_completed_bar_fetched_late_speaks_for_its_end_not_its_fetch_time(tmp_path: Path) -> None:
+    """From Codex's review: after an outage, bars arrive long after they closed.
+    A call resolving at 01:00 is settled by the bar that ENDS at 01:00 (the
+    00:00 bar), not by the bar that opens at 01:00, whose close is an hour later."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T00:00:00+00:00", {100.0: "2026-09-04T05:00:00+00:00"})
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {107.0: "2026-09-04T05:00:00+00:00"})
+
+        price, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:00:00+00:00")
 
         assert price == 100.0
+
+
+def test_fast_settlement_matches_the_bar_training_uses(tmp_path: Path) -> None:
+    """From Codex's review: fast training settles a round ending 12:05 on the
+    12:04 bar's close. Live settlement picked the 12:05 bar (distance zero),
+    one bar later. The 12:04 bar's final close is the price at 12:05."""
+
+    with connect(tmp_path / "c.db") as connection:
+        for open_time, close, seen in (
+            ("2026-09-06T12:04:00+00:00", 50_000.0, "2026-09-06T12:05:01+00:00"),
+            ("2026-09-06T12:05:00+00:00", 50_010.0, "2026-09-06T12:05:01+00:00"),
+        ):
+            record_observations(connection, [_candle(interval="1m", open_time=open_time, close=close)])
+            connection.execute(
+                "UPDATE crypto_observations SET first_seen_at = ? WHERE open_time = ?", (seen, open_time)
+            )
+        connection.commit()
+
+        price, _ = close_price_at(
+            connection, "BTC-USD", "2026-09-06T12:05:00+00:00", interval="1m", tolerance_minutes=2
+        )
+
+        assert price == 50_000.0
 
 
 def test_settlement_marks_up_and_down_correctly(tmp_path: Path) -> None:

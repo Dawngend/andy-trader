@@ -182,6 +182,20 @@ def test_predictions_are_not_rewritten_on_a_second_identical_run(tmp_path: Path)
         assert count["n"] == 1
 
 
+def _captured_when_opened(connection) -> None:
+    """Stamp each stored bar as captured the moment it opened.
+
+    These tests walk the clock forward and predict at hour h right after
+    recording the bar that opens at h, treating its close as the price now.
+    That is what the live collector's snapshot of a forming bar means. Left at
+    record_observations' real-clock stamp, the bar would read as a completed
+    bar whose close is the price an hour LATER, which settlement now honours.
+    """
+
+    connection.execute("UPDATE crypto_observations SET first_seen_at = open_time")
+    connection.commit()
+
+
 def _zigzag_bar(hour: int, close: float) -> Candle:
     return Candle(
         instrument="BTC-USD",
@@ -212,6 +226,7 @@ def test_score_all_ranks_a_calibrated_predictor_above_an_overconfident_one(tmp_p
         )
         for hour, close in enumerate(closes):
             record_observations(connection, [_zigzag_bar(hour, close)])
+            _captured_when_opened(connection)
             predict_once(
                 connection,
                 instruments=("BTC-USD",),
@@ -237,6 +252,7 @@ def test_score_all_flags_a_one_sided_sample_as_undecidable(tmp_path: Path) -> No
     with connect(tmp_path / "c.db") as connection:
         for hour in range(1, 4):
             record_observations(connection, _series(bars=hour))
+            _captured_when_opened(connection)
             predict_once(
                 connection,
                 instruments=("BTC-USD",),
@@ -245,6 +261,7 @@ def test_score_all_flags_a_one_sided_sample_as_undecidable(tmp_path: Path) -> No
                 now_iso=f"2026-09-01T{hour - 1:02d}:00:00+00:00",
             )
         record_observations(connection, _series(bars=4))
+        _captured_when_opened(connection)
         settle_due_predictions(connection, now_iso="2026-09-02T00:00:00+00:00")
 
         report = score_all(connection)["baseline:always_up"]
