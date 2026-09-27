@@ -267,6 +267,7 @@ def collect_signals(
     *,
     http: Callable[[str], object],
     limit: int = 200,
+    include_bybit: bool = True,
 ) -> tuple[list[Signal], list[dict[str, str]]]:
     """Fetch every signal, recording failures as degraded rows rather than raising.
 
@@ -300,6 +301,8 @@ def collect_signals(
         "https://api.alternative.me/fng/?limit=30",
         parse_fear_greed,
     )
+    if not include_bybit:
+        return collected, problems
     for instrument in instruments:
         symbol = _BYBIT_SYMBOLS.get(instrument)
         if symbol is None:

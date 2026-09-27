@@ -146,3 +146,23 @@ def test_collect_skips_an_unmapped_instrument_without_failing() -> None:
     signals, problems = collect_signals(("NOTACOIN-USD",), http=http)
     assert problems == []
     assert [s.signal for s in signals] == [FEAR_GREED]
+
+
+def test_collect_can_skip_bybit_without_losing_market_sentiment() -> None:
+    urls: list[str] = []
+
+    def http(url: str) -> object:
+        urls.append(url)
+        return {
+            "data": [
+                {"value": "50", "value_classification": "Neutral", "timestamp": "1788480000"}
+            ]
+        }
+
+    signals, problems = collect_signals(
+        ("BTC-USD", "ETH-USD"), http=http, include_bybit=False
+    )
+
+    assert problems == []
+    assert [signal.signal for signal in signals] == [FEAR_GREED]
+    assert urls == ["https://api.alternative.me/fng/?limit=30"]

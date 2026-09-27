@@ -1,11 +1,11 @@
 """Tests for the unattended cycle's fallback and diagnostic journal."""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 
-from andy_trader.store import Candle
+from andy_trader.store import Candle, connect, record_observations
 import run_cycle
 
 
@@ -85,6 +85,60 @@ def _fake_price_collect(*, instruments, intervals, venues, settings):
             open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0,
         )
     ], []
+
+
+def test_persistently_failing_venue_is_backed_off_then_probed(tmp_path: Path) -> None:
+    database = tmp_path / "c.db"
+    now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+    with connect(database) as connection:
+        record_observations(
+            connection,
+            [
+                Candle(
+                    instrument="BTC-USD",
+                    venue="bybit",
+                    interval="1h",
+                    open_time="2026-09-24T00:00:00+00:00",
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=1.0,
+                ),
+                Candle(
+                    instrument="BTC-USD",
+                    venue="bybit",
+                    interval="1h",
+                    open_time="2026-09-27T11:45:00+00:00",
+                    open=None,
+                    high=None,
+                    low=None,
+                    close=None,
+                    volume=None,
+                    degraded=True,
+                    degraded_reason="blocked",
+                ),
+            ],
+        )
+        connection.execute(
+            "UPDATE crypto_observations SET last_seen_at = ? WHERE degraded = 0",
+            ("2026-09-24T00:00:00+00:00",),
+        )
+        connection.execute(
+            "UPDATE crypto_observations SET last_seen_at = ? WHERE degraded = 1",
+            ("2026-09-27T11:45:00+00:00",),
+        )
+        effective, backed_off = run_cycle._venues_with_probe_backoff(
+            connection, ("tradingview", "bybit"), now=now
+        )
+        retry_effective, retry_backed_off = run_cycle._venues_with_probe_backoff(
+            connection, ("bybit",), now=now + timedelta(minutes=61)
+        )
+
+    assert effective == ("tradingview",)
+    assert backed_off == ("bybit",)
+    assert retry_effective == ("bybit",)
+    assert retry_backed_off == ()
 
 
 def test_paper_trade_is_opt_in_and_runs_when_explicitly_configured(monkeypatch, tmp_path: Path) -> None:

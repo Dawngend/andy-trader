@@ -210,7 +210,37 @@ def test_tradingview_parses_validated_bars_from_the_bridge() -> None:
     assert candles[0].close == 101.0
     assert seen["symbol"] == "BINANCE:BTCUSDT"
     assert seen["timeframe"] == "60"
-    assert seen["bars"] == 500
+    assert seen["bars"] == 120
+
+
+def test_tradingview_bar_count_can_be_overridden() -> None:
+    seen = {}
+
+    def snapshot(**kwargs):
+        seen.update(kwargs)
+        return {"bars": []}
+
+    fetch_tradingview(
+        "BTC-USD",
+        "1h",
+        SETTINGS,
+        snapshot=snapshot,
+        environ={"TRADINGVIEW_API_ROOT": "D:\\TradingView-API", "TRADINGVIEW_BARS": "42"},
+    )
+
+    assert seen["bars"] == 42
+
+
+@pytest.mark.parametrize("value", ["0", "501", "many"])
+def test_tradingview_refuses_an_invalid_bar_count(value: str) -> None:
+    with pytest.raises(CollectorError, match="TRADINGVIEW_BARS"):
+        fetch_tradingview(
+            "BTC-USD",
+            "1h",
+            SETTINGS,
+            snapshot=lambda **_kwargs: {"bars": []},
+            environ={"TRADINGVIEW_API_ROOT": "unused", "TRADINGVIEW_BARS": value},
+        )
 
 
 def test_tradingview_returns_nothing_for_an_unsupported_market() -> None:

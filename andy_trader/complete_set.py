@@ -51,6 +51,7 @@ DEFAULT_MIN_EXECUTION_EDGE_BPS = 200.0
 DEFAULT_CONFIRMATION_DELAY_SECONDS = 0.5
 DEFAULT_MAX_CONFIRMATION_AGE_SECONDS = 5.0
 DEFAULT_PAPER_BURST_SAMPLES = 50
+DEFAULT_PAPER_STORE_EVERY_SAMPLES = 10
 MAX_BATCH_BOOK_SKEW_MS = 250
 NO_ORDER_BOOK_ERROR = "No orderbook exists for the requested token id"
 SUPPORTED_CRYPTO_ASSETS = ("btc", "eth", "sol", "xrp")
@@ -140,6 +141,16 @@ class CompleteSetObservation:
     net_combined_cost: float | None
     net_mispriced: bool | None
     unmeasurable_reason: str | None
+
+
+def _observation_quote_state(observation: CompleteSetObservation) -> tuple[object, ...]:
+    """Comparable market state, excluding the timestamp of an identical poll."""
+
+    return tuple(
+        value
+        for name, value in vars(observation).items()
+        if name != "observed_at"
+    )
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1727,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "opening batch is collected. Default: 50 (about one scheduled minute)"
         ),
     )
+    parser.add_argument(
+        "--paper-store-every-samples",
+        type=int,
+        default=DEFAULT_PAPER_STORE_EVERY_SAMPLES,
+        help=(
+            "Persist unchanged quote heartbeats every N burst samples; changes and the "
+            "final sample are always stored. Default: 10"
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1729,6 +1749,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--paper-confirmation-delay must not be negative")
     if args.paper and args.paper_burst_samples < 1:
         parser.error("--paper-burst-samples must be at least 1")
+    if args.paper and args.paper_store_every_samples < 1:
+        parser.error("--paper-store-every-samples must be at least 1")
 
     db_path = Path(args.database) if args.database else default_database_path()
     final_observations: dict[str, CompleteSetObservation] = {}
@@ -1742,6 +1764,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     requote_summary: RequoteTrialSummary | None = None
     burst_snapshot_count = 1
     burst_attempts = 0
+    stored_observation_count = 0
     with connect(db_path) as connection:
         if args.report:
             _print_report(summarize_history(connection, target_notional=args.target_notional))
@@ -1762,6 +1785,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for observation in final_observations.values():
             record_complete_set_observation(connection, observation, commit=False)
         connection.commit()
+        stored_observation_count += len(final_observations)
+        last_stored = dict(final_observations)
         if args.paper:
             get_or_create_paper_account(connection, starting_cash=args.paper_starting_cash)
             backfill_requote_trials(connection)
@@ -1770,7 +1795,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 connection, timeout_seconds=args.timeout
             )
             signals = dict(final_observations)
-            for _ in range(args.paper_burst_samples):
+            for sample_index in range(1, args.paper_burst_samples + 1):
                 time.sleep(args.paper_confirmation_delay)
                 try:
                     current_observations = collect_current_rounds(
@@ -1791,8 +1816,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                             )
                             burst_attempts += 1
                     break
-                for current in current_observations.values():
-                    record_complete_set_observation(connection, current, commit=False)
+                for asset, current in current_observations.items():
+                    previous = last_stored.get(asset)
+                    quote_changed = previous is None or (
+                        _observation_quote_state(previous) != _observation_quote_state(current)
+                    )
+                    heartbeat_due = sample_index % args.paper_store_every_samples == 0
+                    final_sample = sample_index == args.paper_burst_samples
+                    if quote_changed or heartbeat_due or final_sample:
+                        record_complete_set_observation(connection, current, commit=False)
+                        last_stored[asset] = current
+                        stored_observation_count += 1
                 connection.commit()
                 burst_snapshot_count += 1
                 for asset, current in current_observations.items():
@@ -1846,7 +1880,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"paper quote burst : {burst_snapshot_count} synchronized batches across "
             f"{len(assets)} markets, "
-            f"{burst_attempts} net-edge confirmation attempts"
+            f"{burst_attempts} net-edge confirmation attempts, "
+            f"{stored_observation_count} observations stored"
         )
         if confirmation_error is not None:
             print(f"paper quote burst : failed closed ({confirmation_error})")

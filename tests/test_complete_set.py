@@ -1042,6 +1042,57 @@ def test_cli_burst_can_detect_and_confirm_an_edge_after_the_first_snapshot(
     assert summary["confirmed_trades"] == 1
 
 
+def test_cli_burst_compresses_unchanged_polls_but_keeps_heartbeats_and_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _observation("btc-updown-5m-cli-heartbeat", up_price=0.50, down_price=0.50)
+    observations = iter(
+        [
+            replace(base, observed_at=f"2026-09-07T00:00:0{index}+00:00")
+            for index in range(6)
+        ]
+    )
+    calls = 0
+
+    def collect(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"btc": next(observations)}
+
+    monkeypatch.setattr(complete_set, "collect_current_rounds", collect)
+    monkeypatch.setattr(complete_set.time, "sleep", lambda _seconds: None)
+
+    result = complete_set.main(
+        [
+            "--database",
+            str(tmp_path / "paper.db"),
+            "--paper",
+            "--assets",
+            "btc",
+            "--paper-confirmation-delay",
+            "0",
+            "--paper-burst-samples",
+            "5",
+            "--paper-store-every-samples",
+            "2",
+        ]
+    )
+
+    with connect(tmp_path / "paper.db") as connection:
+        stored = connection.execute(
+            "SELECT observed_at FROM complete_set_observations ORDER BY observed_at"
+        ).fetchall()
+
+    assert result == 0
+    assert calls == 6  # every live sample was still collected and evaluated
+    assert [row["observed_at"] for row in stored] == [
+        "2026-09-07T00:00:00+00:00",
+        "2026-09-07T00:00:02+00:00",
+        "2026-09-07T00:00:04+00:00",
+        "2026-09-07T00:00:05+00:00",
+    ]
+
+
 def test_the_same_round_is_never_traded_twice(tmp_path: Path) -> None:
     observation = _observation("btc-updown-5m-3", up_price=0.50, down_price=0.44)
 

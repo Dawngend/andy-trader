@@ -23,6 +23,7 @@ USER_AGENT = "andy-trader-collector/1.0 (personal research)"
 
 DEFAULT_INSTRUMENTS = ("BTC-USD", "ETH-USD")
 DEFAULT_INTERVALS = ("1h", "4h")
+DEFAULT_TRADINGVIEW_BARS = 120
 
 # Coinbase Exchange granularities are a fixed set of seconds and 4h is not in
 # it; the neighbouring option is 6h. Rather than silently substituting 6h data
@@ -450,13 +451,19 @@ def fetch_tradingview(
     if not raw_root:
         raise CollectorError("TRADINGVIEW_API_ROOT is required for the tradingview venue")
     node_executable = source.get("TRADINGVIEW_NODE", "node").strip() or "node"
+    try:
+        bars = int(source.get("TRADINGVIEW_BARS", str(DEFAULT_TRADINGVIEW_BARS)))
+    except ValueError as exc:
+        raise CollectorError("TRADINGVIEW_BARS must be an integer") from exc
+    if not 1 <= bars <= 500:
+        raise CollectorError("TRADINGVIEW_BARS must be between 1 and 500")
 
     getter = snapshot or collect_tradingview_snapshot
     payload = getter(
         api_root=Path(raw_root),
         symbol=symbol,
         timeframe=timeframe,
-        bars=500,
+        bars=bars,
         timeout_seconds=settings.timeout_seconds,
         node_executable=node_executable,
     )

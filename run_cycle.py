@@ -14,9 +14,10 @@ one condition a scheduler should surface.
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
+import sqlite3
 import sys
 import time
 from typing import Sequence
@@ -86,6 +87,54 @@ def _journal(event: str, **details: object) -> None:
 # 429 at eight instruments, so it remains a selective fallback only when both
 # scheduled sources fail to provide the reference interval for an instrument.
 SCHEDULED_VENUES = ("tradingview", "bybit")
+DEFAULT_VENUE_STALE_HOURS = 24.0
+DEFAULT_VENUE_PROBE_INTERVAL_MINUTES = 60.0
+
+
+def _parse_observed_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _venues_with_probe_backoff(
+    connection: sqlite3.Connection,
+    venues: Sequence[str],
+    *,
+    now: datetime,
+    stale_after_hours: float = DEFAULT_VENUE_STALE_HOURS,
+    probe_interval_minutes: float = DEFAULT_VENUE_PROBE_INTERVAL_MINUTES,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Throttle a persistently failing venue while still probing it periodically.
+
+    A venue is backed off only after its last good row is stale (or it has never
+    produced one) and a more recent attempt occurred inside the probe interval.
+    Explicit ``--venues`` requests bypass this helper in ``main``.
+    """
+
+    stale_after = timedelta(hours=stale_after_hours)
+    probe_after = timedelta(minutes=probe_interval_minutes)
+    effective: list[str] = []
+    backed_off: list[str] = []
+    for venue in venues:
+        row = connection.execute(
+            "SELECT MAX(last_seen_at) AS latest_attempt, "
+            "MAX(CASE WHEN degraded = 0 THEN last_seen_at END) AS latest_success "
+            "FROM crypto_observations WHERE venue = ?",
+            (venue,),
+        ).fetchone()
+        latest_attempt = row["latest_attempt"] if row is not None else None
+        latest_success = row["latest_success"] if row is not None else None
+        success_is_stale = latest_success is None or (
+            now - _parse_observed_time(latest_success) > stale_after
+        )
+        probe_is_recent = latest_attempt is not None and (
+            now - _parse_observed_time(latest_attempt) < probe_after
+        )
+        if success_is_stale and probe_is_recent:
+            backed_off.append(venue)
+        else:
+            effective.append(venue)
+    return tuple(effective), tuple(backed_off)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -141,7 +190,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     instruments = tuple(args.instruments.split(",")) if args.instruments else DEFAULT_INSTRUMENTS
     intervals = tuple(args.intervals.split(",")) if args.intervals else DEFAULT_INTERVALS
     horizons = tuple(args.horizons.split(",")) if args.horizons else DEFAULT_HORIZONS
-    venues = tuple(args.venues.split(",")) if args.venues else SCHEDULED_VENUES
+    requested_venues = tuple(args.venues.split(",")) if args.venues else SCHEDULED_VENUES
+    database_path = default_database_path()
+    backed_off_venues: tuple[str, ...] = ()
+    venues = requested_venues
+    if not args.venues:
+        stale_hours = float(
+            os.environ.get("CRYPTO_VENUE_STALE_HOURS", str(DEFAULT_VENUE_STALE_HOURS))
+        )
+        probe_minutes = float(
+            os.environ.get(
+                "CRYPTO_VENUE_PROBE_INTERVAL_MINUTES",
+                str(DEFAULT_VENUE_PROBE_INTERVAL_MINUTES),
+            )
+        )
+        if stale_hours <= 0 or probe_minutes <= 0:
+            raise ValueError("venue stale and probe intervals must be positive")
+        with connect(database_path) as connection:
+            venues, backed_off_venues = _venues_with_probe_backoff(
+                connection,
+                requested_venues,
+                now=datetime.now(UTC),
+                stale_after_hours=stale_hours,
+                probe_interval_minutes=probe_minutes,
+            )
     maximum_data_age_minutes = float(
         os.environ.get("CRYPTO_MAX_DATA_AGE_MINUTES", str(DEFAULT_MAX_DATA_AGE_MINUTES))
     )
@@ -166,7 +238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         instruments=list(instruments),
         intervals=list(intervals),
         horizons=list(horizons),
+        requested_venues=list(requested_venues),
         venues=list(venues),
+        backed_off_venues=list(backed_off_venues),
     )
     try:
         candles, problems = collect(
@@ -217,11 +291,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             signals, signal_problems = collect_signals(
                 instruments,
                 http=lambda url: _http_json(url, settings),
+                include_bybit="bybit" in venues,
             )
-        _journal("signals_collected", signals=len(signals), problems=len(signal_problems))
+        _journal(
+            "signals_collected",
+            signals=len(signals),
+            problems=len(signal_problems),
+            problem_details=signal_problems,
+            bybit_enabled="bybit" in venues,
+        )
 
         paper_trade_results: list[dict[str, object]] = []
-        with connect(default_database_path()) as connection:
+        with connect(database_path) as connection:
             inserted, seen = record_observations(connection, candles)
             if signals:
                 record_signals(connection, signals)

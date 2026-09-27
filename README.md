@@ -94,6 +94,13 @@ The authorization was provided directly to Dawn through the workshop for complet
 is project-specific context and should be preserved when evaluating the integration even if the
 general public documentation has not caught up.
 
+Scheduled collection requests 120 TradingView bars per instrument and interval by default instead
+of re-downloading the API maximum on every cycle. Set `TRADINGVIEW_BARS` from 1 to 500 when a deeper
+manual backfill is needed. A venue with no successful row in 24 hours is temporarily backed off
+after a failed attempt and probed again hourly; explicit `--venues` runs always bypass this throttle.
+When Bybit is backed off, its three per-instrument positioning requests are skipped too, while the
+independent Fear and Greed signal continues to collect.
+
 ```powershell
 git clone https://github.com/Mathieu2301/TradingView-API D:\TradingView-API
 Set-Location D:\TradingView-API
@@ -491,6 +498,11 @@ SOL, and XRP together for approximately one scheduled minute: 51 synchronized fu
 the default half-second cadence. Token discovery is cached per five-minute market and all eight outcome books
 share one request per sample. This covers most of each scheduled minute without a new runtime
 dependency and remains far below the documented `/books` request limit.
+
+All 51 batches are still evaluated. To prevent identical half-second polls from growing SQLite by
+nearly 300,000 rows per day, storage keeps every quote change, every tenth unchanged sample as a
+heartbeat, and the final sample. `--paper-store-every-samples 1` restores full raw persistence for a
+targeted diagnostic run. Existing evidence is never deleted or rewritten.
 
 Every post-fee edge in that burst, including edges too small to deploy, gets an append-only attempt
 outcome. The learning report separates feed failures, vanished edges, surviving net edges, edges that
