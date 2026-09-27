@@ -19,6 +19,7 @@ from andy_trader.baselines import (
 )
 from andy_trader.calibration import CalibrationError, evaluate, format_report
 from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.paper_gate import independent_calls
 from andy_trader.store import (
     Prediction,
     connect,
@@ -189,8 +190,16 @@ def score_all(
     minimum: int = 1,
     maximum_data_age_minutes: float | None = None,
     excluded_stale: dict[str, int] | None = None,
+    independent_counts: dict[str, int] | None = None,
 ) -> dict[str, object]:
-    """Score every predictor that has settled calls, ranked by skill score."""
+    """Score every predictor that has settled calls, ranked by skill score.
+
+    When `independent_counts` is given it is filled with how many of each
+    predictor's scored calls are non-overlapping within their own instrument and
+    horizon. The scheduler logs a call every 15 minutes for every horizon, so a
+    report's `count` can be several times the number of distinct outcomes it
+    actually rests on; the paper gate judges on the independent number.
+    """
 
     predictors = [
         row["predictor"]
@@ -228,6 +237,13 @@ def score_all(
             rows = scoreable
         if len(rows) < minimum:
             continue
+        if independent_counts is not None:
+            groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for row in rows:
+                groups.setdefault((row["instrument"], row["horizon"]), []).append(row)
+            independent_counts[predictor] = sum(
+                len(independent_calls(group)) for group in groups.values()
+            )
         probabilities = [float(row["probability_up"]) for row in rows]
         outcomes = [int(row["outcome_up"]) for row in rows]
         try:
@@ -302,11 +318,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         excluded_stale: dict[str, int] = {}
+        independent: dict[str, int] = {}
         reports = score_all(
             connection,
             minimum=args.minimum,
             maximum_data_age_minutes=maximum_data_age_minutes,
             excluded_stale=excluded_stale,
+            independent_counts=independent,
         )
         if not reports:
             if excluded_stale:
@@ -322,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             for key, value in reports.items()
                         },
                         "excluded_stale": excluded_stale,
+                        "independent_counts": independent,
                     },
                     indent=2,
                 )
@@ -335,6 +354,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ranked = sorted(reports.items(), key=lambda kv: kv[1].brier_skill_score, reverse=True)
         for predictor, report in ranked:
             print(format_report(report, predictor=predictor))
+            if predictor in independent:
+                print(
+                    f"  independent (non-overlapping) calls: {independent[predictor]} "
+                    f"of {report.count} scored"
+                )
             print()
         best = ranked[0]
         print(f"BAR TO BEAT: {best[0]} at skill {best[1].brier_skill_score:+.4f}")

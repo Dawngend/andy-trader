@@ -139,18 +139,20 @@ def _latest_prices(connection: sqlite3.Connection) -> list[dict[str, object]]:
 
 def _scoreboard(connection: sqlite3.Connection) -> tuple[dict[str, object], dict[str, int]]:
     excluded_stale: dict[str, int] = {}
+    independent: dict[str, int] = {}
     reports = score_all(
         connection,
         minimum=1,
         maximum_data_age_minutes=DEFAULT_MAX_DATA_AGE_MINUTES,
         excluded_stale=excluded_stale,
+        independent_counts=independent,
     )
     out: dict[str, object] = {}
     for predictor, report in reports.items():
         if isinstance(report, dict):  # CalibrationError case
             out[predictor] = report
         else:
-            out[predictor] = report.as_dict()
+            out[predictor] = {**report.as_dict(), "independent_count": independent.get(predictor)}
     return out, excluded_stale
 
 
@@ -446,7 +448,7 @@ _PAGE = """<!doctype html>
     <div class="card">
       <h2>Scoreboard (Brier skill vs. base rate)</h2>
       <p class="updated" id="score-quality"></p>
-      <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
+      <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon: the number of distinct outcomes the score rests on">Independent</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Model Registry (CT-07)</h2>
@@ -818,10 +820,11 @@ async function refresh() {
       : "No stale-reference calls excluded";
     Object.keys(s.scoreboard).sort().forEach(name => {
       const r = s.scoreboard[name];
-      if (r.error) { sbBody.appendChild(row([td(name), td("-"), td(r.error), td("-")])); return; }
+      if (r.error) { sbBody.appendChild(row([td(name), td("-"), td("-"), td(r.error), td("-")])); return; }
       const skillCell = td(r.degenerate ? "degenerate" : r.brier_skill_score.toFixed(4));
       skillCell.className = r.degenerate ? "muted" : (r.brier_skill_score > 0 ? "ok" : "bad");
-      sbBody.appendChild(row([td(name), td(r.count), skillCell, td((r.hit_rate*100).toFixed(1)+"%")]));
+      const independentCell = td(r.independent_count == null ? "-" : r.independent_count);
+      sbBody.appendChild(row([td(name), td(r.count), independentCell, skillCell, td((r.hit_rate*100).toFixed(1)+"%")]));
     });
 
     const regBody = document.querySelector("#registry tbody");

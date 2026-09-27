@@ -317,3 +317,44 @@ def test_score_all_excludes_and_surfaces_stale_reference_calls(tmp_path: Path) -
 
         assert report.count == 1
         assert excluded == {"baseline:half": 1}
+
+
+def test_score_all_reports_how_many_calls_are_independent(tmp_path: Path) -> None:
+    """Four 1h calls logged 15 minutes apart share one outcome window; the
+    scoreboard must say so instead of letting the raw count read as evidence.
+    Windows only overlap within one instrument and horizon, so ETH's call is
+    independent of BTC's even though they were made at the same moment."""
+
+    from datetime import UTC, datetime, timedelta
+
+    from andy_trader.store import Prediction, record_prediction
+
+    with connect(tmp_path / "c.db") as connection:
+        base = datetime(2026, 9, 1, tzinfo=UTC)
+        made = [(instrument, base + timedelta(minutes=15 * step))
+                for instrument, steps in (("BTC-USD", range(5)), ("ETH-USD", range(1)))
+                for step in steps]
+        for instrument, created in made:
+            record_prediction(
+                connection,
+                Prediction(
+                    predictor="baseline:eager", instrument=instrument, horizon="1h",
+                    probability_up=0.6, reference_price=100.0,
+                    created_at=created.isoformat(),
+                    resolves_at=(created + timedelta(hours=1)).isoformat(),
+                ),
+            )
+        connection.execute(
+            "UPDATE crypto_predictions SET settled_at = ?, settle_price = 101.0, "
+            "outcome_up = id % 2",
+            ((base + timedelta(days=1)).isoformat(),),
+        )
+        connection.commit()
+
+        independent: dict[str, int] = {}
+        report = score_all(connection, independent_counts=independent)["baseline:eager"]
+
+        # BTC: calls at :00, :15, :30, :45 share one window, the 01:00 call opens
+        # the next; ETH's single call is its own window.
+        assert report.count == 6
+        assert independent == {"baseline:eager": 3}
