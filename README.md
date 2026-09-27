@@ -499,10 +499,11 @@ the default half-second cadence. Token discovery is cached per five-minute marke
 share one request per sample. This covers most of each scheduled minute without a new runtime
 dependency and remains far below the documented `/books` request limit.
 
-All 51 batches are still evaluated. To prevent identical half-second polls from growing SQLite by
-nearly 300,000 rows per day, storage keeps every quote change, every tenth unchanged sample as a
-heartbeat, and the final sample. `--paper-store-every-samples 1` restores full raw persistence for a
-targeted diagnostic run. Existing evidence is never deleted or rewritten.
+All 51 batches are still evaluated. To prevent routine non-edge half-second quote churn from growing
+SQLite by nearly 300,000 rows per day, storage keeps every gross or net edge, every transition in
+edge/measurability state, every tenth ordinary sample as a heartbeat, and the final sample.
+`--paper-store-every-samples 1` restores full raw persistence for a targeted diagnostic run.
+Existing evidence is never deleted or rewritten.
 
 Every post-fee edge in that burst, including edges too small to deploy, gets an append-only attempt
 outcome. The learning report separates feed failures, vanished edges, surviving net edges, edges that

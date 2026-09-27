@@ -143,13 +143,15 @@ class CompleteSetObservation:
     unmeasurable_reason: str | None
 
 
-def _observation_quote_state(observation: CompleteSetObservation) -> tuple[object, ...]:
-    """Comparable market state, excluding the timestamp of an identical poll."""
+def _observation_storage_state(observation: CompleteSetObservation) -> tuple[object, ...]:
+    """Decision-relevant state used to compress routine non-edge quote churn."""
 
-    return tuple(
-        value
-        for name, value in vars(observation).items()
-        if name != "observed_at"
+    return (
+        observation.round_id,
+        observation.target_notional,
+        observation.mispriced,
+        observation.net_mispriced,
+        observation.unmeasurable_reason,
     )
 
 
@@ -1818,12 +1820,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     break
                 for asset, current in current_observations.items():
                     previous = last_stored.get(asset)
-                    quote_changed = previous is None or (
-                        _observation_quote_state(previous) != _observation_quote_state(current)
+                    edge_observed = current.mispriced is True or current.net_mispriced is True
+                    decision_changed = previous is None or (
+                        _observation_storage_state(previous)
+                        != _observation_storage_state(current)
                     )
                     heartbeat_due = sample_index % args.paper_store_every_samples == 0
                     final_sample = sample_index == args.paper_burst_samples
-                    if quote_changed or heartbeat_due or final_sample:
+                    if edge_observed or decision_changed or heartbeat_due or final_sample:
                         record_complete_set_observation(connection, current, commit=False)
                         last_stored[asset] = current
                         stored_observation_count += 1

@@ -1045,10 +1045,16 @@ def test_cli_burst_can_detect_and_confirm_an_edge_after_the_first_snapshot(
 def test_cli_burst_compresses_unchanged_polls_but_keeps_heartbeats_and_final(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    base = _observation("btc-updown-5m-cli-heartbeat", up_price=0.50, down_price=0.50)
     observations = iter(
         [
-            replace(base, observed_at=f"2026-09-07T00:00:0{index}+00:00")
+            replace(
+                _observation(
+                    "btc-updown-5m-cli-heartbeat",
+                    up_price=0.50 + (index * 0.001),
+                    down_price=0.50,
+                ),
+                observed_at=f"2026-09-07T00:00:0{index}+00:00",
+            )
             for index in range(6)
         ]
     )
