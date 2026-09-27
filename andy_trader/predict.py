@@ -198,7 +198,12 @@ def score_all(
     predictor's scored calls are non-overlapping within their own instrument and
     horizon. The scheduler logs a call every 15 minutes for every horizon, so a
     report's `count` can be several times the number of distinct outcomes it
-    actually rests on; the paper gate judges on the independent number.
+    actually rests on; the paper gate judges on the non-overlapping number.
+
+    Pooled across horizons and instruments this is still an UPPER bound on
+    independent evidence: a 1h and a 4h window on one coin cover the same hours,
+    and different coins move together. It removes the largest inflation (repeat
+    calls on one window), not every correlation.
     """
 
     predictors = [
@@ -356,8 +361,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(format_report(report, predictor=predictor))
             if predictor in independent:
                 print(
-                    f"  independent (non-overlapping) calls: {independent[predictor]} "
-                    f"of {report.count} scored"
+                    f"  non-overlapping calls: {independent[predictor]} of {report.count} "
+                    f"scored (an upper bound on independent evidence)"
                 )
             print()
         best = ranked[0]

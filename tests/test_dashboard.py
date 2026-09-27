@@ -172,6 +172,8 @@ def test_build_dashboard_state_survives_a_real_degenerate_scoreboard_report() ->
     state = build_dashboard_state(connection)
     report = state["scoreboard"]["model:promoted"]
     assert report["degenerate"] is True
+    # The scoreboard row carries the non-overlapping count the dashboard shows.
+    assert report["independent_count"] == 1
 
     # This must not raise -- the real historical bug was that build_dashboard_state
     # itself was fine; only json.dumps of its output silently produced invalid JSON.

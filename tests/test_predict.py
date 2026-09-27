@@ -320,10 +320,11 @@ def test_score_all_excludes_and_surfaces_stale_reference_calls(tmp_path: Path) -
 
 
 def test_score_all_reports_how_many_calls_are_independent(tmp_path: Path) -> None:
-    """Four 1h calls logged 15 minutes apart share one outcome window; the
-    scoreboard must say so instead of letting the raw count read as evidence.
-    Windows only overlap within one instrument and horizon, so ETH's call is
-    independent of BTC's even though they were made at the same moment."""
+    """Four 1h calls logged 15 minutes apart share one outcome window, and
+    score_all must say so instead of letting the raw count read as evidence.
+    Thinning happens within each (instrument, horizon): ETH's call and BTC's 4h
+    call each form their own group. (The dashboard wiring is covered in
+    test_dashboard.)"""
 
     from datetime import UTC, datetime, timedelta
 
@@ -331,17 +332,16 @@ def test_score_all_reports_how_many_calls_are_independent(tmp_path: Path) -> Non
 
     with connect(tmp_path / "c.db") as connection:
         base = datetime(2026, 9, 1, tzinfo=UTC)
-        made = [(instrument, base + timedelta(minutes=15 * step))
-                for instrument, steps in (("BTC-USD", range(5)), ("ETH-USD", range(1)))
-                for step in steps]
-        for instrument, created in made:
+        made = [("BTC-USD", "1h", base + timedelta(minutes=15 * step)) for step in range(5)]
+        made += [("ETH-USD", "1h", base), ("BTC-USD", "4h", base)]
+        for instrument, horizon, created in made:
             record_prediction(
                 connection,
                 Prediction(
-                    predictor="baseline:eager", instrument=instrument, horizon="1h",
+                    predictor="baseline:eager", instrument=instrument, horizon=horizon,
                     probability_up=0.6, reference_price=100.0,
                     created_at=created.isoformat(),
-                    resolves_at=(created + timedelta(hours=1)).isoformat(),
+                    resolves_at=(created + timedelta(hours=int(horizon[:-1]))).isoformat(),
                 ),
             )
         connection.execute(
@@ -354,7 +354,7 @@ def test_score_all_reports_how_many_calls_are_independent(tmp_path: Path) -> Non
         independent: dict[str, int] = {}
         report = score_all(connection, independent_counts=independent)["baseline:eager"]
 
-        # BTC: calls at :00, :15, :30, :45 share one window, the 01:00 call opens
-        # the next; ETH's single call is its own window.
-        assert report.count == 6
-        assert independent == {"baseline:eager": 3}
+        # BTC 1h: calls at :00, :15, :30, :45 share one window, the 01:00 call
+        # opens the next (2). ETH 1h (1) and BTC 4h (1) are separate groups.
+        assert report.count == 7
+        assert independent == {"baseline:eager": 4}

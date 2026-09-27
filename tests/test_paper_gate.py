@@ -731,12 +731,14 @@ def test_independent_calls_compares_instants_not_stored_text() -> None:
     """Rows arrive ordered by the stored string. A +08:00 stamp sorts after a
     UTC one it actually precedes, and a naive stamp (read as UTC) must not
     crash the comparison against aware ones."""
+    # Exactly the order `ORDER BY created_at` would return these strings in.
     rows = [
         {"created_at": "2026-08-01T01:00:00+00:00", "resolves_at": "2026-08-01T02:00:00+00:00"},
-        # 00:30 UTC written in Manila time: really the earliest call.
-        {"created_at": "2026-08-01T08:30:00+08:00", "resolves_at": "2026-08-01T09:30:00+08:00"},
         {"created_at": "2026-08-01T02:00:00", "resolves_at": "2026-08-01T03:00:00"},
+        # 00:30 UTC written in Manila time: sorts last as text, is really first.
+        {"created_at": "2026-08-01T08:30:00+08:00", "resolves_at": "2026-08-01T09:30:00+08:00"},
     ]
+    assert [row["created_at"] for row in rows] == sorted(row["created_at"] for row in rows)
 
     kept = independent_calls(rows)  # type: ignore[arg-type]
 

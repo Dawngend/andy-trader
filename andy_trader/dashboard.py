@@ -448,7 +448,7 @@ _PAGE = """<!doctype html>
     <div class="card">
       <h2>Scoreboard (Brier skill vs. base rate)</h2>
       <p class="updated" id="score-quality"></p>
-      <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon: the number of distinct outcomes the score rests on">Independent</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
+      <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon. Still an upper bound on independent evidence: a 1h and a 4h window on one coin cover the same hours, and coins move together.">Non-overlapping</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Model Registry (CT-07)</h2>
