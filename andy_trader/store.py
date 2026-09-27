@@ -373,27 +373,62 @@ def close_price_at(
     Returns (price, note). A None price means the store cannot settle this yet,
     which is a legitimate state and must not be filled with the nearest guess
     from outside the tolerance window.
+
+    The bar is the one whose open_time is nearest `at_iso`. That bar is often
+    still forming when a mid-hour call falls due, and the store keeps every
+    snapshot of it (each changed close is a new row). Which snapshot settles
+    the call matters: measured on the live store 2026-09-28, choosing among
+    them by `times_seen` alone -- a tie between one-off snapshots -- settled
+    58% of 1h calls on a price captured BEFORE the call resolved, a median 15
+    and up to 45 minutes early, silently scoring a shorter horizon than the one
+    predicted. So the snapshot used is the earliest one captured at or after
+    `at_iso`. If none exists yet and the bar is still open at `at_iso`, the
+    call waits for the next collection rather than settling early. Only a bar
+    that had already closed by `at_iso` falls back to its most-confirmed close,
+    since no later price for it can ever arrive.
     """
 
     target = datetime.fromisoformat(at_iso)
     window = timedelta(minutes=tolerance_minutes)
     low = (target - window).isoformat()
     high = (target + window).isoformat()
-    row = connection.execute(
+    rows = connection.execute(
         """
-        SELECT open_time, close, venue,
+        SELECT open_time, close, venue, times_seen, first_seen_at,
                ABS(JULIANDAY(open_time) - JULIANDAY(?)) AS distance
         FROM crypto_observations
         WHERE instrument = ? AND interval = ? AND degraded = 0 AND close IS NOT NULL
           AND open_time BETWEEN ? AND ?
         ORDER BY distance ASC, times_seen DESC
-        LIMIT 1
         """,
         (at_iso, instrument, interval, low, high),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if not rows:
         return None, f"no non-degraded {interval} close within {tolerance_minutes}m of {at_iso}"
+
+    bar_open = rows[0]["open_time"]
+    snapshots = [row for row in rows if row["open_time"] == bar_open]
+    target_utc = _as_utc(target)
+    after = [row for row in snapshots if _as_utc(datetime.fromisoformat(row["first_seen_at"])) >= target_utc]
+    if after:
+        row = min(
+            after,
+            key=lambda r: (_as_utc(datetime.fromisoformat(r["first_seen_at"])), -int(r["times_seen"]), r["venue"]),
+        )
+    elif _as_utc(datetime.fromisoformat(bar_open)) + horizon_delta(interval) <= target_utc:
+        row = snapshots[0]  # already ordered by times_seen DESC
+    else:
+        return None, (
+            f"{interval} bar at {bar_open} has no price captured at or after {at_iso} yet; "
+            f"waiting rather than settling on an earlier snapshot"
+        )
     return float(row["close"]), f"{row['venue']} {interval} close at {row['open_time']}"
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """Naive timestamps are UTC by this store's convention; aware ones are converted."""
+
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
 def settle_due_predictions(

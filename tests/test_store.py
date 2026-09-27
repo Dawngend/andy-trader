@@ -154,6 +154,61 @@ def test_close_price_respects_the_tolerance_window(tmp_path: Path) -> None:
         assert price is None
 
 
+def _snapshots(connection, open_time: str, seen: dict[float, str]) -> None:
+    """Store several snapshots of one still-forming bar, each with the moment it
+    was captured. record_observations stamps the real clock, so the capture
+    time is set afterwards to what the scenario needs."""
+
+    for close, first_seen_at in seen.items():
+        record_observations(connection, [_candle(open_time=open_time, close=close)])
+        connection.execute(
+            "UPDATE crypto_observations SET first_seen_at = ? WHERE open_time = ? AND close = ?",
+            (first_seen_at, open_time, close),
+        )
+    connection.commit()
+
+
+def test_settlement_uses_the_first_price_captured_at_or_after_the_resolve_time(tmp_path: Path) -> None:
+    """The live defect, 2026-09-28: snapshots of a forming bar all have
+    times_seen = 1, so the old tie-break picked one arbitrarily, and 58% of 1h
+    calls settled on a price captured before they resolved."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {
+            101.0: "2026-09-04T01:02:00+00:00",
+            102.0: "2026-09-04T01:17:30+00:00",
+            103.0: "2026-09-04T01:32:00+00:00",
+        })
+
+        exact, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:17:00+00:00")
+        between, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:10:00+00:00")
+
+        assert exact == 102.0
+        assert between == 102.0
+
+
+def test_settlement_waits_when_a_forming_bar_has_only_earlier_prices(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {101.0: "2026-09-04T01:02:00+00:00"})
+
+        price, note = close_price_at(connection, "BTC-USD", "2026-09-04T01:17:00+00:00")
+
+        assert price is None
+        assert "waiting" in note
+
+
+def test_a_bar_that_closed_before_the_resolve_time_still_settles(tmp_path: Path) -> None:
+    """No later price for a finished bar can ever arrive, so waiting would leave
+    the call unsettled forever; its most-confirmed close is used."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T00:00:00+00:00", {100.0: "2026-09-04T00:59:00+00:00"})
+
+        price, _ = close_price_at(connection, "BTC-USD", "2026-09-04T01:20:00+00:00")
+
+        assert price == 100.0
+
+
 def test_settlement_marks_up_and_down_correctly(tmp_path: Path) -> None:
     with connect(tmp_path / "c.db") as connection:
         record_observations(
