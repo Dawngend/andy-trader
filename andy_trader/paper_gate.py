@@ -53,12 +53,26 @@ exact same bar as the lifetime one. A predictor can pass on paper forever
 while its last hundred calls have already gone cold, and the two checks catch
 different failures -- lifetime average and recent trend are not the same
 claim, the same way statistical skill and economic profit were not.
+
+A FOURTH gap, found 2026-09-28 by measuring realized net return per call:
+`baseline:random` on AVAX-USD at 1d showed +304bps net per call with a
+t-statistic of 15, which is impossible for a coin flip. The cause is overlap.
+The scheduler logs a fresh call every 15 minutes for every horizon, so one 1d
+window holds ~96 calls that all settle on nearly the same price move. Counting
+them as 96 pieces of evidence let a trending market pass as skill: the random
+predictor's 1,039 "settled calls" were 17 independent days. At 1h the same
+cadence gives four calls per window (BTC-USD momentum: 1,255 logged, 280
+independent). The gate now counts, scores and windows only NON-OVERLAPPING
+calls -- each one starting at or after the previous one's resolution -- so the
+200-call minimum means 200 separate outcomes, as it always claimed to.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 import sqlite3
+from typing import Sequence
 
 from andy_trader.calibration import CalibrationError, evaluate
 from andy_trader.economics import DEFAULT_ROUND_TRIP_BPS, evaluate_horizon
@@ -88,6 +102,27 @@ def _observation_interval_for(horizon: str) -> str:
     return "1m" if horizon in FAST_HORIZONS else horizon
 
 
+def independent_calls(rows: Sequence[sqlite3.Row]) -> list[sqlite3.Row]:
+    """The settled calls whose forecast windows do not overlap.
+
+    Walks the calls in creation order and keeps one only if it was made at or
+    after the previous kept call resolved. Calls made inside a window that is
+    already being measured settle on (nearly) the same price move, so they add
+    repetitions of one outcome, not new evidence. Greedy earliest-first keeps
+    the largest possible set of disjoint windows when every window has the same
+    length, which is the case within one horizon.
+    """
+
+    kept: list[sqlite3.Row] = []
+    window_end: datetime | None = None
+    for row in rows:
+        created = datetime.fromisoformat(row["created_at"])
+        if window_end is None or created >= window_end:
+            kept.append(row)
+            window_end = datetime.fromisoformat(row["resolves_at"])
+    return kept
+
+
 @dataclass(frozen=True)
 class EligibilityVerdict:
     """Whether a predictor has earned the right to open new paper positions."""
@@ -103,6 +138,9 @@ class EligibilityVerdict:
     recent_sample_size: int | None = None
     recent_brier_skill_score: float | None = None
     recent_hit_rate: float | None = None
+    # Every settled call logged, overlapping ones included. `sample_size` is the
+    # independent subset the verdict actually rests on.
+    logged_calls: int | None = None
 
 
 def evaluate_paper_eligibility(
@@ -120,18 +158,49 @@ def evaluate_paper_eligibility(
     Judged per instrument, not per predictor, because "works on BTC" and "works
     on DOGE" are different claims and a predictor that is carried by one
     instrument should not get to trade the other seven on its reputation.
+
+    Only non-overlapping calls count as evidence (see `independent_calls`).
     """
 
-    rows = fetch_settled(
+    logged = fetch_settled(
         connection, predictor=predictor, instrument=instrument, horizon=horizon
     )
+    verdict = _judge(
+        connection,
+        independent_calls(logged),
+        logged_calls=len(logged),
+        predictor=predictor,
+        instrument=instrument,
+        horizon=horizon,
+        minimum_calls=minimum_calls,
+        round_trip_bps=round_trip_bps,
+        recent_window=recent_window,
+    )
+    return replace(verdict, logged_calls=len(logged))
+
+
+def _judge(
+    connection: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    *,
+    logged_calls: int,
+    predictor: str,
+    instrument: str,
+    horizon: str,
+    minimum_calls: int,
+    round_trip_bps: float,
+    recent_window: int,
+) -> EligibilityVerdict:
+    """The verdict on an already-deduplicated, time-ordered set of calls."""
+
     sample_size = len(rows)
     if sample_size < minimum_calls:
         return EligibilityVerdict(
             eligible=False,
             reason=(
-                f"only {sample_size} settled {horizon} calls for {predictor} on "
-                f"{instrument}; needs {minimum_calls} before its score means anything"
+                f"only {sample_size} independent settled {horizon} calls for {predictor} "
+                f"on {instrument} ({logged_calls} logged; calls inside one forecast window "
+                f"share its outcome); needs {minimum_calls} before its score means anything"
             ),
             predictor=predictor,
             instrument=instrument,
@@ -210,14 +279,25 @@ def evaluate_paper_eligibility(
         )
 
     if report.hit_rate < econ.break_even_win_rate:
+        if econ.break_even_win_rate >= 1.0:
+            # A "needed" hit rate above 100% reads as a typo; say what it means.
+            shortfall = (
+                f"this horizon's {econ.average_move_bps:.1f}bps average move is no bigger "
+                f"than the {econ.round_trip_bps:.0f}bps round trip, so no hit rate covers "
+                f"costs -- even calling every move right would lose money"
+            )
+        else:
+            shortfall = (
+                f"its {report.hit_rate:.1%} hit rate is below the "
+                f"{econ.break_even_win_rate:.1%} needed to cover a {econ.round_trip_bps:.0f}bps "
+                f"round trip against this horizon's {econ.average_move_bps:.1f}bps average move"
+            )
         return EligibilityVerdict(
             eligible=False,
             reason=(
                 f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
-                f"skill) but its {report.hit_rate:.1%} hit rate is below the "
-                f"{econ.break_even_win_rate:.1%} needed to cover a {econ.round_trip_bps:.0f}bps "
-                f"round trip against this horizon's {econ.average_move_bps:.1f}bps average move -- "
-                f"statistically better than guessing is not the same as economically profitable"
+                f"skill, {report.hit_rate:.1%} hit rate) but {shortfall} -- statistically "
+                f"better than guessing is not the same as economically profitable"
             ),
             predictor=predictor,
             instrument=instrument,
@@ -316,7 +396,7 @@ def evaluate_paper_eligibility(
             reason=(
                 f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
                 f"lifetime skill) AND its {report.hit_rate:.1%} hit rate clears the "
-                f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} calls -- "
+                f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} independent calls -- "
                 f"AND its most recent {recent_window} calls independently confirm this "
                 f"({recent_report.brier_skill_score:+.4f} skill, {recent_report.hit_rate:.1%} hit rate)"
             ),
@@ -336,7 +416,7 @@ def evaluate_paper_eligibility(
         reason=(
             f"{predictor} on {instrument} beats the base rate ({report.brier_skill_score:+.4f} "
             f"skill) AND its {report.hit_rate:.1%} hit rate clears the "
-            f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} calls"
+            f"{econ.break_even_win_rate:.1%} needed to cover costs, over {sample_size} independent calls"
         ),
         predictor=predictor,
         instrument=instrument,
@@ -407,8 +487,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         ).fetchall()
 
     print(
-        f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} {'skill':>9} "
-        f"{'hit':>7} {'need':>7} {'recent':>9}  verdict"
+        f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} {'logged':>7} "
+        f"{'skill':>9} {'hit':>7} {'need':>7} {'recent':>9}  verdict"
     )
     allowed = 0
     for row in pairs:
@@ -426,11 +506,12 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             else "--"
         )
         hit = f"{verdict.hit_rate:.1%}" if verdict.hit_rate is not None else "--"
-        need = (
-            f"{verdict.break_even_win_rate:.1%}"
-            if verdict.break_even_win_rate is not None
-            else "--"
-        )
+        if verdict.break_even_win_rate is None:
+            need = "--"
+        elif verdict.break_even_win_rate >= 1.0:
+            need = "never"  # cost >= average move: no hit rate breaks even
+        else:
+            need = f"{verdict.break_even_win_rate:.1%}"
         recent = (
             f"{verdict.recent_brier_skill_score:+.4f}"
             if verdict.recent_brier_skill_score is not None
@@ -440,9 +521,12 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         allowed += 1 if verdict.eligible else 0
         print(
             f"{row['predictor']:<28} {row['instrument']:<11} {row['horizon']:>7} "
-            f"{verdict.sample_size:>5} {skill:>9} {hit:>7} {need:>7} {recent:>9}  {mark}"
+            f"{verdict.sample_size:>5} {verdict.logged_calls or 0:>7} {skill:>9} {hit:>7} "
+            f"{need:>7} {recent:>9}  {mark}"
         )
     print(f"\n{allowed} pair(s) currently allowed to open new positions.")
+    print("(n = independent, non-overlapping settled calls the verdict rests on; "
+          "logged = every settled call, overlapping ones included)")
     print(f"(recent = Brier skill over the most recent {DEFAULT_RECENT_WINDOW} calls only, "
           "checked independently of the lifetime average)")
 

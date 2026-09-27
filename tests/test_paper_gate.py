@@ -7,6 +7,7 @@ from andy_trader.paper_gate import (
     DEFAULT_RECENT_WINDOW,
     MINIMUM_SETTLED_CALLS,
     evaluate_paper_eligibility,
+    independent_calls,
 )
 from andy_trader.portfolio import paper_trade_once
 from andy_trader.store import (
@@ -591,3 +592,112 @@ def test_an_open_position_can_still_be_closed_after_the_gate_shuts() -> None:
     assert attempt.skipped_reason is None, attempt.skipped_reason
     assert attempt.trade is not None
     assert attempt.trade.side == "flat"
+
+
+def _spaced_calls(
+    connection: sqlite3.Connection,
+    *,
+    predictor: str,
+    count: int,
+    spacing: timedelta,
+    instrument: str = "BTC-USD",
+) -> None:
+    """Confident, correct 1h calls made every `spacing`, settled on alternating outcomes."""
+
+    base = datetime(2026, 8, 1, tzinfo=UTC)
+    for index in range(count):
+        created = base + index * spacing
+        record_prediction(
+            connection,
+            Prediction(
+                predictor=predictor, instrument=instrument, horizon="1h",
+                probability_up=0.9 if index % 2 == 0 else 0.1, reference_price=100.0,
+                created_at=created.isoformat(),
+                resolves_at=(created + timedelta(hours=1)).isoformat(),
+            ),
+        )
+    connection.execute(
+        """
+        UPDATE crypto_predictions
+        SET settled_at = ?, settle_price = 100.0,
+            outcome_up = CASE WHEN (id % 2) = 1 THEN 1 ELSE 0 END
+        WHERE predictor = ? AND settled_at IS NULL
+        """,
+        (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), predictor),
+    )
+    connection.commit()
+
+
+def test_calls_inside_one_forecast_window_are_one_piece_of_evidence() -> None:
+    """The fourth gap, found 2026-09-28: the scheduler logs a call every 15
+    minutes for every horizon, so four 1h calls share one outcome window. Live,
+    baseline:random on AVAX-USD at 1d showed a t-statistic of 15 from 1,039
+    "settled calls" that were only 17 independent days. Overlapping calls must
+    not be allowed to fill the 200-call minimum on their own."""
+    connection = _conn()
+    _price_history(connection)
+    logged = 4 * (MINIMUM_SETTLED_CALLS - 1)
+    _spaced_calls(connection, predictor="baseline:eager", count=logged, spacing=timedelta(minutes=15))
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:eager", instrument="BTC-USD"
+    )
+
+    assert not verdict.eligible
+    assert verdict.logged_calls == logged
+    assert verdict.sample_size == MINIMUM_SETTLED_CALLS - 1
+    assert "independent" in verdict.reason and f"{logged} logged" in verdict.reason
+
+
+def test_calls_a_full_window_apart_all_count() -> None:
+    connection = _conn()
+    _price_history(connection)
+    _spaced_calls(
+        connection, predictor="baseline:patient", count=MINIMUM_SETTLED_CALLS,
+        spacing=timedelta(hours=1),
+    )
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:patient", instrument="BTC-USD"
+    )
+
+    assert verdict.sample_size == verdict.logged_calls == MINIMUM_SETTLED_CALLS
+    assert verdict.eligible, verdict.reason
+
+
+def test_independent_calls_keeps_only_disjoint_windows() -> None:
+    def call(start_minute: int, length_minutes: int = 60) -> dict[str, str]:
+        start = datetime(2026, 8, 1, tzinfo=UTC) + timedelta(minutes=start_minute)
+        return {
+            "created_at": start.isoformat(),
+            "resolves_at": (start + timedelta(minutes=length_minutes)).isoformat(),
+        }
+
+    rows = [call(0), call(15), call(59), call(60), call(61), call(130)]
+    kept = independent_calls(rows)  # type: ignore[arg-type]
+
+    # A call made exactly when the previous window resolves is independent.
+    assert [row["created_at"] for row in kept] == [
+        rows[0]["created_at"], rows[3]["created_at"], rows[5]["created_at"]
+    ]
+
+
+def test_costs_larger_than_the_average_move_are_explained_not_quoted_as_a_percentage() -> None:
+    """Live, the fast strategy was blocked with "90.5% hit rate is below the
+    550.5% needed": the right decision, stated as an impossible number. When
+    the round trip is at least the average move, no hit rate can pay for it."""
+    connection = _conn()
+    _price_history(connection)  # ~200bps average 1h move
+    _spaced_calls(
+        connection, predictor="baseline:sharp", count=MINIMUM_SETTLED_CALLS,
+        spacing=timedelta(hours=1),
+    )
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:sharp", instrument="BTC-USD", round_trip_bps=500.0
+    )
+
+    assert not verdict.eligible
+    assert verdict.break_even_win_rate is not None and verdict.break_even_win_rate > 1.0
+    assert "even calling every move right would lose money" in verdict.reason
+    assert f"{verdict.break_even_win_rate:.1%}" not in verdict.reason
