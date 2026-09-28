@@ -495,7 +495,7 @@ _PAGE = """<!doctype html>
     <div class="card">
       <h2>Scoreboard (Brier skill vs. base rate)</h2>
       <p class="updated" id="score-quality"></p>
-      <p class="updated" id="settle-quality" title="Each call settles on the first price captured at or after its resolve time. Lag is how long after that time the price was captured."></p>
+      <p class="updated" id="settle-quality" title="Each call settles on the first price captured at or after its resolve time. Only when no such price can arrive any more does it fall back to the latest earlier one (counted as fallback). Lag is how long after the resolve time the price was captured."></p>
       <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon. Still an upper bound on independent evidence: a 1h and a 4h window on one coin cover the same hours, and coins move together.">Non-overlapping</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
