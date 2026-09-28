@@ -207,8 +207,8 @@ def test_settlement_falls_back_only_after_the_grace_period(tmp_path: Path) -> No
         })
         at = "2026-09-04T01:17:00+00:00"
 
-        # Still inside the refetch window (500 hourly bars): keep waiting.
-        early, _ = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-10T00:00:00+00:00")
+        # Still inside the 200-hour refetch window: keep waiting.
+        early, _ = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-12T00:00:00+00:00")
         late, note = close_price_at(connection, "BTC-USD", at, now_iso="2026-10-01T00:00:00+00:00")
 
         assert early is None
@@ -257,13 +257,14 @@ def test_capture_stamps_are_stored_as_utc_so_later_really_means_later(tmp_path: 
 
 
 def test_fallback_grace_follows_each_series_refetch_depth_and_is_capped() -> None:
-    """From Codex's fourth review: a flat 500-bar grace kept 1h calls pending
-    ~21 days and would keep 1d calls ~500 days."""
+    """From Codex's fourth and fifth reviews: a flat 500-bar grace kept 1h calls
+    pending ~21 days, and a 7-day cap cut off Bybit's 200-hour refetch window.
+    Hourly waits exactly as long as a bar can still be refetched."""
 
     from andy_trader.store import SETTLEMENT_MAX_GRACE, settlement_fallback_grace
 
     assert settlement_fallback_grace("1m") == timedelta(minutes=500)
-    assert settlement_fallback_grace("1h") == SETTLEMENT_MAX_GRACE == timedelta(days=7)
+    assert settlement_fallback_grace("1h") == SETTLEMENT_MAX_GRACE == timedelta(hours=200)
     assert settlement_fallback_grace("1d") == SETTLEMENT_MAX_GRACE
 
 

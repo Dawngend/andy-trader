@@ -382,11 +382,12 @@ SETTLEMENT_REFETCH_BARS: Mapping[str, int] = {"1m": 500}
 # Hourly and slower series come from TradingView (TRADINGVIEW_BARS, default
 # 120) and Bybit (200 per request); the deeper of the two sets the depth.
 DEFAULT_SETTLEMENT_REFETCH_BARS = 200
-# A call left without a price for more than a week is an incident to fix, not
-# something settlement should wait out: without a cap a 1d series would wait
-# ~200 days. Codex's fourth review found the uncapped 500-bar grace kept 1h
-# calls pending ~21 days.
-SETTLEMENT_MAX_GRACE = timedelta(days=7)
+# Cap for slower series, where interval x bars would run to months (a 1d series
+# ~200 days). It equals the deepest hourly refetch (Bybit's 200 hourly bars),
+# since settlement runs against hourly bars: a 7-day cap fell short of that
+# window (Codex's fifth review), and the uncapped 500-bar grace kept 1h calls
+# pending ~21 days (fourth review).
+SETTLEMENT_MAX_GRACE = timedelta(hours=DEFAULT_SETTLEMENT_REFETCH_BARS)
 
 
 def settlement_fallback_grace(interval: str) -> timedelta:
