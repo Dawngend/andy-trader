@@ -19,7 +19,7 @@ matching the rest of the project.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -101,6 +101,49 @@ def _pending_overdue(connection: sqlite3.Connection, now_iso: str) -> int:
         (now_iso,),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def _settlement_quality(connection: sqlite3.Connection, now: datetime) -> dict[str, object]:
+    """How the last 24 hours of settlements were made.
+
+    Settlement now uses the first price captured at or after each call's
+    resolve time and records that price moment in `settle_note`. This reads it
+    back so a degrading collector shows up here -- lags creeping towards the
+    tolerance, or the earlier-price fallback firing -- instead of silently
+    shortening or lengthening every horizon, which is what happened before
+    2026-09-28 (58% of 1h calls were settled on an earlier price).
+    """
+
+    since = (now - timedelta(hours=24)).isoformat()
+    rows = connection.execute(
+        "SELECT resolves_at, settle_note FROM crypto_predictions WHERE settled_at >= ?",
+        (since,),
+    ).fetchall()
+    lags: list[float] = []
+    fallback = legacy = 0
+    for row in rows:
+        note = row["settle_note"] or ""
+        if " price as of " not in note:
+            legacy += 1
+            continue
+        if "latest price before" in note:
+            fallback += 1
+            continue
+        stamp = note.split(" price as of ", 1)[1].split(" ", 1)[0].rstrip(",")
+        try:
+            moment = datetime.fromisoformat(stamp)
+            lags.append((moment - datetime.fromisoformat(row["resolves_at"])).total_seconds() / 60.0)
+        except ValueError:
+            legacy += 1
+    lags.sort()
+    return {
+        "settled": len(rows),
+        "fallback": fallback,
+        "legacy_notes": legacy,
+        "early": sum(1 for lag in lags if lag < 0),
+        "median_lag_minutes": lags[len(lags) // 2] if lags else None,
+        "max_lag_minutes": lags[-1] if lags else None,
+    }
 
 
 def _recent_predictions(connection: sqlite3.Connection) -> list[dict[str, object]]:
@@ -378,6 +421,7 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
         "recent_predictions": _recent_predictions(connection),
         "scoreboard": scoreboard,
         "score_exclusions": score_exclusions,
+        "settlement_quality": _settlement_quality(connection, now),
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
         "portfolio_summary": _portfolio_summary(connection),
@@ -448,6 +492,7 @@ _PAGE = """<!doctype html>
     <div class="card">
       <h2>Scoreboard (Brier skill vs. base rate)</h2>
       <p class="updated" id="score-quality"></p>
+      <p class="updated" id="settle-quality" title="Each call settles on the first price captured at or after its resolve time. Lag is how long after that time the price was captured."></p>
       <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon. Still an upper bound on independent evidence: a 1h and a 4h window on one coin cover the same hours, and coins move together.">Non-overlapping</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
@@ -815,6 +860,19 @@ async function refresh() {
     const sbBody = document.querySelector("#scoreboard tbody");
     sbBody.innerHTML = "";
     const excluded = Object.values(s.score_exclusions).reduce((a, b) => a + b, 0);
+    const sq = s.settlement_quality || {};
+    const settleLine = document.getElementById("settle-quality");
+    if (!sq.settled) {
+      settleLine.textContent = "Settlement (24h): nothing settled yet";
+      settleLine.className = "updated muted";
+    } else {
+      const lag = sq.median_lag_minutes == null ? "n/a"
+        : "median +" + sq.median_lag_minutes.toFixed(1) + " min, max +" + sq.max_lag_minutes.toFixed(1) + " min after resolve";
+      settleLine.textContent = "Settlement (24h): " + sq.settled + " settled, " + lag
+        + ", " + sq.fallback + " fallback, " + sq.early + " early"
+        + (sq.legacy_notes ? ", " + sq.legacy_notes + " under the old rule" : "");
+      settleLine.className = "updated " + ((sq.fallback || sq.early) ? "warn" : "ok");
+    }
     document.getElementById("score-quality").textContent = excluded
       ? excluded + " stale-reference calls excluded by the 90m quality gate"
       : "No stale-reference calls excluded";

@@ -180,6 +180,40 @@ def test_build_dashboard_state_survives_a_real_degenerate_scoreboard_report() ->
     json.dumps(_json_safe(state))
 
 
+def test_settlement_quality_reads_back_the_price_moment_each_call_used() -> None:
+    """The dashboard shows how settlements were made, so a collector that starts
+    delivering late prices or tripping the fallback is visible."""
+    from andy_trader.dashboard import _settlement_quality
+
+    connection = _conn()
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
+    notes = [
+        ("2026-09-28T10:00:00+00:00", "tv 1h close at 2026-09-28T10:00:00+00:00, price as of 2026-09-28T10:02:00+00:00"),
+        ("2026-09-28T10:15:00+00:00", "tv 1h close at 2026-09-28T10:00:00+00:00, price as of 2026-09-28T10:17:00+00:00"),
+        ("2026-09-28T10:30:00+00:00", "tv 1h close at 2026-09-28T10:00:00+00:00, price as of 2026-09-28T10:40:00+00:00"),
+        ("2026-09-28T09:30:00+00:00", "tv 1h close at 2026-09-28T09:00:00+00:00, price as of "
+                                      "2026-09-28T09:20:00+00:00 (latest price before 2026-09-28T09:30:00+00:00; "
+                                      "nothing was captured after it)"),
+        ("2026-09-28T08:00:00+00:00", "kraken 1h close at 2026-09-28T08:00:00+00:00"),
+    ]
+    for index, (resolves_at, note) in enumerate(notes):
+        connection.execute(
+            "INSERT INTO crypto_predictions (predictor, instrument, horizon, probability_up, reference_price, "
+            "mode, features_json, created_at, resolves_at, settled_at, settle_price, outcome_up, settle_note) "
+            "VALUES ('baseline:x', 'BTC-USD', '1h', 0.5, 100, 'live', '{}', ?, ?, ?, 100, 1, ?)",
+            (f"2026-09-28T0{index}:00:00+00:00", resolves_at, "2026-09-28T11:00:00+00:00", note),
+        )
+
+    quality = _settlement_quality(connection, now)
+
+    assert quality["settled"] == 5
+    assert quality["fallback"] == 1
+    assert quality["legacy_notes"] == 1
+    assert quality["early"] == 0
+    assert quality["median_lag_minutes"] == 2.0
+    assert quality["max_lag_minutes"] == 10.0
+
+
 def test_registry_shows_a_demoted_model_as_demoted_not_still_promoted() -> None:
     """The original promotion row is an honest historical fact and must never
     be rewritten -- but the dashboard still needs to show that a later,
