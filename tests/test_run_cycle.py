@@ -76,6 +76,64 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     assert all(value >= 0 for value in elapsed)
 
 
+def _bybit_signal_request(monkeypatch, tmp_path: Path, *, bybit_price_ok: bool) -> tuple[bool, dict]:
+    """Run one cycle with Bybit in the venue list and report whether its signals were requested."""
+
+    def fake_collect(*, instruments, intervals, venues, settings):
+        del settings
+        stamp = datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+        rows = [Candle(instrument=instruments[0], venue="tradingview", interval=intervals[0],
+                       open_time=stamp, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0)]
+        if "bybit" in venues:
+            rows.append(Candle(
+                instrument=instruments[0], venue="bybit", interval=intervals[0], open_time=stamp,
+                open=100.0 if bybit_price_ok else None, high=101.0 if bybit_price_ok else None,
+                low=99.0 if bybit_price_ok else None, close=100.0 if bybit_price_ok else None,
+                volume=1.0 if bybit_price_ok else None, degraded=not bybit_price_ok,
+                degraded_reason=None if bybit_price_ok else "untrusted certificate",
+            ))
+        return rows, []
+
+    requested: list[bool] = []
+
+    def fake_collect_signals(instruments, *, http, include_bybit):
+        del instruments, http
+        requested.append(include_bybit)
+        return [], []
+
+    journal = tmp_path / "cycle.jsonl"
+    monkeypatch.setattr(run_cycle, "collect", fake_collect)
+    monkeypatch.setattr(run_cycle, "collect_signals", fake_collect_signals)
+    monkeypatch.setattr(run_cycle, "CYCLE_LOG_PATH", journal)
+    monkeypatch.setattr(run_cycle, "default_database_path", lambda: tmp_path / "c.db")
+    monkeypatch.setattr(run_cycle, "load_env_file", lambda _path: None)
+
+    assert run_cycle.main(
+        ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
+         "--venues", "tradingview,bybit", "--quiet"]
+    ) == 0
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    signals_entry = next(entry for entry in entries if entry["event"] == "signals_collected")
+    return requested[0], signals_entry
+
+
+def test_bybit_signals_are_skipped_when_every_bybit_price_failed(monkeypatch, tmp_path: Path) -> None:
+    """The hourly re-probe of a blocked Bybit used to log 24 failed prices AND
+    24 failed signals: the same blocked domain, counted twice."""
+
+    requested, entry = _bybit_signal_request(monkeypatch, tmp_path, bybit_price_ok=False)
+
+    assert requested is False
+    assert entry["bybit_enabled"] is True and entry["bybit_signals"] is False
+
+
+def test_bybit_signals_are_still_collected_when_bybit_prices_work(monkeypatch, tmp_path: Path) -> None:
+    requested, entry = _bybit_signal_request(monkeypatch, tmp_path, bybit_price_ok=True)
+
+    assert requested is True
+    assert entry["bybit_signals"] is True
+
+
 def _fake_price_collect(*, instruments, intervals, venues, settings):
     del venues, settings
     return [

@@ -137,6 +137,24 @@ def _venues_with_probe_backoff(
     return tuple(effective), tuple(backed_off)
 
 
+def _bybit_prices_usable(candles: Sequence[object]) -> bool:
+    """Whether this cycle got at least one usable Bybit price.
+
+    Bybit's positioning signals share the price endpoints' domain, and the
+    usual failure here (the ISP's forged-certificate block) takes out both.
+    During the hourly re-probe of a backed-off Bybit, asking for its 24 signal
+    series after every price request has already failed only doubles the
+    "degraded" count of that cycle without any chance of new data.
+    """
+
+    return any(
+        getattr(candle, "venue", None) == "bybit"
+        and not getattr(candle, "degraded", True)
+        and getattr(candle, "close", None) is not None
+        for candle in candles
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     global _RUN_ID, _RUN_STARTED
 
@@ -283,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         signals: list = []
         signal_problems: list = []
+        bybit_signals = "bybit" in venues and _bybit_prices_usable(candles)
         if not args.skip_signals:
             # Funding updates 8-hourly and Fear and Greed daily, so most cycles
             # re-observe unchanged values. That is deliberately cheap: the
@@ -291,7 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             signals, signal_problems = collect_signals(
                 instruments,
                 http=lambda url: _http_json(url, settings),
-                include_bybit="bybit" in venues,
+                include_bybit=bybit_signals,
             )
         _journal(
             "signals_collected",
@@ -299,6 +318,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             problems=len(signal_problems),
             problem_details=signal_problems,
             bybit_enabled="bybit" in venues,
+            bybit_signals=bybit_signals,
         )
 
         paper_trade_results: list[dict[str, object]] = []
