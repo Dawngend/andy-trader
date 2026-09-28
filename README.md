@@ -558,6 +558,16 @@ paper trades with no non-profitable settlement, an authenticated execution adapt
 handling for a one-leg-filled / one-leg-failed event. Meeting those minimums would permit a new
 review. It would not guarantee profit.
 
+**Where it stands (2026-09-28).** Over 12 collection days and 2,152 rounds, 22 rounds were below
+$1 after fees: about 1%. Every one of the nine net edges that reached the re-quote step was gone
+when the second synchronized quote arrived 0.8 to 1.2 seconds later; the re-quoted all-in cost was
+$1.018 to $1.109 every time, including an edge first seen at $0.806. All nine shadow trials settled
+at the re-quoted price lost money (-$3.63 in total). So at this system's roughly one-second
+execution latency, the mispricings it can see do not last long enough to be bought, and the
+readiness gate's hundred confirmed trades cannot accumulate. Closing that gap would take a
+different system (sub-second, co-located execution), not more of this one; the research path is
+effectively closed rather than merely waiting for data.
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
