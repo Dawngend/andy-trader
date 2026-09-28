@@ -299,7 +299,8 @@ def record_observations(
              volume, degraded, degraded_reason, first_seen_at, last_seen_at, times_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(content_hash) DO UPDATE SET
-                last_seen_at = excluded.last_seen_at,
+                -- never backwards: an out-of-order refetch must not erase later evidence
+                last_seen_at = MAX(crypto_observations.last_seen_at, excluded.last_seen_at),
                 times_seen = crypto_observations.times_seen + 1
             """,
             (
@@ -370,11 +371,18 @@ def record_prediction(connection: sqlite3.Connection, prediction: Prediction) ->
     return int(existing["id"])
 
 
-# How long settlement keeps waiting for a price at or after the resolve time
-# before falling back to the latest earlier one. Collectors refetch history
-# (120 hourly bars, 500 one-minute bars ~ 8.3h), so a bar missed during an
-# outage usually arrives on recovery; 6h stays inside the shortest of those.
-SETTLEMENT_FALLBACK_GRACE = timedelta(hours=6)
+# How many bars of history a collector can still refetch: Binance 1m klines use
+# limit=500 and TRADINGVIEW_BARS is capped at 500. Until a resolve time is that
+# far in the past, a bar missed during an outage can still arrive on recovery,
+# so settlement keeps waiting rather than falling back to an earlier price.
+# Codex's review showed a fixed 6h grace fell inside the 1m refetch window.
+SETTLEMENT_REFETCH_BARS = 500
+
+
+def settlement_fallback_grace(interval: str) -> timedelta:
+    """How long past the tolerance a call waits before the earlier-price fallback."""
+
+    return horizon_delta(interval) * SETTLEMENT_REFETCH_BARS
 
 
 def price_moments(row: Mapping[str, object], interval: str) -> tuple[datetime, ...]:
@@ -384,8 +392,10 @@ def price_moments(row: Mapping[str, object], interval: str) -> tuple[datetime, .
     again, last at `last_seen_at`; the same close held at both. A bar's close
     is the price at the bar's END, so a capture after the bar closed speaks for
     the end time, not the fetch time -- which is what makes a completed bar
-    fetched late (after an outage) settle correctly. A capture can also not
-    precede the bar's open; a clock-skewed or future-dated bar is clamped.
+    fetched late (after an outage) settle correctly. A capture from before the
+    bar even opened (a future-dated venue bar, or clock skew) is not evidence of
+    anything and is dropped, not clamped: clamping would invent a price at the
+    bar's open that nobody observed.
 
     Capture stamps are written when the whole collection pass ends, so they
     can trail the real fetch by the length of the pass (about a minute live):
@@ -399,7 +409,8 @@ def price_moments(row: Mapping[str, object], interval: str) -> tuple[datetime, .
         stamp = row[column]
         if stamp:
             captured = _as_utc(datetime.fromisoformat(str(stamp)))
-            moments.add(min(max(captured, bar_open), bar_end))
+            if captured >= bar_open:
+                moments.add(min(captured, bar_end))
     return tuple(sorted(moments))
 
 
@@ -429,11 +440,10 @@ def close_price_at(
     02:00 bar's first price comes later.
 
     If nothing at or after `at_iso` has been captured yet, the call waits.
-    Once `now` is past `at_iso + tolerance + SETTLEMENT_FALLBACK_GRACE`,
-    waiting cannot help -- old bars stop being refetched -- so it settles on the
-    latest price in [at_iso - tolerance, at_iso) instead, and says so in the
-    note, rather than staying pending forever. The grace leaves room for a
-    collector recovering from an outage to refetch the missing bar first.
+    Once `now` is past `at_iso + tolerance + settlement_fallback_grace()` --
+    beyond the history any collector refetches -- waiting cannot help, so it
+    settles on the latest price in [at_iso - tolerance, at_iso) instead, and
+    says so in the note, rather than staying pending forever.
     """
 
     target = _as_utc(datetime.fromisoformat(at_iso))
@@ -470,13 +480,13 @@ def close_price_at(
 
     now = _as_utc(datetime.fromisoformat(now_iso)) if now_iso else datetime.now(UTC)
     before = [(m, row) for m, row in moments if target - window <= m < target]
-    if now > target + window + SETTLEMENT_FALLBACK_GRACE and before:
+    if now > target + window + settlement_fallback_grace(interval) and before:
         moment, row = best(before, latest=True)
         return float(row["close"]), (
             f"{row['venue']} {interval} close at {row['open_time']}, price as of {moment.isoformat()} "
             f"(latest price before {at_iso}; nothing was captured after it)"
         )
-    if not moments:
+    if not rows:
         return None, f"no non-degraded {interval} close within {tolerance_minutes}m of {at_iso}"
     return None, f"no {interval} price captured at or after {at_iso} yet; waiting"
 

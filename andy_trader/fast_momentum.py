@@ -257,9 +257,10 @@ def load_minute_closes(
 ) -> list[tuple[datetime, float]]:
     """Ordered (time, close) pairs from non-degraded 1m bars.
 
-    Where several venues reported the same minute, the most-confirmed row wins,
-    matching the tie-break `close_price_at` already uses so the two never
-    disagree about what the price was.
+    Where several rows or venues reported the same minute, the most-confirmed
+    row wins, then venue name, close and content hash -- the same order
+    `close_price_at` uses among rows tied at one price moment -- so the two
+    never disagree about what a completed minute's price was.
     """
 
     clauses = ["interval = ?", "instrument = ?", "degraded = 0", "close IS NOT NULL"]
@@ -275,12 +276,12 @@ def load_minute_closes(
         SELECT open_time, close, times_seen
         FROM crypto_observations
         WHERE {' AND '.join(clauses)}
-        ORDER BY open_time ASC, times_seen ASC
+        ORDER BY open_time ASC, times_seen ASC, venue DESC, close DESC, content_hash DESC
         """,
         params,
     ).fetchall()
-    # Later rows win, and rows arrive in ascending times_seen order, so the
-    # most-confirmed observation for each minute is the one left standing.
+    # Later rows win. Rows arrive least-preferred first, so for each minute the
+    # one left standing is the most-confirmed, then lowest venue, close, hash.
     best: dict[datetime, float] = {}
     for row in rows:
         best[datetime.fromisoformat(row["open_time"])] = float(row["close"])

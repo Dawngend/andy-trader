@@ -207,12 +207,39 @@ def test_settlement_falls_back_only_after_the_grace_period(tmp_path: Path) -> No
         })
         at = "2026-09-04T01:17:00+00:00"
 
-        early, _ = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-04T03:00:00+00:00")
-        late, note = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-04T10:00:00+00:00")
+        # Still inside the refetch window (500 hourly bars): keep waiting.
+        early, _ = close_price_at(connection, "BTC-USD", at, now_iso="2026-09-10T00:00:00+00:00")
+        late, note = close_price_at(connection, "BTC-USD", at, now_iso="2026-10-01T00:00:00+00:00")
 
         assert early is None
         assert late == 101.0
         assert "latest price before" in note
+
+
+def test_a_capture_from_before_the_bar_opened_is_not_evidence(tmp_path: Path) -> None:
+    """From Codex's third review: clamping a future-dated bar's capture to its
+    open invented a price at the open that nobody observed."""
+
+    with connect(tmp_path / "c.db") as connection:
+        # A 02:00 bar that a venue reported early, captured at 01:20.
+        _snapshots(connection, "2026-09-04T02:00:00+00:00", {150.0: "2026-09-04T01:20:00+00:00"})
+
+        price, note = close_price_at(
+            connection, "BTC-USD", "2026-09-04T01:17:00+00:00", now_iso="2026-09-04T02:30:00+00:00"
+        )
+
+        assert price is None
+        assert "waiting" in note
+
+
+def test_an_out_of_order_refetch_never_moves_last_seen_backwards(tmp_path: Path) -> None:
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T01:40:00+00:00"})
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T01:10:00+00:00"})
+
+        row = connection.execute("SELECT last_seen_at FROM crypto_observations").fetchone()
+
+        assert row["last_seen_at"] == "2026-09-04T01:40:00+00:00"
 
 
 def test_an_unchanged_refetch_proves_the_price_still_held(tmp_path: Path) -> None:
