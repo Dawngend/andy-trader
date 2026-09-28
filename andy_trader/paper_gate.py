@@ -154,6 +154,9 @@ class EligibilityVerdict:
     # Every settled call logged, overlapping ones included. `sample_size` is the
     # independent subset the verdict actually rests on.
     logged_calls: int | None = None
+    # Settlements made by the corrected at-or-after-resolution rule, before
+    # overlapping forecast windows are thinned into `sample_size`.
+    corrected_calls: int | None = None
 
 
 def evaluate_paper_eligibility(
@@ -196,7 +199,11 @@ def evaluate_paper_eligibility(
         round_trip_bps=round_trip_bps,
         recent_window=recent_window,
     )
-    return replace(verdict, logged_calls=len(logged))
+    return replace(
+        verdict,
+        logged_calls=len(logged),
+        corrected_calls=len(corrected),
+    )
 
 
 def _judge(
@@ -511,7 +518,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         ).fetchall()
 
     print(
-        f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} {'logged':>7} "
+        f"{'predictor':<28} {'instrument':<11} {'horizon':>7} {'n':>5} "
+        f"{'corrected':>9} {'logged':>7} "
         f"{'skill':>9} {'hit':>7} {'need':>7} {'recent':>9}  verdict"
     )
     allowed = 0
@@ -545,12 +553,14 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         allowed += 1 if verdict.eligible else 0
         print(
             f"{row['predictor']:<28} {row['instrument']:<11} {row['horizon']:>7} "
-            f"{verdict.sample_size:>5} {verdict.logged_calls or 0:>7} {skill:>9} {hit:>7} "
+            f"{verdict.sample_size:>5} {verdict.corrected_calls or 0:>9} "
+            f"{verdict.logged_calls or 0:>7} {skill:>9} {hit:>7} "
             f"{need:>7} {recent:>9}  {mark}"
         )
     print(f"\n{allowed} pair(s) currently allowed to open new positions.")
-    print("(n = independent, non-overlapping settled calls the verdict rests on; "
-          "logged = every settled call, overlapping ones included)")
+    print("(n = independent, non-overlapping corrected settlements the verdict rests on; "
+          "corrected = all at/after-resolution settlements before overlap thinning; "
+          "logged = every settled call, including legacy outcomes and overlaps)")
     print(f"(recent = Brier skill over the most recent {DEFAULT_RECENT_WINDOW} calls only, "
           "checked independently of the lifetime average)")
 

@@ -130,6 +130,7 @@ def test_legacy_settlements_cannot_open_the_paper_gate() -> None:
 
     assert verdict.eligible is False
     assert verdict.sample_size == 0
+    assert verdict.corrected_calls == 0
     assert verdict.logged_calls == total
     assert f"0 corrected settlements of {total} logged" in verdict.reason
 
