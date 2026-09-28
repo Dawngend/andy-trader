@@ -25,12 +25,13 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import statistics
 import sys
 from typing import Sequence
 
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes, score_all
-from andy_trader.store import connect, default_database_path
+from andy_trader.store import _as_utc, connect, default_database_path
 
 DEFAULT_PORT = 8787
 RECENT_PREDICTIONS_LIMIT = 40
@@ -131,18 +132,20 @@ def _settlement_quality(connection: sqlite3.Connection, now: datetime) -> dict[s
             continue
         stamp = note.split(" price as of ", 1)[1].split(" ", 1)[0].rstrip(",")
         try:
-            moment = datetime.fromisoformat(stamp)
-            lags.append((moment - datetime.fromisoformat(row["resolves_at"])).total_seconds() / 60.0)
-        except ValueError:
+            # Naive stamps are UTC by the store's convention, as in close_price_at;
+            # mixing naive and aware must not crash the whole dashboard state.
+            moment = _as_utc(datetime.fromisoformat(stamp))
+            resolves = _as_utc(datetime.fromisoformat(str(row["resolves_at"])))
+            lags.append((moment - resolves).total_seconds() / 60.0)
+        except (TypeError, ValueError):
             legacy += 1
-    lags.sort()
     return {
         "settled": len(rows),
         "fallback": fallback,
         "legacy_notes": legacy,
         "early": sum(1 for lag in lags if lag < 0),
-        "median_lag_minutes": lags[len(lags) // 2] if lags else None,
-        "max_lag_minutes": lags[-1] if lags else None,
+        "median_lag_minutes": statistics.median(lags) if lags else None,
+        "max_lag_minutes": max(lags) if lags else None,
     }
 
 
