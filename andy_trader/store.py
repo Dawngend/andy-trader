@@ -286,7 +286,9 @@ def record_observations(
     walk a simulated clock pass it explicitly instead of rewriting rows.
     """
 
-    now = observed_at or utc_now_iso()
+    # Stored as UTC so that the lexical MAX() on last_seen_at below is also a
+    # chronological one; a caller's other offset must not reorder evidence.
+    now = _as_utc(datetime.fromisoformat(observed_at)).isoformat() if observed_at else utc_now_iso()
     inserted = 0
     seen = 0
     for candle in candles:
@@ -376,13 +378,23 @@ def record_prediction(connection: sqlite3.Connection, prediction: Prediction) ->
 # far in the past, a bar missed during an outage can still arrive on recovery,
 # so settlement keeps waiting rather than falling back to an earlier price.
 # Codex's review showed a fixed 6h grace fell inside the 1m refetch window.
-SETTLEMENT_REFETCH_BARS = 500
+SETTLEMENT_REFETCH_BARS: Mapping[str, int] = {"1m": 500}
+# Hourly and slower series come from TradingView (TRADINGVIEW_BARS, default
+# 120) and Bybit (200 per request); the deeper of the two sets the depth.
+DEFAULT_SETTLEMENT_REFETCH_BARS = 200
+# A call left without a price for more than a week is an incident to fix, not
+# something settlement should wait out: without a cap a 1d series would wait
+# ~200 days. Codex's fourth review found the uncapped 500-bar grace kept 1h
+# calls pending ~21 days.
+SETTLEMENT_MAX_GRACE = timedelta(days=7)
 
 
 def settlement_fallback_grace(interval: str) -> timedelta:
-    """How long past the tolerance a call waits before the earlier-price fallback."""
+    """How long past the tolerance a call waits before the earlier-price fallback:
+    as long as the interval's collectors can still refetch the bar, capped."""
 
-    return horizon_delta(interval) * SETTLEMENT_REFETCH_BARS
+    bars = SETTLEMENT_REFETCH_BARS.get(interval, DEFAULT_SETTLEMENT_REFETCH_BARS)
+    return min(horizon_delta(interval) * bars, SETTLEMENT_MAX_GRACE)
 
 
 def price_moments(row: Mapping[str, object], interval: str) -> tuple[datetime, ...]:

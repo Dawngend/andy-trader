@@ -242,6 +242,31 @@ def test_an_out_of_order_refetch_never_moves_last_seen_backwards(tmp_path: Path)
         assert row["last_seen_at"] == "2026-09-04T01:40:00+00:00"
 
 
+def test_capture_stamps_are_stored_as_utc_so_later_really_means_later(tmp_path: Path) -> None:
+    """From Codex's fourth review: MAX() compares text. 09:40+08:00 is 01:40
+    UTC, later than 01:30 UTC, but sorts earlier as text unless normalized."""
+
+    with connect(tmp_path / "c.db") as connection:
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T09:40:00+08:00"})
+        _snapshots(connection, "2026-09-04T01:00:00+00:00", {100.0: "2026-09-04T01:30:00+00:00"})
+
+        row = connection.execute("SELECT first_seen_at, last_seen_at FROM crypto_observations").fetchone()
+
+        assert row["first_seen_at"] == "2026-09-04T01:40:00+00:00"
+        assert row["last_seen_at"] == "2026-09-04T01:40:00+00:00"
+
+
+def test_fallback_grace_follows_each_series_refetch_depth_and_is_capped() -> None:
+    """From Codex's fourth review: a flat 500-bar grace kept 1h calls pending
+    ~21 days and would keep 1d calls ~500 days."""
+
+    from andy_trader.store import SETTLEMENT_MAX_GRACE, settlement_fallback_grace
+
+    assert settlement_fallback_grace("1m") == timedelta(minutes=500)
+    assert settlement_fallback_grace("1h") == SETTLEMENT_MAX_GRACE == timedelta(days=7)
+    assert settlement_fallback_grace("1d") == SETTLEMENT_MAX_GRACE
+
+
 def test_an_unchanged_refetch_proves_the_price_still_held(tmp_path: Path) -> None:
     """From Codex's second review: re-fetching an identical bar only updates
     last_seen_at, which still proves the close was the price at that moment."""
