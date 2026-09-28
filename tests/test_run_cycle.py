@@ -76,7 +76,11 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     assert all(value >= 0 for value in elapsed)
 
 
-def _bybit_signal_request(monkeypatch, tmp_path: Path, *, bybit_price_ok: bool) -> tuple[bool, dict]:
+def _bybit_signal_request(
+    monkeypatch, tmp_path: Path, *, bybit_price_ok: bool,
+    reason: str = "ConnectionError: URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED]>",
+    extra_args: tuple[str, ...] = (),
+) -> tuple[bool | None, dict]:
     """Run one cycle with Bybit in the venue list and report whether its signals were requested."""
 
     def fake_collect(*, instruments, intervals, venues, settings):
@@ -90,7 +94,7 @@ def _bybit_signal_request(monkeypatch, tmp_path: Path, *, bybit_price_ok: bool) 
                 open=100.0 if bybit_price_ok else None, high=101.0 if bybit_price_ok else None,
                 low=99.0 if bybit_price_ok else None, close=100.0 if bybit_price_ok else None,
                 volume=1.0 if bybit_price_ok else None, degraded=not bybit_price_ok,
-                degraded_reason=None if bybit_price_ok else "untrusted certificate",
+                degraded_reason=None if bybit_price_ok else reason,
             ))
         return rows, []
 
@@ -110,16 +114,16 @@ def _bybit_signal_request(monkeypatch, tmp_path: Path, *, bybit_price_ok: bool) 
 
     assert run_cycle.main(
         ["--instruments", "BTC-USD", "--intervals", "1h", "--horizons", "1h",
-         "--venues", "tradingview,bybit", "--quiet"]
+         "--venues", "tradingview,bybit", "--quiet", *extra_args]
     ) == 0
     entries = [json.loads(line) for line in journal.read_text().splitlines()]
     signals_entry = next(entry for entry in entries if entry["event"] == "signals_collected")
-    return requested[0], signals_entry
+    return (requested[0] if requested else None), signals_entry
 
 
-def test_bybit_signals_are_skipped_when_every_bybit_price_failed(monkeypatch, tmp_path: Path) -> None:
+def test_bybit_signals_are_skipped_when_the_bybit_host_is_unreachable(monkeypatch, tmp_path: Path) -> None:
     """The hourly re-probe of a blocked Bybit used to log 24 failed prices AND
-    24 failed signals: the same blocked domain, counted twice."""
+    24 failed signals: the same blocked host, counted twice."""
 
     requested, entry = _bybit_signal_request(monkeypatch, tmp_path, bybit_price_ok=False)
 
@@ -127,11 +131,35 @@ def test_bybit_signals_are_skipped_when_every_bybit_price_failed(monkeypatch, tm
     assert entry["bybit_enabled"] is True and entry["bybit_signals"] is False
 
 
+def test_a_non_transport_price_failure_does_not_suppress_bybit_signals(monkeypatch, tmp_path: Path) -> None:
+    """From Codex's review: an empty or unsupported price response says nothing
+    about the signal endpoints."""
+
+    requested, entry = _bybit_signal_request(
+        monkeypatch, tmp_path, bybit_price_ok=False, reason="EmptyResponse: no klines returned"
+    )
+
+    assert requested is True
+    assert entry["bybit_signals"] is True
+
+
 def test_bybit_signals_are_still_collected_when_bybit_prices_work(monkeypatch, tmp_path: Path) -> None:
     requested, entry = _bybit_signal_request(monkeypatch, tmp_path, bybit_price_ok=True)
 
     assert requested is True
     assert entry["bybit_signals"] is True
+
+
+def test_skip_signals_journals_no_bybit_signal_claim(monkeypatch, tmp_path: Path) -> None:
+    """From Codex's review: with --skip-signals nothing was requested, so the
+    journal must not say Bybit signals were on."""
+
+    requested, entry = _bybit_signal_request(
+        monkeypatch, tmp_path, bybit_price_ok=True, extra_args=("--skip-signals",)
+    )
+
+    assert requested is None
+    assert entry["bybit_signals"] is None
 
 
 def _fake_price_collect(*, instruments, intervals, venues, settings):

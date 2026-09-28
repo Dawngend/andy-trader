@@ -137,21 +137,24 @@ def _venues_with_probe_backoff(
     return tuple(effective), tuple(backed_off)
 
 
-def _bybit_prices_usable(candles: Sequence[object]) -> bool:
-    """Whether this cycle got at least one usable Bybit price.
+def _bybit_host_unreachable(candles: Sequence[object]) -> bool:
+    """Whether this cycle proved the Bybit host itself unreachable.
 
-    Bybit's positioning signals share the price endpoints' domain, and the
-    usual failure here (the ISP's forged-certificate block) takes out both.
-    During the hourly re-probe of a backed-off Bybit, asking for its 24 signal
-    series after every price request has already failed only doubles the
-    "degraded" count of that cycle without any chance of new data.
+    True only when there were Bybit price rows, every one failed, and every
+    failure was a transport-level ConnectionError (TLS or DNS) -- the ISP's
+    forged-certificate block, which is every Bybit failure recorded so far.
+    Bybit's signal endpoints live on the same host, so requesting them after
+    that only doubled the hourly re-probe's "degraded" count. Any other
+    failure (an empty or unsupported price response, a parse error) says
+    nothing about the signal endpoints, so they are still requested
+    (narrowed after Codex's review).
     """
 
-    return any(
-        getattr(candle, "venue", None) == "bybit"
-        and not getattr(candle, "degraded", True)
-        and getattr(candle, "close", None) is not None
-        for candle in candles
+    bybit = [candle for candle in candles if getattr(candle, "venue", None) == "bybit"]
+    return bool(bybit) and all(
+        getattr(candle, "degraded", False)
+        and str(getattr(candle, "degraded_reason", "") or "").startswith("ConnectionError")
+        for candle in bybit
     )
 
 
@@ -301,8 +304,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         signals: list = []
         signal_problems: list = []
-        bybit_signals = "bybit" in venues and _bybit_prices_usable(candles)
+        bybit_signals: bool | None = None  # None: no signal request was made at all
         if not args.skip_signals:
+            bybit_signals = "bybit" in venues and not _bybit_host_unreachable(candles)
             # Funding updates 8-hourly and Fear and Greed daily, so most cycles
             # re-observe unchanged values. That is deliberately cheap: the
             # content hash collapses repeats onto one row and bumps times_seen,
