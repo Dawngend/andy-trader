@@ -445,6 +445,34 @@ python -m andy_trader.paper_gate
 Deliberately **not** included: inverting momentum. A 47% hit rate over one regime is not a
 licence to trade 53% the other way. That is fitting the sign to the sample.
 
+## Two measurement corrections (2026-09-28)
+
+Both were found by measuring the store against itself, and both were reviewed adversarially
+by a second agent over ten rounds before they reached `main`.
+
+**Overlapping calls were counted as separate evidence.** The scheduler logs a call every 15
+minutes for every horizon, so four 1h calls, or 96 daily calls, share one outcome window.
+Measured as realized net return per call, `baseline:random` on AVAX-USD at 1d showed +304 bps
+per call with a t-statistic of 15, which a coin flip cannot do: its 1,039 "settled calls" were
+17 independent days. BTC-USD momentum at 1h had 280 independent calls behind 1,255 logged. The
+skill gate now counts, scores and windows only non-overlapping calls, so its 200-call minimum
+means 200 separate outcomes, and the scoreboard and dashboard show both numbers. No verdict
+changed: every pair was blocked before and after. The honest consequence is that a daily
+predictor now needs about 200 days of history before it could trade.
+
+**Settlement often used a price from before the call resolved.** A bar that is still forming
+is stored as several snapshots, all seen once, and settlement picked among them arbitrarily.
+58% of 1h calls were settled on a price captured before they resolved (median 15, up to 45
+minutes early), so many "1h" calls were really scored on 15-45 minute moves, and fast 2m
+settlement ran one bar later than the history it was fitted on. Settlement now uses the first
+known price at or after the resolve time: a snapshot's capture time, or a completed bar's end.
+It waits while a missing bar can still be refetched and only then falls back to the latest
+earlier price, saying so in the settlement note. Replayed on the live store, 20% of 1h outcomes,
+10% of 4h, 2% of 1d and 2% of fast 2m flip. Re-scored on corrected outcomes, scores move both
+ways and no hidden edge appears. Recorded outcomes were not rewritten, so scores before and
+after this change are measured slightly differently. The first live cycle on the new rule
+settled 81 of 81 due calls, none early (median 0.3 minutes after the resolve time).
+
 ## Intra-round continuation, and why a real signal still loses
 
 A widely-shared bot claimed to turn $250 into $13,000 trading Polymarket's 5-minute BTC
