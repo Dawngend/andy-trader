@@ -76,7 +76,7 @@ from typing import Sequence
 
 from andy_trader.calibration import CalibrationError, evaluate
 from andy_trader.economics import DEFAULT_ROUND_TRIP_BPS, evaluate_horizon
-from andy_trader.store import FAST_HORIZONS, fetch_settled
+from andy_trader.store import FAST_HORIZONS, fetch_settled, has_valid_corrected_settlement
 
 # A predictor needs a real sample before its score means anything. At 1h across
 # the live instruments this is a few weeks of history, which is the point: the
@@ -172,16 +172,23 @@ def evaluate_paper_eligibility(
     on DOGE" are different claims and a predictor that is carried by one
     instrument should not get to trade the other seven on its reputation.
 
-    Only non-overlapping calls count as evidence (see `independent_calls`).
+    Only non-overlapping calls with corrected, at-or-after-resolution
+    settlements count as evidence (see `independent_calls`). Legacy outcomes
+    stay in the audit log but cannot authorize simulated capital.
     """
 
     logged = fetch_settled(
         connection, predictor=predictor, instrument=instrument, horizon=horizon
     )
+    corrected = [
+        row for row in logged
+        if has_valid_corrected_settlement(row["resolves_at"], row["settle_note"])
+    ]
     verdict = _judge(
         connection,
-        independent_calls(logged),
+        independent_calls(corrected),
         logged_calls=len(logged),
+        corrected_calls=len(corrected),
         predictor=predictor,
         instrument=instrument,
         horizon=horizon,
@@ -197,6 +204,7 @@ def _judge(
     rows: Sequence[sqlite3.Row],
     *,
     logged_calls: int,
+    corrected_calls: int,
     predictor: str,
     instrument: str,
     horizon: str,
@@ -212,7 +220,8 @@ def _judge(
             eligible=False,
             reason=(
                 f"only {sample_size} independent settled {horizon} calls for {predictor} "
-                f"on {instrument} ({logged_calls} logged; calls inside one forecast window "
+                f"on {instrument} ({corrected_calls} corrected settlements of {logged_calls} logged; "
+                f"calls inside one forecast window "
                 f"share its outcome); needs {minimum_calls} before its score means anything"
             ),
             predictor=predictor,

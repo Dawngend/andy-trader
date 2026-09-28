@@ -60,6 +60,53 @@ def test_collector_health_separately_flags_an_old_usable_bar() -> None:
     assert not health["healthy"]
 
 
+def test_collector_health_uses_active_configuration_not_retired_history() -> None:
+    connection = _conn()
+    now = datetime.now(UTC)
+    record_observations(
+        connection,
+        [
+            Candle(
+                instrument="ETH-USD", venue="binance", interval="1m",
+                open_time=(now - timedelta(days=10)).isoformat(),
+                open=100.0, high=100.0, low=100.0, close=100.0, volume=1.0,
+            )
+        ],
+        observed_at=(now - timedelta(days=10)).isoformat(),
+    )
+    record_observations(
+        connection,
+        [
+            Candle(
+                instrument="BTC-USD", venue="binance", interval="1m",
+                open_time=now.isoformat(),
+                open=101.0, high=101.0, low=101.0, close=101.0, volume=1.0,
+            )
+        ],
+        observed_at=now.isoformat(),
+    )
+
+    health = _collector_health(
+        connection, now, expected_series=(("BTC-USD", "1m"),)
+    )
+
+    assert health["healthy"] is True
+    assert [(row["instrument"], row["interval"]) for row in health["series"]] == [
+        ("BTC-USD", "1m")
+    ]
+
+
+def test_collector_health_marks_a_missing_active_series_unhealthy() -> None:
+    health = _collector_health(
+        _conn(),
+        datetime.now(UTC),
+        expected_series=(("BTC-USD", "1m"),),
+    )
+
+    assert health["healthy"] is False
+    assert health["series"][0]["missing"] is True
+
+
 def test_latest_price_uses_the_same_repeat_then_venue_tiebreak_as_prediction() -> None:
     connection = _conn()
     stamp = datetime.now(UTC).isoformat()

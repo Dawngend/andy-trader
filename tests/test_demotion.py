@@ -88,7 +88,8 @@ def _settled_calls(
             connection.execute(
                 """
                 UPDATE crypto_predictions
-                SET settled_at = ?, settle_price = ?, outcome_up = ?, settle_note = 'test'
+                SET settled_at = ?, settle_price = ?, outcome_up = ?,
+                    settle_note = 'test price as of ' || resolves_at
                 WHERE id = ?
                 """,
                 (resolves_at, 101.0 if outcome else 99.0, outcome, prediction_id),
@@ -201,6 +202,29 @@ def test_failing_model_is_demoted_once_and_cannot_be_served(
             "SELECT promoted FROM model_registry WHERE model_id = ?", (entry.model_id,)
         ).fetchone()
         assert registry_row["promoted"] == 1
+
+
+def test_legacy_settlements_cannot_demote_a_promoted_model(tmp_path: Path) -> None:
+    with connect(tmp_path / "legacy.db") as connection:
+        entry = _promote(connection)
+        outcomes = _alternating_outcomes(36)
+        _settled_calls(
+            connection,
+            model_id=entry.model_id,
+            outcomes=outcomes,
+            model_probabilities=_wrong_probabilities(outcomes),
+            base_rate_probabilities=[0.5] * len(outcomes),
+        )
+        connection.execute("UPDATE crypto_predictions SET settle_note = NULL")
+        connection.commit()
+
+        result = check_live_performance_and_demote(
+            connection, instrument="BTC-USD"
+        )
+
+        assert result["status"] == "not_enough_calls"
+        assert result["live_call_count"] == 0
+        assert is_demoted(connection, model_id=entry.model_id) is False
 
 
 def test_too_few_bad_calls_do_not_demote(tmp_path: Path) -> None:

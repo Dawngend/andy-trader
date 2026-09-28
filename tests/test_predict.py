@@ -365,3 +365,22 @@ def test_score_all_reports_how_many_calls_are_independent(tmp_path: Path) -> Non
         # opens the next (2). ETH 1h (1) and BTC 4h (1) are separate groups.
         assert report.count == 7
         assert independent == {"baseline:eager": 4}
+
+        settlement_excluded: dict[str, int] = {}
+        corrected = score_all(
+            connection,
+            corrected_settlements_only=True,
+            excluded_settlement=settlement_excluded,
+        )
+        assert corrected == {}
+        assert settlement_excluded == {"baseline:eager": 7}
+
+        connection.execute(
+            "UPDATE crypto_predictions SET settle_note = 'test price as of ' || resolves_at "
+            "WHERE id = (SELECT MIN(id) FROM crypto_predictions)"
+        )
+        connection.commit()
+        corrected_report = score_all(
+            connection, corrected_settlements_only=True
+        )["baseline:eager"]
+        assert corrected_report.count == 1

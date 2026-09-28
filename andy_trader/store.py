@@ -510,6 +510,40 @@ def _as_utc(moment: datetime) -> datetime:
     return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
+def settlement_lag_minutes(resolves_at: str, settle_note: str | None) -> float | None:
+    """Return the captured-price lag recorded by the corrected settlement rule.
+
+    Legacy rows did not record the price moment at all. Malformed notes are also
+    treated as unknown rather than guessed from ``settled_at``, which is the
+    database write time and not necessarily the market-data capture time.
+    """
+
+    if not settle_note or " price as of " not in settle_note:
+        return None
+    stamp = settle_note.split(" price as of ", 1)[1].split(" ", 1)[0].rstrip(",")
+    try:
+        moment = _as_utc(datetime.fromisoformat(stamp))
+        resolves = _as_utc(datetime.fromisoformat(str(resolves_at)))
+    except (TypeError, ValueError):
+        return None
+    return (moment - resolves).total_seconds() / 60.0
+
+
+def has_valid_corrected_settlement(resolves_at: str, settle_note: str | None) -> bool:
+    """Whether a settled outcome uses a captured price at/after resolution.
+
+    Earlier-price fallbacks remain useful audit records, but they are not valid
+    calibration evidence. They measure a different (shorter) forecast window.
+    """
+
+    lag = settlement_lag_minutes(resolves_at, settle_note)
+    return (
+        lag is not None
+        and lag >= 0
+        and "latest price before" not in (settle_note or "")
+    )
+
+
 def settle_due_predictions(
     connection: sqlite3.Connection,
     *,

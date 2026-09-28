@@ -62,7 +62,8 @@ def _settled_calls(
         """
         UPDATE crypto_predictions
         SET settled_at = ?, settle_price = 100.0,
-            outcome_up = CASE WHEN (id %  2) = 1 THEN 0 ELSE 1 END
+            outcome_up = CASE WHEN (id %  2) = 1 THEN 0 ELSE 1 END,
+            settle_note = 'test price as of ' || resolves_at
         WHERE predictor = ? AND settled_at IS NULL
         """,
         (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), predictor),
@@ -105,6 +106,32 @@ def test_a_predictor_with_too_little_history_has_not_proven_anything() -> None:
     assert not verdict.eligible
     assert "needs 200" in verdict.reason
     assert verdict.sample_size == 20
+
+
+def test_legacy_settlements_cannot_open_the_paper_gate() -> None:
+    connection = _conn()
+    total = MINIMUM_SETTLED_CALLS + 40
+    _settled_calls(
+        connection,
+        predictor="baseline:legacy_winner",
+        count=total,
+        probability=0.9,
+        correct=True,
+    )
+    connection.execute(
+        "UPDATE crypto_predictions SET settle_note = NULL "
+        "WHERE predictor = 'baseline:legacy_winner'"
+    )
+    connection.commit()
+
+    verdict = evaluate_paper_eligibility(
+        connection, predictor="baseline:legacy_winner", instrument="BTC-USD"
+    )
+
+    assert verdict.eligible is False
+    assert verdict.sample_size == 0
+    assert verdict.logged_calls == total
+    assert f"0 corrected settlements of {total} logged" in verdict.reason
 
 
 def test_a_predictor_that_loses_to_the_base_rate_may_not_deploy_capital() -> None:
@@ -181,7 +208,8 @@ def test_beating_the_base_rate_statistically_is_not_enough_if_it_cannot_cover_co
         """
         UPDATE crypto_predictions
         SET settled_at = ?, settle_price = 100.0,
-            outcome_up = CASE WHEN (id % 2) = 1 THEN 0 ELSE 1 END
+            outcome_up = CASE WHEN (id % 2) = 1 THEN 0 ELSE 1 END,
+            settle_note = 'test price as of ' || resolves_at
         WHERE predictor = ? AND settled_at IS NULL
         """,
         (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), predictor),
@@ -241,7 +269,7 @@ def _calls_with_explicit_outcomes(
     for row_id, outcome_up in row_outcomes:
         connection.execute(
             "UPDATE crypto_predictions SET settled_at = ?, settle_price = 100.0, "
-            "outcome_up = ? WHERE id = ?",
+            "outcome_up = ?, settle_note = 'test price as of ' || resolves_at WHERE id = ?",
             (settled_at, outcome_up, row_id),
         )
     connection.commit()
@@ -621,7 +649,8 @@ def _spaced_calls(
         """
         UPDATE crypto_predictions
         SET settled_at = ?, settle_price = 100.0,
-            outcome_up = CASE WHEN (id % 2) = 1 THEN 1 ELSE 0 END
+            outcome_up = CASE WHEN (id % 2) = 1 THEN 1 ELSE 0 END,
+            settle_note = 'test price as of ' || resolves_at
         WHERE predictor = ? AND settled_at IS NULL
         """,
         (datetime(2026, 9, 1, tzinfo=UTC).isoformat(), predictor),

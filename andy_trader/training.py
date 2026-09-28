@@ -46,6 +46,7 @@ from andy_trader.store import (
     connect,
     default_database_path,
     fetch_settled,
+    has_valid_corrected_settlement,
     horizon_delta,
     record_prediction,
     utc_now_iso,
@@ -609,6 +610,10 @@ def _check_live_performance_and_demote(
         instrument=instrument,
         horizon=horizon,
     )
+    promoted_rows = [
+        row for row in promoted_rows
+        if has_valid_corrected_settlement(row["resolves_at"], row["settle_note"])
+    ]
     model_rows = []
     for row in promoted_rows:
         try:
@@ -655,6 +660,7 @@ def _check_live_performance_and_demote(
     base_rate_rows = [
         row for row in base_rate_rows
         if window_start <= str(row["created_at"]) <= window_end
+        and has_valid_corrected_settlement(row["resolves_at"], row["settle_note"])
     ]
     if not base_rate_rows:
         return {

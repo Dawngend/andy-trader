@@ -31,7 +31,12 @@ from typing import Sequence
 
 from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes, score_all
-from andy_trader.store import _as_utc, connect, default_database_path
+from andy_trader.store import (
+    connect,
+    default_database_path,
+    fetch_settled,
+    settlement_lag_minutes,
+)
 
 DEFAULT_PORT = 8787
 RECENT_PREDICTIONS_LIMIT = 40
@@ -45,8 +50,29 @@ def _seconds_since(iso_timestamp: str, now: datetime) -> float:
     return (now - parsed).total_seconds()
 
 
-def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str, object]:
-    """Per series source reachability and usable-bar freshness."""
+def _scheduled_series() -> tuple[tuple[str, str], ...]:
+    """The series the two installed collection loops are expected to refresh."""
+
+    from run_cycle import DEFAULT_INSTRUMENTS, DEFAULT_INTERVALS
+    from run_fast import DEFAULT_INSTRUMENTS as FAST_INSTRUMENTS
+
+    regular = ((instrument, interval) for instrument in DEFAULT_INSTRUMENTS for interval in DEFAULT_INTERVALS)
+    fast = ((instrument, "1m") for instrument in FAST_INSTRUMENTS)
+    return tuple(sorted({*regular, *fast}))
+
+
+def _collector_health(
+    connection: sqlite3.Connection,
+    now: datetime,
+    *,
+    expected_series: Sequence[tuple[str, str]] | None = None,
+) -> dict[str, object]:
+    """Per active series source reachability and usable-bar freshness.
+
+    When an expected set is supplied, retired historical series are ignored and
+    missing active series are explicitly unhealthy. Without it, all observed
+    series are reported for backwards-compatible diagnostic use.
+    """
 
     rows = connection.execute(
         """
@@ -59,14 +85,32 @@ def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str
         ORDER BY instrument, interval
         """
     ).fetchall()
+    by_key = {(row["instrument"], row["interval"]): row for row in rows}
+    selected = sorted(by_key) if expected_series is None else sorted(set(expected_series))
     series = []
     most_recent = None
-    for row in rows:
+    for instrument, interval in selected:
+        row = by_key.get((instrument, interval))
+        if row is None:
+            series.append(
+                {
+                    "instrument": instrument,
+                    "interval": interval,
+                    "last_seen_at": None,
+                    "age_seconds": None,
+                    "stale": True,
+                    "latest_bar_at": None,
+                    "data_age_seconds": None,
+                    "data_stale": True,
+                    "missing": True,
+                }
+            )
+            continue
         last_seen_at = row["last_seen_at"]
         age_seconds = _seconds_since(last_seen_at, now)
         latest_bar_at = row["latest_bar_at"]
         data_age_seconds = _seconds_since(latest_bar_at, now)
-        interval_seconds = {"1h": 3600, "4h": 14_400, "1d": 86_400}.get(
+        interval_seconds = {"1m": 60, "1h": 3600, "4h": 14_400, "1d": 86_400}.get(
             row["interval"], 0
         )
         # Bar open_time naturally trails the wall clock by up to one complete
@@ -83,6 +127,7 @@ def _collector_health(connection: sqlite3.Connection, now: datetime) -> dict[str
                 "latest_bar_at": latest_bar_at,
                 "data_age_seconds": data_age_seconds,
                 "data_stale": data_stale,
+                "missing": False,
             }
         )
         if most_recent is None or age_seconds < most_recent:
@@ -130,15 +175,11 @@ def _settlement_quality(connection: sqlite3.Connection, now: datetime) -> dict[s
         if "latest price before" in note:
             fallback += 1
             continue
-        stamp = note.split(" price as of ", 1)[1].split(" ", 1)[0].rstrip(",")
-        try:
-            # Naive stamps are UTC by the store's convention, as in close_price_at;
-            # mixing naive and aware must not crash the whole dashboard state.
-            moment = _as_utc(datetime.fromisoformat(stamp))
-            resolves = _as_utc(datetime.fromisoformat(str(row["resolves_at"])))
-            lags.append((moment - resolves).total_seconds() / 60.0)
-        except (TypeError, ValueError):
+        lag = settlement_lag_minutes(row["resolves_at"], note)
+        if lag is None:
             legacy += 1
+        else:
+            lags.append(lag)
     return {
         "settled": len(rows),
         "fallback": fallback,
@@ -183,15 +224,24 @@ def _latest_prices(connection: sqlite3.Connection) -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
-def _scoreboard(connection: sqlite3.Connection) -> tuple[dict[str, object], dict[str, int]]:
+def _scoreboard(
+    connection: sqlite3.Connection,
+    *,
+    corrected_settlements_only: bool = False,
+    settled_rows: Sequence[sqlite3.Row] | None = None,
+) -> tuple[dict[str, object], dict[str, int], dict[str, int]]:
     excluded_stale: dict[str, int] = {}
+    excluded_settlement: dict[str, int] = {}
     independent: dict[str, int] = {}
     reports = score_all(
         connection,
         minimum=1,
         maximum_data_age_minutes=DEFAULT_MAX_DATA_AGE_MINUTES,
         excluded_stale=excluded_stale,
+        excluded_settlement=excluded_settlement,
         independent_counts=independent,
+        corrected_settlements_only=corrected_settlements_only,
+        settled_rows=settled_rows,
     )
     out: dict[str, object] = {}
     for predictor, report in reports.items():
@@ -199,7 +249,7 @@ def _scoreboard(connection: sqlite3.Connection) -> tuple[dict[str, object], dict
             out[predictor] = report
         else:
             out[predictor] = {**report.as_dict(), "independent_count": independent.get(predictor)}
-    return out, excluded_stale
+    return out, excluded_stale, excluded_settlement
 
 
 def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
@@ -415,15 +465,28 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
 
     now = datetime.now(UTC)
     now_iso = now.isoformat()
-    scoreboard, score_exclusions = _scoreboard(connection)
+    settled_rows = fetch_settled(connection)
+    scoreboard, score_exclusions, _ = _scoreboard(
+        connection, settled_rows=settled_rows
+    )
+    corrected_scoreboard, corrected_score_exclusions, settlement_exclusions = _scoreboard(
+        connection,
+        corrected_settlements_only=True,
+        settled_rows=settled_rows,
+    )
     return {
         "generated_at": now_iso,
-        "collector_health": _collector_health(connection, now),
+        "collector_health": _collector_health(
+            connection, now, expected_series=_scheduled_series()
+        ),
         "pending_overdue": _pending_overdue(connection, now_iso),
         "latest_prices": _latest_prices(connection),
         "recent_predictions": _recent_predictions(connection),
         "scoreboard": scoreboard,
         "score_exclusions": score_exclusions,
+        "scoreboard_corrected": corrected_scoreboard,
+        "score_exclusions_corrected": corrected_score_exclusions,
+        "settlement_exclusions_corrected": settlement_exclusions,
         "settlement_quality": _settlement_quality(connection, now),
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
@@ -445,6 +508,9 @@ _PAGE = """<!doctype html>
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; align-items:start; }
   .card { background:#11161d; border:1px solid #1e2833; border-radius:8px; padding:14px 16px; }
   .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:#8fa3b0; margin:0 0 10px; }
+  .card-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px; }
+  .card-head h2 { margin:0; }
+  select { background:#0b0f14; color:#d8e1e8; border:1px solid #2a3947; border-radius:4px; padding:4px 7px; font-size:11px; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
   th, td { text-align:left; padding:4px 6px; border-bottom:1px solid #1a232c; white-space:nowrap; }
   th { color:#6d8494; font-weight:600; }
@@ -493,7 +559,13 @@ _PAGE = """<!doctype html>
       <table id="prices"><thead><tr><th>Instrument</th><th>Interval</th><th>Close</th><th>Open Time</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
-      <h2>Scoreboard (Brier skill vs. base rate)</h2>
+      <div class="card-head">
+        <h2>Scoreboard (Brier skill vs. base rate)</h2>
+        <select id="score-scope" title="Corrected-only is the decision-grade view. Historical preserves the immutable audit record across both settlement rules.">
+          <option value="corrected" selected>Corrected settlements only</option>
+          <option value="all">All historical outcomes</option>
+        </select>
+      </div>
       <p class="updated" id="score-quality"></p>
       <p class="updated" id="settle-quality" title="Each call settles on the first price captured at or after its resolve time. Only when no such price can arrive any more does it fall back to the latest earlier one (counted as fallback). Lag is how long after the resolve time the price was captured."></p>
       <table id="scoreboard"><thead><tr><th>Predictor</th><th>N</th><th title="Calls whose forecast windows do not overlap within the same instrument and horizon. Still an upper bound on independent evidence: a 1h and a 4h window on one coin cover the same hours, and coins move together.">Non-overlapping</th><th>Skill</th><th>Hit Rate</th></tr></thead><tbody></tbody></table>
@@ -862,7 +934,14 @@ async function refresh() {
 
     const sbBody = document.querySelector("#scoreboard tbody");
     sbBody.innerHTML = "";
-    const excluded = Object.values(s.score_exclusions).reduce((a, b) => a + b, 0);
+    const scoreScope = document.getElementById("score-scope");
+    const correctedOnly = scoreScope.value === "corrected";
+    const scores = correctedOnly ? s.scoreboard_corrected : s.scoreboard;
+    const exclusions = correctedOnly ? s.score_exclusions_corrected : s.score_exclusions;
+    const excluded = Object.values(exclusions || {}).reduce((a, b) => a + b, 0);
+    const settlementExcluded = correctedOnly
+      ? Object.values(s.settlement_exclusions_corrected || {}).reduce((a, b) => a + b, 0)
+      : 0;
     const sq = s.settlement_quality || {};
     const settleLine = document.getElementById("settle-quality");
     if (!sq.settled) {
@@ -876,17 +955,23 @@ async function refresh() {
         + (sq.legacy_notes ? ", " + sq.legacy_notes + " under the old rule" : "");
       settleLine.className = "updated " + ((sq.fallback || sq.early) ? "warn" : "ok");
     }
-    document.getElementById("score-quality").textContent = excluded
-      ? excluded + " stale-reference calls excluded by the 90m quality gate"
-      : "No stale-reference calls excluded";
-    Object.keys(s.scoreboard).sort().forEach(name => {
-      const r = s.scoreboard[name];
+    const qualityParts = [];
+    qualityParts.push(correctedOnly ? "Decision view: corrected at/after-resolution outcomes only" : "Audit view: old and corrected settlement rules mixed");
+    if (settlementExcluded) qualityParts.push(settlementExcluded + " old/fallback/invalid outcomes excluded");
+    if (excluded) qualityParts.push(excluded + " stale-reference calls excluded");
+    document.getElementById("score-quality").textContent = qualityParts.join("; ");
+    Object.keys(scores || {}).sort().forEach(name => {
+      const r = scores[name];
       if (r.error) { sbBody.appendChild(row([td(name), td("-"), td("-"), td(r.error), td("-")])); return; }
       const skillCell = td(r.degenerate ? "degenerate" : r.brier_skill_score.toFixed(4));
       skillCell.className = r.degenerate ? "muted" : (r.brier_skill_score > 0 ? "ok" : "bad");
       const independentCell = td(r.independent_count == null ? "-" : r.independent_count);
       sbBody.appendChild(row([td(name), td(r.count), independentCell, skillCell, td((r.hit_rate*100).toFixed(1)+"%")]));
     });
+    if (!Object.keys(scores || {}).length) {
+      sbBody.appendChild(row([td("No scoreable outcomes in this evidence view"), td("-"), td("-"), td("-"), td("-")]));
+    }
+    scoreScope.onchange = refresh;
 
     const regBody = document.querySelector("#registry tbody");
     regBody.innerHTML = "";

@@ -312,7 +312,9 @@ CT-09 serves the same database on localhost only. It shows collection health,
 prices, predictions, calibration, model promotion decisions, and paper equity.
 It does not place trades. The score display and CLI exclude, and explicitly
 count, predictions whose call-time reference data exceeded the configured
-freshness ceiling.
+freshness ceiling. Collector health is evaluated against the series the two
+scheduled loops currently run, so a retired historical series cannot make the
+dashboard red and a configured series that never appears cannot look healthy.
 
 ```bash
 python -m andy_trader.portfolio --predictor baseline:momentum --instrument BTC-USD --horizon 1h
@@ -472,6 +474,12 @@ earlier price, saying so in the settlement note. Replayed on the live store, 20%
 ways and no hidden edge appears. Recorded outcomes were not rewritten, so scores before and
 after this change are measured slightly differently. The first live cycle on the new rule
 settled 81 of 81 due calls, none early (median 0.3 minutes after the resolve time).
+
+The dashboard now defaults to a corrected-settlement-only decision view and keeps the mixed
+historical record behind an explicit audit-view selector. Legacy notes, malformed notes,
+earlier-price fallbacks and any early captures cannot count toward the paper-capital gate or
+live model demotion. This changes no stored row: it draws a conservative evidence boundary
+around the append-only record.
 
 ## Intra-round continuation, and why a real signal still loses
 

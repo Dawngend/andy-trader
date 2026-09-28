@@ -25,6 +25,7 @@ from andy_trader.store import (
     connect,
     default_database_path,
     fetch_settled,
+    has_valid_corrected_settlement,
     horizon_delta,
     record_prediction,
     settle_due_predictions,
@@ -190,7 +191,10 @@ def score_all(
     minimum: int = 1,
     maximum_data_age_minutes: float | None = None,
     excluded_stale: dict[str, int] | None = None,
+    excluded_settlement: dict[str, int] | None = None,
     independent_counts: dict[str, int] | None = None,
+    corrected_settlements_only: bool = False,
+    settled_rows: Sequence[sqlite3.Row] | None = None,
 ) -> dict[str, object]:
     """Score every predictor that has settled calls, ranked by skill score.
 
@@ -204,19 +208,51 @@ def score_all(
     independent evidence: a 1h and a 4h window on one coin cover the same hours,
     and different coins move together. It removes the largest inflation (repeat
     calls on one window), not every correlation.
+
+    ``corrected_settlements_only`` excludes legacy outcomes, malformed notes,
+    early captures and explicit earlier-price fallbacks. This preserves the
+    immutable audit history while preventing the old and corrected measurement
+    rules from being presented as one calibration sample.
+
+    ``settled_rows`` lets read-only projections reuse one immutable snapshot
+    across several evidence views. Normal callers should leave it unset.
     """
 
-    predictors = [
-        row["predictor"]
-        for row in connection.execute(
-            "SELECT DISTINCT predictor FROM crypto_predictions WHERE settled_at IS NOT NULL"
-        ).fetchall()
-    ]
+    if settled_rows is None:
+        predictors = [
+            row["predictor"]
+            for row in connection.execute(
+                "SELECT DISTINCT predictor FROM crypto_predictions WHERE settled_at IS NOT NULL"
+            ).fetchall()
+        ]
+    else:
+        predictors = sorted({str(row["predictor"]) for row in settled_rows})
     reports: dict[str, object] = {}
     for predictor in sorted(predictors):
-        rows = fetch_settled(
-            connection, predictor=predictor, instrument=instrument, horizon=horizon
-        )
+        if settled_rows is None:
+            rows = list(
+                fetch_settled(
+                    connection,
+                    predictor=predictor,
+                    instrument=instrument,
+                    horizon=horizon,
+                )
+            )
+        else:
+            rows = [
+                row for row in settled_rows
+                if row["predictor"] == predictor
+                and (instrument is None or row["instrument"] == instrument)
+                and (horizon is None or row["horizon"] == horizon)
+            ]
+        if corrected_settlements_only:
+            corrected = [
+                row for row in rows
+                if has_valid_corrected_settlement(row["resolves_at"], row["settle_note"])
+            ]
+            if excluded_settlement is not None and len(corrected) != len(rows):
+                excluded_settlement[predictor] = len(rows) - len(corrected)
+            rows = corrected
         if maximum_data_age_minutes is not None:
             scoreable = []
             for row in rows:
@@ -275,6 +311,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Machine-readable output")
     parser.add_argument("--minimum", type=int, default=1, help="Minimum settled calls to score")
     parser.add_argument(
+        "--corrected-settlements-only",
+        action="store_true",
+        help="Score only at-or-after-resolution outcomes written by the corrected rule",
+    )
+    parser.add_argument(
         "--maximum-data-age-minutes",
         type=float,
         help="Refuse live calls whose newest close is older than this",
@@ -323,17 +364,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         excluded_stale: dict[str, int] = {}
+        excluded_settlement: dict[str, int] = {}
         independent: dict[str, int] = {}
         reports = score_all(
             connection,
             minimum=args.minimum,
             maximum_data_age_minutes=maximum_data_age_minutes,
             excluded_stale=excluded_stale,
+            excluded_settlement=excluded_settlement,
             independent_counts=independent,
+            corrected_settlements_only=args.corrected_settlements_only,
         )
         if not reports:
             if excluded_stale:
                 print(f"excluded {sum(excluded_stale.values())} stale-reference calls")
+            if excluded_settlement:
+                print(
+                    f"excluded {sum(excluded_settlement.values())} outcomes outside "
+                    "the corrected settlement rule"
+                )
             print("nothing settled yet; run 'settle' after a horizon has elapsed")
             return 0
         if args.json:
@@ -345,6 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             for key, value in reports.items()
                         },
                         "excluded_stale": excluded_stale,
+                        "excluded_settlement": excluded_settlement,
                         "independent_counts": independent,
                     },
                     indent=2,
@@ -355,6 +405,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"QUALITY GATE: excluded {sum(excluded_stale.values())} settled calls "
                 f"whose reference data exceeded {maximum_data_age_minutes:.1f}m"
+            )
+        if excluded_settlement:
+            print(
+                f"SETTLEMENT GATE: excluded {sum(excluded_settlement.values())} outcomes "
+                "outside the corrected settlement rule"
             )
         ranked = sorted(reports.items(), key=lambda kv: kv[1].brier_skill_score, reverse=True)
         for predictor, report in ranked:
