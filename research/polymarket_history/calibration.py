@@ -52,7 +52,7 @@ def main() -> None:
     checkpoint_rows = ", ".join(
         f"('{tf}', {r})" for tf, remaining in CHECKPOINTS.items() for r in remaining
     )
-    con.sql(f"create table cps(tf varchar, remaining int) as values {checkpoint_rows}")
+    con.sql(f"create table cps as select * from (values {checkpoint_rows}) as v(tf, remaining)")
     con.sql(f"""
         create table priced as
         select r.market_id, r.asset, r.tf, c.remaining, r.up_won,
@@ -112,6 +112,55 @@ def main() -> None:
     survivors = df[(df["ev_test"] > 0) & (df["z_test"] > 2)] if len(df) else df
     print(f"\n{len(df)} bins looked profitable in TRAIN; {len(survivors)} held up in TEST "
           "(EV > 0 and z > 2).")
+    executable_check(con, trades)
+
+
+def executable_check(con: duckdb.DuckDBPyConnection, trades: str) -> None:
+    """Re-score the favorite bins at prices a buyer actually paid.
+
+    The last traded price can be a sale at the bid, one tick below what a buyer
+    pays. In the unified YES perspective, a BUY fill is someone paying the Up
+    ask, and a SELL fill at p is someone selling Up at the bid, which is the
+    same trade as buying Down at 1 - p. So the entry cost for Up is the last
+    BUY fill price, and for Down it is 1 minus the last SELL fill price.
+    """
+
+    print("\nBase rate of Up wins by period:")
+    print(con.sql("""
+        select case when train then 'train' else 'test' end as period,
+               count(distinct market_id) as rounds, round(avg(up_won), 4) as up_win_rate
+        from priced group by 1
+    """).df().to_string(index=False))
+    con.sql(f"""
+        create table exec_priced as
+        select r.market_id, r.tf, c.remaining, r.up_won, (r.end_s < {SPLIT_EPOCH}) as train,
+               arg_max(t.price, t.timestamp) filter (where t.side = 'BUY') as up_cost,
+               1 - arg_max(t.price, t.timestamp) filter (where t.side = 'SELL') as down_cost
+        from rounds r
+        join cps c using (tf)
+        join read_parquet('{trades}') t
+          on t.market_id = r.market_id
+         and t.timestamp >  r.end_s - c.remaining - {WINDOW_S}
+         and t.timestamp <= r.end_s - c.remaining
+        group by all
+    """)
+    print("\nFavorites at executable prices (entry cost 0.90 to 0.99), EV per share after fee:")
+    print(con.sql(f"""
+        with legs as (
+            select tf, remaining, train, 'Up' as side, up_cost as cost, up_won as won
+            from exec_priced where up_cost between 0.90 and 0.99
+            union all
+            select tf, remaining, train, 'Down', down_cost, 1 - up_won
+            from exec_priced where down_cost between 0.90 and 0.99
+        )
+        select tf, remaining, side, case when train then 'train' else 'test' end as period,
+               count(*) as n, round(avg(cost), 4) as mean_cost, round(avg(won), 4) as win_rate,
+               round(avg(won) - avg(cost) - {FEE_RATE} * avg(cost * (1 - cost)), 4) as ev,
+               round((avg(won) - avg(cost) - {FEE_RATE} * avg(cost * (1 - cost)))
+                     / sqrt(avg(won) * (1 - avg(won)) / count(*)), 2) as z
+        from legs group by all
+        order by tf, remaining desc, side, period desc
+    """).df().to_string(index=False))
 
 
 if __name__ == "__main__":
