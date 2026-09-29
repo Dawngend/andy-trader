@@ -90,6 +90,18 @@ short and too rare to trade after latency, and it is not shown to be executable.
 different times** (`pairing_mode: sequential`), which is two directional bets, not an arbitrage.
 Net of fees it made $0.007.
 
+Re-run over one full hour (12 rounds from 2026-05-29 14:00 UTC, `andy_pair_fee_compare.py`), with
+the strategy's own default of fees in the entry signal and with the example's fees-off setting:
+
+| Fees in signal | Pairs entered | Per-market total PnL |
+| --- | --- | --- |
+| On (strategy default) | 9 | -$1.80 |
+| Off (example setting) | 12 | -$3.18 |
+
+Because the second leg is bought later at whatever the price has moved to, the pairs cost 0.66 + 0.40
+= 1.06, 0.21 + 0.83 = 1.04, 0.20 + 0.81 = 1.01, 0.97 + 0.07 = 1.04 and so on: almost never under $1,
+and fees turn the rest into losses. Turning fees off only adds more losing pairs.
+
 Its two totals disagree: the per-market table says -0.085 and the portfolio summary says -10.09. The
 fills explain it exactly: the four legs cost $9.87 plus about $0.22 of taker fees, so the portfolio
 line counts every position as worthless. It never books the $1 payout on the two winning legs
