@@ -16,6 +16,10 @@
 # model_registry table already keeps the auditable record of every attempt.
 models/
 
+# Third-party research datasets (e.g. the SII-WANGZJ Polymarket history). Large,
+# regenerable from their public source, and kept on D: under a 20 GB cap.
+research_data/
+
 # Credentials
 .env
 .env.*
