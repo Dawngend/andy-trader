@@ -458,6 +458,92 @@ def _judge(
     )
 
 
+def final_check(verdicts: Sequence[EligibilityVerdict]) -> list[str]:
+    """Answer the skeptic's questions from the verdicts themselves.
+
+    Borrowed from a trading-research prompt's closing checklist ("Is the edge
+    real or just overfitting? What evidence would invalidate the thesis?").
+    Asked as bare questions they invite a reassuring answer; answered from the
+    gate's own numbers they cannot, which is the point of printing them under
+    every report instead of leaving them to memory.
+    """
+
+    total = len(verdicts)
+    eligible = [v for v in verdicts if v.eligible]
+    thin = [v for v in verdicts if v.sample_size < MINIMUM_SETTLED_CALLS]
+    never = [
+        v for v in verdicts
+        if v.break_even_win_rate is not None and v.break_even_win_rate >= 1.0
+    ]
+    shifted = [
+        v for v in verdicts
+        if v.brier_skill_score is not None
+        and v.recent_brier_skill_score is not None
+        and (v.brier_skill_score > 0) != (v.recent_brier_skill_score > 0)
+    ]
+    logged = sum(v.logged_calls or 0 for v in verdicts)
+    independent = sum(v.sample_size for v in verdicts)
+
+    lines = ["FINAL CHECK"]
+
+    lines.append("1. Is the edge real, or noise?")
+    if not eligible:
+        lines.append(f"   No edge is demonstrated: 0 of {total} pair(s) clear the gate.")
+    else:
+        names = ", ".join(f"{v.predictor} {v.instrument}" for v in eligible)
+        lines.append(f"   {len(eligible)} of {total} pair(s) clear the gate: {names}.")
+        if total > 1:
+            lines.append(
+                "   They were found by searching many pairs; confirm on a fresh window "
+                "before trusting them."
+            )
+
+    lines.append("2. What evidence would invalidate it?")
+    if not eligible:
+        lines.append("   Nothing has passed, so there is nothing to invalidate yet.")
+    for v in eligible:
+        need = (
+            f"hit rate below {v.break_even_win_rate:.1%}"
+            if v.break_even_win_rate is not None
+            else "hit rate below break-even"
+        )
+        lines.append(
+            f"   {v.predictor} {v.instrument}: recent skill turning negative, or {need}."
+        )
+
+    lines.append("3. Does it hold across regimes?")
+    if shifted:
+        lines.append(
+            f"   {len(shifted)} pair(s) have recent skill on the opposite side of zero "
+            "from their lifetime skill: the regime may have changed under them."
+        )
+    else:
+        lines.append("   No pair's recent skill contradicts its lifetime skill.")
+
+    lines.append("4. Which assumptions are weakest?")
+    lines.append(
+        f"   {len(thin)} of {total} pair(s) are below {MINIMUM_SETTLED_CALLS} independent "
+        "calls, so their scores are not yet evidence."
+    )
+    lines.append(
+        f"   {len(never)} pair(s) cannot break even at any hit rate: costs exceed the "
+        "average move."
+    )
+
+    lines.append("5. What might be missing?")
+    lines.append(
+        f"   {logged:,} logged calls rest on {independent:,} independent outcomes; "
+        "overlapping windows and legacy settlements are not counted as evidence."
+    )
+
+    lines.append("6. What would change the verdict?")
+    lines.append(
+        f"   A pair needs {MINIMUM_SETTLED_CALLS}+ independent corrected calls, positive "
+        "lifetime and recent Brier skill, and a hit rate above its cost break-even."
+    )
+    return lines
+
+
 def main(argv: "Sequence[str] | None" = None) -> int:
     """Report which (predictor, instrument) pairs are currently allowed to trade."""
 
@@ -523,6 +609,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         f"{'skill':>9} {'hit':>7} {'need':>7} {'recent':>9}  verdict"
     )
     allowed = 0
+    reported: list[EligibilityVerdict] = []
     for row in pairs:
         if args.predictor and row["predictor"] != args.predictor:
             continue
@@ -532,6 +619,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             instrument=row["instrument"],
             horizon=row["horizon"],
         )
+        reported.append(verdict)
         skill = (
             f"{verdict.brier_skill_score:+.4f}"
             if verdict.brier_skill_score is not None
@@ -573,6 +661,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
             php_per_usd=args.php_per_usd,
             only_predictor=args.predictor,
         )
+
+    print()
+    print("\n".join(final_check(reported)))
     return 0
 
 
