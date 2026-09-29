@@ -29,8 +29,23 @@ Almost all are daily "Highest temperature in <city>" buckets. Largest series by 
 - Market history: the public markets table has every weather market with outcomes; fills are in the
   same Hugging Face dataset (not yet extracted for weather).
 
-**To confirm before building:** each city's settlement source and station from the market rules text.
-The stations above are the likely ones, not yet verified against the rules.
+**Settlement confirmed from the official rules text** (`settlement_rules.py`, Gamma API, July 2026
+events):
+
+| City | Settlement source and station | Precision |
+| --- | --- | --- |
+| London | Wunderground, London City Airport (EGLC) | whole deg C |
+| NYC | Wunderground, LaGuardia (KLGA) | whole deg F |
+| Seoul | Wunderground, Incheon Intl (RKSI) | whole deg C |
+| Shanghai | Wunderground, Pudong Intl (ZSPD) | whole deg C |
+| Paris | Wunderground, Paris-Le Bourget (LFPB) | whole deg C |
+| Hong Kong | Hong Kong Observatory "Absolute Daily Max" (Daily Extract) | 0.1 deg C |
+
+Wunderground's airport history is built from the same METAR reports the free feed serves, so METAR
+is effectively the settlement data for five of the six. Rules also say a market cannot resolve until
+the next day's first data point is published, and revisions count until then. Unit conversion and
+rounding (METAR reports whole or tenths deg C; NYC settles in whole deg F) must be replicated exactly
+in any replay. Hong Kong needs the Observatory's own data instead.
 
 ## Proposed Paper Test (Fits The Existing Gate)
 
