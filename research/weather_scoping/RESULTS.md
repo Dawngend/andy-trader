@@ -79,7 +79,10 @@ left after the first few minutes is a handful of stale quotes, not a steady edge
   are not modeled.
 - The weather fee rate was not verified; results are shown at 0 and 0.07.
 - Wunderground rounding and revision rules are approximated by rounding METAR to whole degrees and a
-  one-degree margin; Paris (91.6% reproduction) shows this is imperfect for some stations.
+  one-degree margin. That holds for London (0 of 108 days where METAR's high differed from the winning
+  exact-degree bucket), Shanghai (0 of 30) and NYC (100% of buckets reproduced), but not for Seoul (14
+  of 110 days, 13%) or Paris (25 of 53 days, 47%, three by 2 C or more). The paper collector
+  (`andy_trader.weather`) therefore trades London, NYC and Shanghai only.
 - Delay is measured from the METAR observation time, not its publication time.
 
 ## Reproduce

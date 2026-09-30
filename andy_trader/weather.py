@@ -49,15 +49,18 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 # Settlement stations and units come from each market's official rules text
-# (research/weather_scoping/SCOPING.md). Hong Kong settles on the Observatory,
-# not a METAR station, so it is deliberately absent.
+# (research/weather_scoping/SCOPING.md). Only cities whose METAR high was
+# validated against real resolutions are tradeable here: London (0 of 108 days
+# disagreed), Shanghai (0 of 30) and NYC (100% of buckets reproduced). Seoul
+# (RKSI, 13% of days disagreed) and Paris (LFPB, 47%, three by 2 C or more)
+# settle on Wunderground figures that do not track METAR closely enough, and
+# Hong Kong settles on the Observatory rather than a METAR station, so all
+# three are deliberately absent.
 CITIES: dict[str, tuple[str, str, str]] = {
     # key: (ICAO station, time zone, slug fragment)
     "london": ("EGLC", "Europe/London", "london"),
     "nyc": ("KLGA", "America/New_York", "nyc"),
-    "seoul": ("RKSI", "Asia/Seoul", "seoul"),
     "shanghai": ("ZSPD", "Asia/Shanghai", "shanghai"),
-    "paris": ("LFPB", "Europe/Paris", "paris"),
 }
 DEFAULT_CITIES = ("london", "nyc")  # where the historical edge concentrated
 MARGIN = 1              # degrees the running high must clear a bucket edge by
