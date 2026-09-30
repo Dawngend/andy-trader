@@ -39,7 +39,7 @@ live-performance demotion path that pulled a promoted model back out of service.
 
 Every prediction is written to durable storage *before* its outcome can be known, carrying its
 timestamp, the reference price, the probability, and a snapshot of what the predictor saw. A separate
-settlement job resolves it later, and that job **never reads the prediction** — it looks up the price
+settlement job resolves it later, and that job **never reads the prediction**: it looks up the price
 and compares it to the reference. Keeping the outcome computation blind to the call is what stops a
 settlement bug from quietly flattering the score.
 
@@ -124,11 +124,11 @@ something the base rate does not, zero means it does not, negative means it is a
 
 The report also gives Murphy's decomposition, `Brier = reliability - resolution + uncertainty`:
 
-- **reliability** — 0 is perfectly calibrated. When you say 70%, it happens 70% of the time.
-- **resolution** — higher is more informative. How far predictions move away from the base rate
+- **reliability**: 0 is perfectly calibrated. When you say 70%, it happens 70% of the time.
+- **resolution**: higher is more informative. How far predictions move away from the base rate
   *correctly*. A model can be perfectly calibrated and completely useless by always predicting the
   base rate; resolution is what catches that.
-- **uncertainty** — fixed by the data, not the model.
+- **uncertainty**: fixed by the data, not the model.
 
 **Hit rate is reported but is not the headline.** It throws away the confidence, so a predictor that
 is 51% right while claiming certainty scores the same as one that is 51% right while saying so.
@@ -357,7 +357,7 @@ EV per trade = M(2p - 1) - C          break-even  =>  p = 0.5 + C / (2M)
     C = round-trip cost (fee + slippage, entry and exit)
 ```
 
-`C` is a flat ~30 bps whatever you trade. `M` is not — it grows with the horizon.
+`C` is a flat ~30 bps whatever you trade. `M` is not: it grows with the horizon.
 Measured on this repository's own BTC history:
 
 | Interval | Average move | Cost as share of move | Break-even win rate | |
@@ -377,7 +377,7 @@ Best directional accuracy observed across every predictor here is about 52%.
 So the six negative results above were over-determined. Even had one of them
 found real signal, the horizon it was pointed at could not have paid for it.
 Collection and prediction now include 1d, the shortest horizon where profit is
-available at all — at the honest cost that evidence accrues 24x more slowly.
+available at all, at the honest cost that evidence accrues 24x more slowly.
 
 ```bash
 python -m andy_trader.economics --intervals 1m,1h,4h,1d
@@ -404,9 +404,9 @@ simply trading it less. Swept 0.50 through 0.75 on daily BTC-USD:
 | --- | --- | --- | --- |
 | `momentum` | -66.25% | **-53.21%** at 0.55 | 335 of 399 |
 | `ema_crossover_12_26` | -71.43% | **-32.29%** at 0.60 | 209 of 399 |
-| `random` | -66.54% | -38.29% at 0.65 (non-monotonic — noise) | 272 of 399 |
+| `random` | -66.54% | -38.29% at 0.65 (non-monotonic, noise) | 272 of 399 |
 
-Gross return actually improved as the bar rose — `momentum` reached **+27.96%**
+Gross return actually improved as the bar rose: `momentum` reached **+27.96%**
 gross at 0.55, meaning its most confident calls really were more often right.
 Net return never got near zero regardless. The edge concentrated in a
 predictor's strongest calls is real but too small to survive a single round
@@ -414,7 +414,7 @@ trip once isolated, let alone the hundreds this repository's baselines still
 take even at a raised threshold.
 
 (Baselines cap confidence at 0.65 by design, which is why every baseline but
-`random` shows zero trades above that point — there is no higher-conviction
+`random` shows zero trades above that point; there is no higher-conviction
 tier of momentum or EMA-crossover calls left to test.)
 
 ```bash
@@ -433,7 +433,7 @@ deploying capital immediately and kept deploying it no matter how it scored.
 
 What that cost: `baseline:momentum` ran eight instruments to -3.28% with zero winners. Its
 calibration bins say why, and it is not fees. Over 2,818 settled calls it scored -0.0390
-skill with a **47.1% hit rate**, and it was inverted at the extremes — when most confident
+skill with a **47.1% hit rate**, and it was inverted at the extremes: when most confident
 price would fall, price rose 56-65% of the time.
 
 `andy_trader/paper_gate.py` now applies the same bar to everything, judged per instrument,
@@ -498,7 +498,7 @@ monotone in the size of the move:
 | $100-150 | 510 | 96.7% |
 
 The signal was never the problem. Against 400 real resolved Polymarket rounds, the
-favourite won 94.16% at an average price of $0.9266 — an edge of +1.5 points, which is
+favourite won 94.16% at an average price of $0.9266, an edge of +1.5 points, which is
 **inside its own standard error (±1.59) and smaller than the spread crossed to enter**.
 
 And more decisively: at the source bot's stated 50%-of-bankroll stake, that edge produces
@@ -510,7 +510,7 @@ the Kelly-optimal stake and past 2x Kelly growth turns negative by construction.
 fractional Kelly that stakes nothing without a measured edge and ignores any band with
 fewer than 30 samples. `tests/test_fast_momentum.py` encodes the finding as an assertion.
 
-## Complete sets are the only surviving research path, not a live strategy yet
+## Complete sets: the gaps were read skew, not arbitrage
 
 CT-11 measures whether equal shares of both outcomes can be bought for less than their
 combined $1 face payout. It walks the full ask depth on both legs and applies Polymarket's
@@ -575,6 +575,36 @@ execution latency, the mispricings it can see do not last long enough to be boug
 readiness gate's hundred confirmed trades cannot accumulate. Closing that gap would take a
 different system (sub-second, co-located execution), not more of this one; the research path is
 effectively closed rather than merely waiting for data.
+
+**Why (2026-09-30, [full report](research/REPORT_2026-09-30_polymarket_edges.md)).** Polymarket's Up
+and Down books mirror each other, so in a consistent book the two best asks sum to $1 plus the spread.
+The live record shows it: sub-$1 best-ask sums fell from 84 in 6,099 observations (Sep 6 to 19) to 7 in
+124,609 (Sep 20 to 29), the day the collector switched to synchronized batches. Replaying 64 hours of
+public L2 books (PMXT, 653 BTC 5m rounds) through the unchanged `observe_complete_set` found the rest
+are one side's quotes going stale while the other side moves. Separately, 381 million fills across
+134,253 Up/Down rounds show late-round prices are calibrated, and "buy the favorite near the close"
+loses money at the prices a buyer actually pays.
+
+## Weather buckets: the first edge that survives measurement
+
+Polymarket's daily-high temperature markets settle on an airport weather station, and that station's
+public METAR reports reproduce 99.07% of their resolutions. Once the day's running high passes a bucket
+by one degree, the bucket is decided hours before the market closes, and 3,892 of 3,893 such early
+calls were right. Historically, buying the already-decided side within 5 minutes of the deciding report
+would have netted about $3,600 over 15 months across five cities; at 15 minutes about $690, and at an
+hour almost nothing. It is real, small, and a race
+([results](research/weather_scoping/RESULTS.md)).
+
+`andy_trader.weather` paper-trades it every minute for London and NYC: it reads METAR, times each
+bucket from the report that first decided it, walks the decided side's real order book, and opens at
+most one paper trade per bucket when it is still offered below $1 after the market's own fee. It makes
+GET requests only and holds its own gate: 200 settled trades, positive net and recent PnL, and a hit
+rate above cost break-even.
+
+```bash
+python -m andy_trader.weather run --cities london nyc
+python -m andy_trader.weather report
+```
 
 ## Honest expectations
 
