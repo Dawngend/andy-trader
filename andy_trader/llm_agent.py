@@ -73,8 +73,8 @@ def render_context(connection: sqlite3.Connection, instruments: Sequence[str], n
     return "\n".join(lines)
 
 
-def ask_model(context: str, *, opener=urllib.request.urlopen) -> dict:
-    body = {"model": os.environ["LLM_MODEL"], "messages": [
+def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen) -> dict:
+    body = {"model": model or os.environ["LLM_MODEL"], "messages": [
         {"role": "system", "content": "Return JSON only: {\"calls\": [{\"instrument\": \"...\", \"p_up\": 0.0, \"reason\": \"one sentence\"}]}. p_up is the probability that the next hourly close is above the current close. Code decides position size, leverage, and exits."},
         {"role": "user", "content": context},
     ]}
@@ -150,7 +150,10 @@ class LlmPredictor:
             ORDER BY created_at DESC, id DESC LIMIT 1
         """, (since, now_iso, config_rev)).fetchone()
         if recent:
-            rows = connection.execute("SELECT instrument, p_up FROM llm_decisions WHERE batch_id = ?", (recent["batch_id"],)).fetchall()
+            rows = connection.execute(
+                "SELECT instrument, p_up FROM llm_decisions WHERE batch_id = ? AND status != 'ablation'",
+                (recent["batch_id"],),
+            ).fetchall()
             if {row["instrument"] for row in rows} == set(self.instruments):
                 return {row["instrument"]: row["p_up"] for row in rows}
 
