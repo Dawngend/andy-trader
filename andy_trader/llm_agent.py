@@ -27,7 +27,11 @@ def _ordered_prices(connection: sqlite3.Connection, instruments: Sequence[str]) 
         closes = [value for _, value in load_closes(connection, instrument, limit=25)]
         move = (closes[-1] / closes[-25] - 1) * 100 if len(closes) >= 25 and closes[-25] else None
         result.append((instrument, closes, move))
-    return sorted(result, key=lambda item: (-abs(item[2]) if item[2] is not None else float("-inf"), item[0]))
+    return sorted(result, key=lambda item: (
+        item[2] is None,
+        -abs(item[2]) if item[2] is not None else 0,
+        item[0],
+    ))
 
 
 def _signal(connection: sqlite3.Connection, name: str, instrument: str | None, now_iso: str) -> str:
@@ -84,19 +88,21 @@ def ask_model(context: str, *, opener=urllib.request.urlopen) -> dict:
 def _parse(response: dict, instruments: Sequence[str]) -> dict[str, tuple[float, str]]:
     content = response["choices"][0]["message"]["content"]
     data = json.loads(content)
-    if not isinstance(data, dict) or set(data) != {"calls"} or not isinstance(data["calls"], list):
+    if not isinstance(data, dict) or not isinstance(data.get("calls"), list):
         raise ValueError("Invalid calls object")
     calls = {}
     for call in data["calls"]:
-        if not isinstance(call, dict) or set(call) != {"instrument", "p_up", "reason"}:
-            raise ValueError("Invalid call")
-        instrument, probability, reason = call["instrument"], call["p_up"], call["reason"]
+        if not isinstance(call, dict):
+            continue
+        instrument, probability = call.get("instrument"), call.get("p_up")
         if not isinstance(instrument, str) or instrument not in instruments or instrument in calls:
-            raise ValueError("Unexpected or duplicate instrument")
+            continue
         if isinstance(probability, bool) or not isinstance(probability, (int, float)) or not math.isfinite(probability) or not 0 <= probability <= 1:
-            raise ValueError("Invalid probability")
-        if not isinstance(reason, str) or not reason.strip() or "\n" in reason or reason.count(".") > 1:
-            raise ValueError("Invalid reason")
+            continue
+        reason = call.get("reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+        reason = " ".join(reason.split())[:300]
         calls[instrument] = (max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, float(probability))), reason)
     return calls
 

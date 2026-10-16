@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from andy_trader.baselines import PredictionContext, default_baselines
-from andy_trader.llm_agent import LlmPredictor, ask_model, build_predictors, render_context
+from andy_trader.llm_agent import LlmPredictor, _ordered_prices, _parse, ask_model, build_predictors, render_context
 from andy_trader.llm_ledger import fetch_decisions, initialize_ledger, latest_decision, record_decision
 from andy_trader.store import Candle, connect, record_observations
 
@@ -56,6 +56,12 @@ def test_context_sections_order_and_determinism(tmp_path):
             assert f"## SECTION: {name}" in first
         assert "24h volatility" in first
         assert "unavailable" in first
+
+
+def test_missing_history_sorts_last_after_known_moves(tmp_path):
+    with _db(tmp_path) as connection:
+        ordered = _ordered_prices(connection, ("AAA-USD", "BTC-USD", "ETH-USD"))
+        assert [row[0] for row in ordered] == ["ETH-USD", "BTC-USD", "AAA-USD"]
 
 
 def test_ledger_is_append_only_and_filters_replays(tmp_path):
@@ -123,9 +129,36 @@ def test_lower_probability_is_clamped(monkeypatch, tmp_path):
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == pytest.approx(0.35)
 
 
+def test_parse_accepts_multi_sentence_decimal_reason_and_extra_fields():
+    parsed = _parse(_reply(
+        {"instrument": "BTC-USD", "p_up": 0.6,
+         "reason": "Funding is 0.05, so crowding is high.\nWatch for a reversal.", "extra": True},
+    ), INSTRUMENTS)
+    assert parsed["BTC-USD"] == (0.6, "Funding is 0.05, so crowding is high. Watch for a reversal.")
+
+
+def test_parse_cuts_reason_to_300_characters():
+    parsed = _parse(_reply({"instrument": "BTC-USD", "p_up": 0.6, "reason": "x" * 350}), INSTRUMENTS)
+    assert parsed["BTC-USD"][1] == "x" * 300
+
+
+def test_one_bad_call_does_not_discard_valid_calls(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _context: _reply(
+        {"instrument": "BTC-USD", "p_up": 0.7, "reason": "valid"},
+        {"instrument": "ETH-USD", "p_up": 2, "reason": "invalid"},
+    ))
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == pytest.approx(0.65)
+        rows = {row["instrument"]: row for row in fetch_decisions(connection, 10)}
+        assert rows["BTC-USD"]["status"] == "ok"
+        assert rows["ETH-USD"]["status"] == "missing"
+        assert rows["ETH-USD"]["p_up"] == 0.5
+
+
 @pytest.mark.parametrize("reply", [
     {"choices": [{"message": {"content": "bad json"}}]},
-    _reply({"instrument": "BTC-USD", "p_up": 1.1, "reason": "Up."}),
+    {"choices": [{"message": {"content": json.dumps({"other": []})}}]},
 ])
 def test_bad_json_or_probability_writes_error(monkeypatch, tmp_path, reply):
     _configured(monkeypatch)
