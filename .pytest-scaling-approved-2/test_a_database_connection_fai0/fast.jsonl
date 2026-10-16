@@ -1,0 +1,2 @@
+{"at": "2026-10-16T15:00:59+00:00", "database": "D:\\wt-trader-stake-rule-replay-20261016\\.pytest-scaling-approved-2\\test_a_database_connection_fai0\\fast.db", "elapsed_seconds": 3.9e-05, "event": "fast_pass_started", "instruments": ["BTC-USD"], "run_id": "0d3413801aa44b97aa30e18c38cf3e58"}
+{"at": "2026-10-16T15:00:59+00:00", "elapsed_seconds": 0.000263, "error": "database unavailable", "error_type": "OSError", "event": "fast_pass_failed", "run_id": "0d3413801aa44b97aa30e18c38cf3e58"}

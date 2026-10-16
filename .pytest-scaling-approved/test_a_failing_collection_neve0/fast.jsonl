@@ -1,0 +1,2 @@
+{"at": "2026-10-16T14:59:44+00:00", "database": "D:\\wt-trader-stake-rule-replay-20261016\\.pytest-scaling-approved\\test_a_failing_collection_neve0\\fast.db", "elapsed_seconds": 4.2e-05, "event": "fast_pass_started", "instruments": ["BTC-USD"], "run_id": "bde8ba3091f44acd94ef62e789b41d86"}
+{"at": "2026-10-16T14:59:44+00:00", "elapsed_seconds": 0.076474, "error": "venue unreachable", "error_type": "CollectorError", "event": "fast_pass_failed", "run_id": "bde8ba3091f44acd94ef62e789b41d86"}
