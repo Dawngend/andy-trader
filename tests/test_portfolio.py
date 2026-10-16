@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from andy_trader.portfolio import (
+    DEFAULT_STOP_PCT,
+    DEFAULT_TARGET_PCT,
     DEFAULT_FLAT_THRESHOLD,
     DEFAULT_LONG_THRESHOLD,
     DEFAULT_SHORT_THRESHOLD,
@@ -22,7 +24,7 @@ from andy_trader.portfolio import (
     paper_trade_once,
     run_paper_cycle,
 )
-from andy_trader.store import Candle, Prediction, connect, record_observations, record_prediction
+from andy_trader.store import Candle, Prediction, connect, initialize_database, record_observations, record_prediction
 
 
 def _conn() -> sqlite3.Connection:
@@ -287,6 +289,133 @@ def test_run_paper_cycle_stays_flat_below_threshold() -> None:
     )
     assert result.trade is None
     assert result.equity == pytest.approx(10_000.0)
+
+
+def _bar(connection: sqlite3.Connection, *, at: str, high: float, low: float,
+         interval: str = "1m") -> None:
+    record_observations(connection, [Candle(
+        instrument="BTC-USD", venue="bybit", interval=interval, open_time=at,
+        open=100.0, high=high, low=low, close=100.0, volume=1.0,
+    )])
+
+
+@pytest.mark.parametrize("side,high,low,expected_price,reason", [
+    ("long", 101.0, 98.0, 98.0, "bracket stop"),
+    ("long", 104.0, 99.0, 104.0, "bracket target"),
+    ("long", 105.0, 97.0, 98.0, "bracket stop"),
+    ("short", 102.0, 99.0, 102.0, "bracket stop"),
+    ("short", 101.0, 96.0, 96.0, "bracket target"),
+    ("short", 103.0, 95.0, 102.0, "bracket stop"),
+])
+def test_bracket_exits_at_touched_price(side: str, high: float, low: float,
+                                        expected_price: float, reason: str) -> None:
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(connection, predictor="p", instrument="BTC-USD",
+                        target_side=side, price=100.0, now_iso=opened, reason="open")
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso=later)
+    assert state.stop_price == pytest.approx(98.0 if side == "long" else 102.0)
+    assert state.target_price == pytest.approx(104.0 if side == "long" else 96.0)
+    assert state.entry_at == opened
+    _bar(connection, at=later, high=high, low=low)
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9 if side == "long" else 0.1,
+                             price=110.0, now_iso=later)
+    assert result.trade is not None
+    assert result.trade.price == pytest.approx(expected_price)
+    assert result.trade.reason == reason
+    assert result.trade.fee_cost > 0
+    assert result.trade.slippage_cost > 0
+    assert get_or_create_state(connection, predictor="p", instrument="BTC-USD",
+                               now_iso=later).position_qty == 0
+
+
+def test_bracket_uses_finest_interval_and_does_not_exit_without_a_touch() -> None:
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T01:00:00+00:00"
+    execute_paper_trade(connection, predictor="p", instrument="BTC-USD",
+                        target_side="long", price=100.0, now_iso=opened, reason="open")
+    _bar(connection, at=later, high=105.0, low=97.0, interval="1h")
+    _bar(connection, at=later, high=103.0, low=99.0)
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=100.0, now_iso=later)
+    assert result.trade is None
+
+
+def test_bracket_ignores_bars_before_entry_and_keeps_entry_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _conn()
+    initialize_database(connection)
+    monkeypatch.setenv("CRYPTO_STOP_PCT", "3")
+    monkeypatch.setenv("CRYPTO_TARGET_PCT", "5")
+    opened = "2026-09-05T00:01:00+00:00"
+    _bar(connection, at="2026-09-05T00:00:00+00:00", high=110.0, low=90.0)
+    execute_paper_trade(connection, predictor="p", instrument="BTC-USD",
+                        target_side="long", price=100.0, now_iso=opened, reason="open")
+    monkeypatch.setenv("CRYPTO_STOP_PCT", "1")
+    monkeypatch.setenv("CRYPTO_TARGET_PCT", "1")
+    _bar(connection, at="2026-09-05T00:02:00+00:00", high=104.0, low=98.0)
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=100.0,
+                             now_iso="2026-09-05T00:02:00+00:00")
+    assert result.trade is None
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD",
+                                now_iso="2026-09-05T00:02:00+00:00")
+    assert state.stop_price == pytest.approx(97.0)
+    assert state.target_price == pytest.approx(105.0)
+    assert DEFAULT_STOP_PCT == 2.0
+    assert DEFAULT_TARGET_PCT == 4.0
+
+
+def test_bracket_reentry_waits_for_no_trade_band() -> None:
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    execute_paper_trade(connection, predictor="p", instrument="BTC-USD",
+                        target_side="long", price=100.0, now_iso=opened, reason="open")
+    _bar(connection, at="2026-09-05T00:01:00+00:00", high=101.0, low=98.0)
+    probabilities = [0.9, 0.9, 0.5, 0.9]
+    trades = []
+    for minute, probability in enumerate(probabilities, 1):
+        result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                                 probability_up=probability, price=100.0,
+                                 now_iso=f"2026-09-05T00:0{minute}:00+00:00")
+        trades.append(result.trade)
+    assert trades[0].reason == "bracket stop"
+    assert trades[1] is None
+    assert trades[2] is None
+    assert trades[3].side == "long"
+
+
+def test_bracket_migration_is_idempotent_and_backfills_open_position() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("""CREATE TABLE paper_portfolio_state (
+        predictor TEXT NOT NULL, instrument TEXT NOT NULL, cash REAL NOT NULL,
+        position_qty REAL NOT NULL, avg_entry_price REAL, updated_at TEXT NOT NULL,
+        PRIMARY KEY (predictor, instrument))""")
+    opened = "2026-09-05T00:00:00+00:00"
+    connection.execute("INSERT INTO paper_portfolio_state VALUES (?, ?, ?, ?, ?, ?)",
+                       ("p", "BTC-USD", 0.0, 100.0, 100.0, opened))
+    initialize_database(connection)
+    initialize_portfolio(connection)
+    initialize_portfolio(connection)
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD",
+                                now_iso="2026-09-05T00:01:00+00:00")
+    assert state.stop_price is None
+    _bar(connection, at="2026-09-05T00:01:00+00:00", high=101.0, low=99.0)
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=100.0,
+                             now_iso="2026-09-05T00:01:00+00:00")
+    assert result.trade is None
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD",
+                                now_iso="2026-09-05T00:01:00+00:00")
+    assert state.stop_price == pytest.approx(98.0)
+    assert state.target_price == pytest.approx(104.0)
+    assert state.entry_at == opened
 
 
 def test_cannot_trade_at_nonpositive_price() -> None:

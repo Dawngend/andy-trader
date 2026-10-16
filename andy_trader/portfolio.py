@@ -40,12 +40,16 @@ comparable, not measuring two different cost worlds.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import math
+import os
 import sqlite3
 from typing import Literal, Mapping, Sequence
 
 DEFAULT_STARTING_CASH = 10_000.0
+DEFAULT_STOP_PCT = 2.0
+DEFAULT_TARGET_PCT = 4.0
 
 # Environment override for the stake a NEW paper portfolio opens with.
 #
@@ -84,6 +88,25 @@ def configured_starting_cash(environ: "Mapping[str, str] | None" = None) -> floa
     return value
 
 
+def _bracket_percent(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise PortfolioError(f"{name} must be a number, got {raw!r}") from exc
+    if not math.isfinite(value) or not 0 < value < 100:
+        raise PortfolioError(f"{name} must be between 0 and 100, got {value!r}")
+    return value
+
+
+def _bracket_prices(entry: float, side: Side) -> tuple[float, float]:
+    stop = _bracket_percent("CRYPTO_STOP_PCT", DEFAULT_STOP_PCT) / 100
+    target = _bracket_percent("CRYPTO_TARGET_PCT", DEFAULT_TARGET_PCT) / 100
+    if side == "long":
+        return entry * (1 - stop), entry * (1 + target)
+    return entry * (1 + stop), entry * (1 - target)
+
+
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
@@ -109,6 +132,10 @@ class PortfolioState:
     position_qty: float
     avg_entry_price: float | None
     updated_at: str
+    stop_price: float | None = None
+    target_price: float | None = None
+    entry_at: str | None = None
+    reentry_locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -152,6 +179,10 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
             position_qty REAL NOT NULL,
             avg_entry_price REAL,
             updated_at TEXT NOT NULL,
+            stop_price REAL,
+            target_price REAL,
+            entry_at TEXT,
+            reentry_locked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (predictor, instrument)
         )
         """
@@ -211,6 +242,14 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE paper_portfolio_state ADD COLUMN basis_started_at TEXT"
         )
+    for name, definition in (
+        ("stop_price", "REAL"),
+        ("target_price", "REAL"),
+        ("entry_at", "TEXT"),
+        ("reentry_locked", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE paper_portfolio_state ADD COLUMN {name} {definition}")
     connection.commit()
 
 
@@ -244,6 +283,10 @@ def get_or_create_state(
             position_qty=float(row["position_qty"]),
             avg_entry_price=row["avg_entry_price"],
             updated_at=row["updated_at"],
+            stop_price=row["stop_price"],
+            target_price=row["target_price"],
+            entry_at=row["entry_at"],
+            reentry_locked=bool(row["reentry_locked"]),
         )
     connection.execute(
         """
@@ -269,7 +312,8 @@ def _save_state(connection: sqlite3.Connection, state: PortfolioState) -> None:
     connection.execute(
         """
         UPDATE paper_portfolio_state
-        SET cash = ?, position_qty = ?, avg_entry_price = ?, updated_at = ?
+        SET cash = ?, position_qty = ?, avg_entry_price = ?, updated_at = ?,
+            stop_price = ?, target_price = ?, entry_at = ?, reentry_locked = ?
         WHERE predictor = ? AND instrument = ?
         """,
         (
@@ -277,6 +321,10 @@ def _save_state(connection: sqlite3.Connection, state: PortfolioState) -> None:
             state.position_qty,
             state.avg_entry_price,
             state.updated_at,
+            state.stop_price,
+            state.target_price,
+            state.entry_at,
+            int(state.reentry_locked),
             state.predictor,
             state.instrument,
         ),
@@ -368,6 +416,7 @@ def execute_paper_trade(
         qty = deployable / price
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
+        stop_price, target_price = _bracket_prices(price, "long")
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -376,6 +425,9 @@ def execute_paper_trade(
             position_qty=qty,
             avg_entry_price=price,
             updated_at=now_iso,
+            stop_price=stop_price,
+            target_price=target_price,
+            entry_at=now_iso,
         )
         trade = Trade(
             predictor=predictor,
@@ -405,6 +457,7 @@ def execute_paper_trade(
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
         new_cash = state.cash + proceeds
+        stop_price, target_price = _bracket_prices(price, "short")
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -413,6 +466,9 @@ def execute_paper_trade(
             position_qty=-qty,
             avg_entry_price=price,
             updated_at=now_iso,
+            stop_price=stop_price,
+            target_price=target_price,
+            entry_at=now_iso,
         )
         trade = Trade(
             predictor=predictor,
@@ -442,6 +498,7 @@ def execute_paper_trade(
             position_qty=0.0,
             avg_entry_price=None,
             updated_at=now_iso,
+            reentry_locked=reason.startswith("bracket "),
         )
         trade = Trade(
             predictor=predictor,
@@ -476,6 +533,7 @@ def execute_paper_trade(
             position_qty=0.0,
             avg_entry_price=None,
             updated_at=now_iso,
+            reentry_locked=reason.startswith("bracket "),
         )
         trade = Trade(
             predictor=predictor,
@@ -504,6 +562,69 @@ def execute_paper_trade(
     )
     connection.commit()
     return trade
+
+
+def check_bracket(
+    connection: sqlite3.Connection,
+    predictor: str,
+    instrument: str,
+    now_iso: str,
+    *,
+    fee_bps: float = DEFAULT_FEE_BPS,
+    slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+) -> Trade | None:
+    """Close at the first touched bracket on the finest stored candle series."""
+    state = get_or_create_state(
+        connection, predictor=predictor, instrument=instrument, now_iso=now_iso
+    )
+    if state.position_qty == 0:
+        return None
+    if state.stop_price is None or state.target_price is None or state.entry_at is None:
+        side: Side = "long" if state.position_qty > 0 else "short"
+        stop_price, target_price = _bracket_prices(state.avg_entry_price, side)
+        state = replace(
+            state, stop_price=stop_price, target_price=target_price,
+            entry_at=state.updated_at,
+        )
+        _save_state(connection, state)
+
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crypto_observations'"
+    ).fetchone():
+        return None
+    bars = connection.execute(
+        """
+        SELECT interval, open_time, high, low FROM crypto_observations
+        WHERE instrument = ? AND open_time >= ? AND open_time <= ?
+          AND degraded = 0 AND high IS NOT NULL AND low IS NOT NULL
+        """,
+        (instrument, state.entry_at, now_iso),
+    ).fetchall()
+    if not bars:
+        return None
+
+    def interval_minutes(interval: str) -> int:
+        unit = interval[-1]
+        return int(interval[:-1]) * {"m": 1, "h": 60, "d": 1440}[unit]
+
+    finest = min(interval_minutes(bar["interval"]) for bar in bars)
+    for bar in sorted(bars, key=lambda row: row["open_time"]):
+        if interval_minutes(bar["interval"]) != finest:
+            continue
+        if state.position_qty > 0:
+            stop_hit = bar["low"] <= state.stop_price
+            target_hit = bar["high"] >= state.target_price
+        else:
+            stop_hit = bar["high"] >= state.stop_price
+            target_hit = bar["low"] <= state.target_price
+        if stop_hit or target_hit:
+            return execute_paper_trade(
+                connection, predictor=predictor, instrument=instrument,
+                target_side="flat", price=state.stop_price if stop_hit else state.target_price,
+                now_iso=now_iso, reason="bracket stop" if stop_hit else "bracket target",
+                fee_bps=fee_bps, slippage_bps=slippage_bps,
+            )
+    return None
 
 
 def mark_to_market(
@@ -619,6 +740,32 @@ def run_paper_cycle(
         now_iso=now_iso,
         current_equity=live_equity,
     )
+
+    bracket_trade = check_bracket(
+        connection, predictor, instrument, now_iso,
+        fee_bps=fee_bps, slippage_bps=slippage_bps,
+    )
+    if bracket_trade is not None:
+        equity = mark_to_market(
+            connection, predictor=predictor, instrument=instrument,
+            price=price, now_iso=now_iso, starting_cash=starting_cash,
+        )
+        return PaperCycleResult(
+            trade=bracket_trade, equity=equity, risk_allowed=decision.allowed,
+            risk_reason=decision.reason, forced_exit=False,
+        )
+
+    if current_side == "flat" and current_state.reentry_locked:
+        if DEFAULT_SHORT_THRESHOLD < probability_up < DEFAULT_LONG_THRESHOLD:
+            _save_state(connection, replace(current_state, reentry_locked=False))
+        equity = mark_to_market(
+            connection, predictor=predictor, instrument=instrument,
+            price=price, now_iso=now_iso, starting_cash=starting_cash,
+        )
+        return PaperCycleResult(
+            trade=None, equity=equity, risk_allowed=decision.allowed,
+            risk_reason=decision.reason, forced_exit=False,
+        )
 
     desired = decide_side(probability_up, current_side=current_side)
     forced_exit = False
