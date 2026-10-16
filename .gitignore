@@ -53,3 +53,4 @@ overnight_complete_set_collect.py
 Thumbs.db
 desktop.ini
 .DS_Store
+.pytest-scaling*/
