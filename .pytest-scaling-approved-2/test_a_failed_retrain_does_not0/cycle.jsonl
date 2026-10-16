@@ -1,0 +1,6 @@
+{"at": "2026-10-16T15:00:59+00:00", "backed_off_venues": [], "elapsed_seconds": 0.078159, "event": "cycle_started", "horizons": ["1h"], "instruments": ["BTC-USD"], "intervals": ["1h"], "requested_venues": ["tradingview", "bybit"], "run_id": "8293394bc2dd41fea5d050e5812d5b4d", "venues": ["tradingview", "bybit"]}
+{"at": "2026-10-16T15:00:59+00:00", "candles": 1, "elapsed_seconds": 0.078461, "event": "primary_prices_collected", "problems": 0, "run_id": "8293394bc2dd41fea5d050e5812d5b4d"}
+{"at": "2026-10-16T15:00:59+00:00", "bybit_enabled": true, "bybit_signals": null, "elapsed_seconds": 0.078654, "event": "signals_collected", "problem_details": [], "problems": 0, "run_id": "8293394bc2dd41fea5d050e5812d5b4d", "signals": 0}
+{"at": "2026-10-16T15:00:59+00:00", "attempts": [{"error": "not enough history", "instrument": "BTC-USD"}], "elapsed_seconds": 0.118302, "event": "retrain_completed", "run_id": "8293394bc2dd41fea5d050e5812d5b4d"}
+{"at": "2026-10-16T15:00:59+00:00", "elapsed_seconds": 0.143225, "event": "store_updated", "inserted": 1, "observed": 1, "predictions": 2, "run_id": "8293394bc2dd41fea5d050e5812d5b4d", "settled": {"due": 0, "settled": 0, "unresolvable": 0}, "skipped": 3}
+{"at": "2026-10-16T15:00:59+00:00", "degraded": 0, "elapsed_seconds": 0.143564, "event": "cycle_completed", "run_id": "8293394bc2dd41fea5d050e5812d5b4d"}
