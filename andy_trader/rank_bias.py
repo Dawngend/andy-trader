@@ -25,7 +25,11 @@ def boundary_ratio(connection: sqlite3.Connection, arm: str, cut: int = 3) -> fl
                  if row_arm == arm}
     before = positions.get(cut)
     after = positions.get(cut + 1)
-    if before is None or after is None or before[0] < 10 or after[0] < 10 or after[1] == 0:
+    if before is None or after is None or before[0] < 10 or after[0] < 10:
+        return None
+    if before[1] > 0 and after[1] == 0:
+        return float("inf")
+    if before[1] == 0 and after[1] == 0:
         return None
     return before[1] / after[1]
 
@@ -39,8 +43,12 @@ def main() -> None:
         print("arm       position  decisions  conviction share")
         for arm, position, decisions, share in selection_by_rank(connection):
             print(f"{arm:<10}{position:>8}{decisions:>11}{share:>18.1%}")
-        ranked = boundary_ratio(connection, "ranked")
-        shuffled = boundary_ratio(connection, "shuffled")
+        cut = 3
+        ranked = boundary_ratio(connection, "ranked", cut=cut)
+        shuffled = boundary_ratio(connection, "shuffled", cut=cut)
+        for arm, ratio in (("ranked", ranked), ("shuffled", shuffled)):
+            if ratio == float("inf"):
+                print(f"{arm}: no conviction calls at position {cut + 1}")
         if ranked is None or shuffled is None:
             print("There are too few decisions to compare the arms at the cut.")
         elif ranked > shuffled:

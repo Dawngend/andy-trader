@@ -51,9 +51,9 @@ def test_replay_pairs_scores_costs_and_never_becomes_latest(tmp_path):
         assert result["agreement"] == 0.5
         assert result["mean_absolute_difference"] == pytest.approx(0.2)
         assert result["models"]["expensive"]["brier"] == pytest.approx(0.10)
-        assert result["models"]["cheap"]["brier"] == pytest.approx(0.26)
+        assert result["models"]["replay:cheap"]["brier"] == pytest.approx(0.26)
         assert result["models"]["expensive"]["tokens_per_100_batches"] == 5000
-        assert result["models"]["cheap"]["tokens_per_100_batches"] == 2000
+        assert result["models"]["replay:cheap"]["tokens_per_100_batches"] == 2000
         assert result["cost_ratio"] == pytest.approx(0.2)
         rows = connection.execute("SELECT * FROM llm_decisions WHERE status = 'replay' ORDER BY instrument").fetchall()
         assert [(r["instrument"], r["replay_of"]) for r in rows] == [("BTC-USD", btc), ("ETH-USD", eth)]
@@ -71,8 +71,22 @@ def test_open_hour_has_no_brier_and_replays_are_not_sources(tmp_path):
             result = replay(connection, model="cheap", ask=lambda context, *, model: _answer(("BTC-USD", 0.6)))
             assert result["batches"] == 1 and result["settled_calls"] == 0
             assert result["models"]["expensive"]["brier"] is None
-            assert result["models"]["cheap"]["brier"] is None
+            assert result["models"]["replay:cheap"]["brier"] is None
         assert connection.execute("SELECT COUNT(*) FROM llm_decisions WHERE status = 'replay'").fetchone()[0] == 2
+
+
+def test_replay_same_model_keeps_original_and_replay_totals(tmp_path):
+    when = datetime.now(UTC) - timedelta(hours=2)
+    context = "## SECTION: prices\n1. BTC-USD: close 100; 1h 0%\n## SECTION: funding_rate"
+    with connect(tmp_path / "test.db") as connection:
+        initialize_ledger(connection)
+        _original(connection, when, "batch", "BTC-USD", 0.8, context)
+        connection.execute("UPDATE llm_decisions SET cost = 0.02 WHERE batch_id = 'batch'")
+        result = replay(connection, model="expensive", ask=lambda context, *, model: _answer(("BTC-USD", 0.6)))
+        assert set(result["models"]) == {"expensive", "replay:expensive"}
+        assert result["models"]["expensive"]["cost_per_100_batches"] == pytest.approx(2.0)
+        assert result["models"]["replay:expensive"]["cost_per_100_batches"] == pytest.approx(2.0)
+        assert result["cost_ratio"] == pytest.approx(1.0)
 
 
 def test_trading_does_not_reuse_replay_batch(tmp_path, monkeypatch):

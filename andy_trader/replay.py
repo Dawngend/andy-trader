@@ -97,11 +97,13 @@ def replay(connection: sqlite3.Connection, *, model: str, limit: int = 48, ask=N
         return sum(((float(row["p_up"]) if which == "original" else p) - outcome) ** 2
                    for row, p, outcome in selected) / len(selected) if selected else None
 
-    models = {model: {**totals([dict(row) for row, _ in batches if row["model"] == model]),
-                      "brier": brier("original", model)}
-              for model in {row["model"] for row, _ in batches}}
-    models[model] = {**repeated, "brier": brier("replay")}
-    original = next(iter(models.values())) if len(models) == 2 else None
+    models = {original_model: {**totals([dict(row) for row, _ in batches
+                                        if row["model"] == original_model]),
+                               "brier": brier("original", original_model)}
+              for original_model in {row["model"] for row, _ in batches}}
+    models[f"replay:{model}"] = {**repeated, "brier": brier("replay")}
+    originals = [scores for name, scores in models.items() if not name.startswith("replay:")]
+    original = originals[0] if len(originals) == 1 else None
     ratio = (repeated["cost_per_100_batches"] / original["cost_per_100_batches"]
              if original and original["cost_per_100_batches"] else None)
 

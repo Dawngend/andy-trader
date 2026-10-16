@@ -37,6 +37,18 @@ def test_boundary_ratio_needs_ten_decisions_on_both_sides():
         assert boundary_ratio(connection, "ranked") is None
 
 
+def test_boundary_ratio_zero_shares_and_infinite_drop():
+    with sqlite3.connect(":memory:") as connection:
+        initialize_ledger(connection)
+        for position, convictions in ((3, 10), (4, 0)):
+            for index in range(10):
+                record_decision(connection, list_arm="ranked", list_position=position,
+                                status="ok", p_up=0.6 if index < convictions else 0.5)
+        assert boundary_ratio(connection, "ranked") == float("inf")
+        connection.execute("UPDATE llm_decisions SET p_up = 0.5 WHERE list_position = 3")
+        assert boundary_ratio(connection, "ranked") is None
+
+
 def test_report_prints_comparison(monkeypatch, tmp_path, capsys):
     database = tmp_path / "report.db"
     with sqlite3.connect(database) as connection:
@@ -54,3 +66,16 @@ def test_report_prints_comparison(monkeypatch, tmp_path, capsys):
     assert "ranked" in output and "shuffled" in output
     assert "80.0%" in output and "50.0%" in output
     assert "ranked arm drops at the cut more" in output
+
+
+def test_report_describes_infinite_boundary(monkeypatch, tmp_path, capsys):
+    database = tmp_path / "report.db"
+    with sqlite3.connect(database) as connection:
+        initialize_ledger(connection)
+        for position, convictions in ((3, 10), (4, 0)):
+            for index in range(10):
+                record_decision(connection, list_arm="ranked", list_position=position,
+                                status="ok", p_up=0.6 if index < convictions else 0.5)
+    monkeypatch.setattr("andy_trader.store.default_database_path", lambda: database)
+    main()
+    assert "no conviction calls at position 4" in capsys.readouterr().out
