@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import random
 import sqlite3
+from uuid import UUID
 
 import pytest
 
@@ -41,6 +43,7 @@ def _configured(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("LLM_MIN_MINUTES", raising=False)
     monkeypatch.delenv("LLM_DAILY_CALLS", raising=False)
+    monkeypatch.delenv("LLM_LIST_ORDER", raising=False)
 
 
 def _predict(predictor, connection, instrument="BTC-USD", at=NOW):
@@ -188,3 +191,68 @@ def test_disabled_predictor_matches_baselines(monkeypatch, tmp_path):
     with _db(tmp_path) as connection:
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
         assert fetch_decisions(connection, 10) == []
+
+
+@pytest.mark.parametrize("mode,at,expected_arm", [
+    ("ranked", NOW + timedelta(hours=1), "ranked"),
+    ("shuffled", NOW, "shuffled"),
+    ("alternate", NOW, "ranked"),
+    ("alternate", NOW + timedelta(hours=1), "shuffled"),
+    (None, NOW + timedelta(hours=1), "shuffled"),
+])
+def test_list_order_modes(monkeypatch, tmp_path, mode, at, expected_arm):
+    _configured(monkeypatch)
+    if mode is not None:
+        monkeypatch.setenv("LLM_LIST_ORDER", mode)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _context: _reply())
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=at)
+        rows = fetch_decisions(connection, 10)
+        by_position = sorted(rows, key=lambda row: row["list_position"])
+        assert {row["list_arm"] for row in rows} == {expected_arm}
+        seed = rows[0]["list_seed"]
+        assert seed == rows[0]["batch_id"]
+        assert {row["list_seed"] for row in rows} == {seed}
+        expected = ["ETH-USD", "BTC-USD"]
+        if expected_arm == "shuffled":
+            random.Random(seed).shuffle(expected)
+        assert [row["instrument"] for row in by_position] == expected
+        context = rows[0]["rendered_context"]
+        assert context.index(f"1. {expected[0]}") < context.index(f"2. {expected[1]}")
+
+
+def test_same_batch_seed_reproduces_shuffle(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_LIST_ORDER", "shuffled")
+    monkeypatch.setattr("andy_trader.llm_agent.uuid.uuid4", lambda: UUID(int=1))
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _context: _reply())
+    orders = []
+    for name in ("first", "second"):
+        directory = tmp_path / name
+        directory.mkdir()
+        with _db(directory) as connection:
+            _predict(LlmPredictor(INSTRUMENTS), connection)
+            rows = sorted(fetch_decisions(connection, 10), key=lambda row: row["list_position"])
+            orders.append([row["instrument"] for row in rows])
+    assert orders[0] == orders[1]
+
+
+def test_alternate_switches_arm_within_cache_window(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _context: _reply())
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=59))
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(hours=1))
+        assert {row["list_arm"] for row in fetch_decisions(connection, 10)} == {"ranked", "shuffled"}
+
+
+def test_ledger_migration_runs_twice():
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE llm_decisions (id INTEGER PRIMARY KEY, status TEXT)")
+        connection.execute("INSERT INTO llm_decisions (status) VALUES ('ok')")
+        initialize_ledger(connection)
+        initialize_ledger(connection)
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(llm_decisions)")]
+        assert columns.count("list_arm") == 1
+        assert columns.count("list_seed") == 1
+        assert connection.execute("SELECT status FROM llm_decisions").fetchone()[0] == "ok"

@@ -15,6 +15,8 @@ def initialize_ledger(connection: sqlite3.Connection) -> None:
             model TEXT,
             template_rev TEXT,
             config_rev TEXT,
+            list_arm TEXT,
+            list_seed TEXT,
             list_position INTEGER,
             rendered_context TEXT,
             raw_response TEXT,
@@ -27,12 +29,16 @@ def initialize_ledger(connection: sqlite3.Connection) -> None:
             replay_of INTEGER
         )
     """)
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(llm_decisions)")}
+    for column in ("list_arm", "list_seed"):
+        if column not in existing:
+            connection.execute(f"ALTER TABLE llm_decisions ADD COLUMN {column} TEXT")
 
 
 def record_decision(connection: sqlite3.Connection, **values: object) -> int:
     columns = (
         "created_at", "batch_id", "instrument", "model", "template_rev",
-        "config_rev", "list_position", "rendered_context", "raw_response",
+        "config_rev", "list_arm", "list_seed", "list_position", "rendered_context", "raw_response",
         "p_up", "reason", "status", "prompt_tokens", "completion_tokens",
         "cost", "replay_of",
     )

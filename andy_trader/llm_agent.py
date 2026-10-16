@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sqlite3
 import statistics
 from typing import Sequence
@@ -47,10 +48,12 @@ def _signal(connection: sqlite3.Connection, name: str, instrument: str | None, n
     return f"{float(row['value']):.6g}; age {age:.2f}h"
 
 
-def render_context(connection: sqlite3.Connection, instruments: Sequence[str], now_iso: str) -> str:
+def render_context(connection: sqlite3.Connection, instruments: Sequence[str], now_iso: str,
+                   ordered: list[tuple[str, list[float], float | None]] | None = None) -> str:
     """Render only observations stored at or before the requested time."""
     initialize_signals(connection)
-    ordered = _ordered_prices(connection, instruments)
+    if ordered is None:
+        ordered = _ordered_prices(connection, instruments)
     lines = ["## SECTION: prices"]
     for position, (instrument, closes, move) in enumerate(ordered, 1):
         if not closes:
@@ -134,7 +137,12 @@ class LlmPredictor:
         if minutes < 0 or daily_calls < 0:
             raise ValueError("LLM limits must be non-negative")
         model = os.environ["LLM_MODEL"]
-        config_rev = hashlib.sha1(f"{model}|{minutes:g}|{TEMPLATE_REV}".encode()).hexdigest()[:8]
+        list_mode = os.environ.get("LLM_LIST_ORDER", "alternate").lower()
+        if list_mode not in ("ranked", "shuffled", "alternate"):
+            raise ValueError("LLM_LIST_ORDER must be ranked, shuffled, or alternate")
+        hour = datetime.fromisoformat(now_iso).astimezone(UTC).hour
+        list_arm = ("ranked" if hour % 2 == 0 else "shuffled") if list_mode == "alternate" else list_mode
+        config_rev = hashlib.sha1(f"{model}|{minutes:g}|{TEMPLATE_REV}|{list_mode}|{list_arm}".encode()).hexdigest()[:8]
         since = (datetime.fromisoformat(now_iso) - timedelta(minutes=minutes)).isoformat()
         recent = connection.execute("""
             SELECT batch_id FROM llm_decisions
@@ -146,8 +154,12 @@ class LlmPredictor:
             if {row["instrument"] for row in rows} == set(self.instruments):
                 return {row["instrument"]: row["p_up"] for row in rows}
 
+        batch_id = uuid.uuid4().hex
+        list_seed = batch_id
         ordered = _ordered_prices(connection, self.instruments)
-        rendered = render_context(connection, self.instruments, now_iso)
+        if list_arm == "shuffled":
+            random.Random(list_seed).shuffle(ordered)
+        rendered = render_context(connection, self.instruments, now_iso, ordered)
         day = datetime.fromisoformat(now_iso).astimezone(UTC).date().isoformat()
         used = connection.execute("""
             SELECT COUNT(DISTINCT batch_id) FROM llm_decisions
@@ -170,7 +182,6 @@ class LlmPredictor:
                 calls = {}
         if status == "capped":
             calls = {}
-        batch_id = uuid.uuid4().hex
         probabilities = {}
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
         for position, (instrument, _, _) in enumerate(ordered, 1):
@@ -179,7 +190,8 @@ class LlmPredictor:
             probabilities[instrument] = probability
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=instrument,
                             model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
-                            list_position=position, rendered_context=rendered, raw_response=raw,
+                            list_arm=list_arm, list_seed=list_seed, list_position=position,
+                            rendered_context=rendered, raw_response=raw,
                             p_up=probability, reason=error or reason, status=row_status,
                             prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
                             cost=usage.get("cost"))
