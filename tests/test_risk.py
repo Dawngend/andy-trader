@@ -12,6 +12,7 @@ from andy_trader.risk import (
     initialize_risk,
     rearm_kill_switch,
 )
+from andy_trader.store import Candle, initialize_database, record_observations
 
 
 def _conn() -> sqlite3.Connection:
@@ -20,6 +21,19 @@ def _conn() -> sqlite3.Connection:
     initialize_portfolio(connection)
     initialize_risk(connection)
     return connection
+
+
+def _seed_calm_hourly_closes(connection: sqlite3.Connection) -> None:
+    initialize_database(connection)
+    record_observations(connection, [
+        Candle(
+            instrument="BTC-USD", venue="bybit", interval="1h",
+            open_time=f"2026-09-04T{hour:02d}:00:00+00:00",
+            open=100.0 + hour % 2, high=101.0, low=100.0,
+            close=100.0 + hour % 2, volume=1.0,
+        )
+        for hour in range(6)
+    ])
 
 
 def _mark(connection, equity_price, *, predictor="p", instrument="BTC-USD", at="2026-09-05T00:00:00+00:00"):
@@ -242,6 +256,7 @@ def test_holding_a_losing_long_now_trips_and_forces_an_exit() -> None:
     from andy_trader.portfolio import get_or_create_state, run_paper_cycle
 
     connection = _conn()
+    _seed_calm_hourly_closes(connection)
     # Open through the real path (not a direct execute_paper_trade call) so
     # mark_to_market actually seeds the equity curve, exactly as a real
     # scheduled cycle would -- a position opened this way always has at
@@ -285,6 +300,7 @@ def test_holding_a_losing_short_also_trips_and_forces_a_cover() -> None:
     from andy_trader.portfolio import get_or_create_state, run_paper_cycle
 
     connection = _conn()
+    _seed_calm_hourly_closes(connection)
     opening = run_paper_cycle(
         connection, predictor="p", instrument="BTC-USD", probability_up=0.1,
         price=100.0, now_iso="2026-09-05T00:00:00+00:00",

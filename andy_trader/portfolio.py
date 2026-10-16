@@ -375,6 +375,7 @@ def execute_paper_trade(
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float | None = None,
+    size_fraction: float = 1.0,
 ) -> Trade | None:
     """Move the paper position to target_side if it is not already there.
 
@@ -385,6 +386,8 @@ def execute_paper_trade(
 
     if price <= 0 or not price == price:  # noqa: PLR0133 - nan-safe without importing math
         raise PortfolioError(f"Cannot trade at a non-positive or NaN price: {price}")
+    if not math.isfinite(size_fraction) or not 0 < size_fraction <= 1:
+        raise PortfolioError(f"size_fraction must be between 0 and 1, got {size_fraction!r}")
 
     state = get_or_create_state(
         connection,
@@ -407,8 +410,8 @@ def execute_paper_trade(
     cost_rate = (fee_bps + slippage_bps) / 10_000.0
 
     if target_side == "long":
-        # Open long from flat: commit all cash to the position, net of costs.
-        notional = state.cash
+        # Open long from flat: deploy the chosen share of cash, net of costs.
+        notional = state.cash * size_fraction
         total_cost = notional * cost_rate
         deployable = notional - total_cost
         if deployable <= 0:
@@ -421,7 +424,7 @@ def execute_paper_trade(
             predictor=predictor,
             instrument=instrument,
             starting_cash=state.starting_cash,
-            cash=0.0,
+            cash=state.cash - notional,
             position_qty=qty,
             avg_entry_price=price,
             updated_at=now_iso,
@@ -437,18 +440,18 @@ def execute_paper_trade(
             price=price,
             fee_cost=fee_cost,
             slippage_cost=slippage_cost,
-            cash_after=0.0,
+            cash_after=new_state.cash,
             executed_at=now_iso,
             reason=reason,
         )
     elif target_side == "short":
-        # Open short from flat: sell borrowed qty sized off the same "deploy
-        # all current cash" convention long uses, so long and short take on
+        # Open short from flat: sell borrowed qty sized off the same cash
+        # fraction convention long uses, so long and short take on
         # identical notional risk, mirrored, not one bigger than the other.
         # Cash rises by the sale proceeds -- this is bookkeeping for a
         # simulated borrow, not literally spendable mid-position; only
         # `cash + position_qty * price` is ever the real equity number.
-        notional = state.cash
+        notional = state.cash * size_fraction
         total_cost = notional * cost_rate
         proceeds = notional - total_cost
         if proceeds <= 0:
@@ -707,6 +710,8 @@ def run_paper_cycle(
     """
 
     from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
+    from andy_trader.predict import load_closes
+    from andy_trader.sizing import realized_volatility, size_fraction as fraction_for_volatility
 
     # Resolved here rather than as a default argument: a default is bound once at
     # import, so an environment change would not take effect until the process
@@ -785,6 +790,19 @@ def run_paper_cycle(
 
     trade: Trade | None = None
     if target != current_side:
+        fraction = 1.0
+        if target in ("long", "short"):
+            has_observations = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crypto_observations'"
+            ).fetchone()
+            closes = (
+                load_closes(connection, instrument, interval="1h", limit=24)
+                if has_observations else []
+            )
+            volatility = realized_volatility([close for _, close in closes])
+            fraction = fraction_for_volatility(volatility)
+            vol_text = "unavailable" if volatility is None else f"{volatility:.1%}"
+            reason += f"; size {fraction:.2f} at hourly vol {vol_text}"
         trade = execute_paper_trade(
             connection,
             predictor=predictor,
@@ -796,6 +814,7 @@ def run_paper_cycle(
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             starting_cash=starting_cash,
+            size_fraction=fraction,
         )
 
     equity = mark_to_market(

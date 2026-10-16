@@ -272,7 +272,7 @@ def test_run_paper_cycle_opens_on_high_confidence_and_marks_to_market() -> None:
     )
     assert result.trade is not None
     assert result.trade.side == "long"
-    assert result.equity == pytest.approx(result.trade.qty * 100.0)
+    assert result.equity == pytest.approx(result.trade.cash_after + result.trade.qty * 100.0)
     assert result.risk_allowed is True
     assert result.forced_exit is False
 
