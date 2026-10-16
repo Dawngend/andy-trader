@@ -25,6 +25,8 @@ import uuid
 
 from andy_trader.collector import _http_json, _settings_from_env, collect
 from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.llm_agent import build_predictors
+from andy_trader.llm_ledger import initialize_ledger
 from andy_trader.portfolio import paper_trade_once
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, predict_once
 from andy_trader.signals import collect_signals, record_signals
@@ -327,6 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         paper_trade_results: list[dict[str, object]] = []
         with connect(database_path) as connection:
+            initialize_ledger(connection)
             inserted, seen = record_observations(connection, candles)
             if signals:
                 record_signals(connection, signals)
@@ -335,6 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 instruments=instruments,
                 horizons=horizons,
                 interval=reference_interval,
+                predictors=build_predictors(instruments),
                 maximum_data_age_minutes=maximum_data_age_minutes,
             )
             settled = settle_due_predictions(connection, interval=reference_interval)

@@ -22,6 +22,8 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     monkeypatch, tmp_path: Path,
 ) -> None:
     calls: list[tuple[str, ...]] = []
+    for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(key, raising=False)
 
     def fake_collect(*, instruments, intervals, venues, settings):
         del settings
@@ -67,6 +69,8 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     ]
     stored = next(entry for entry in entries if entry["event"] == "store_updated")
     assert stored["predictions"] == 2  # only the minimum-history-one baselines can run
+    with connect(tmp_path / "c.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM llm_decisions").fetchone()[0] == 0
     assert "paper_trade_completed" not in events  # opt-in only; nothing was configured
     run_ids = {entry["run_id"] for entry in entries}
     assert len(run_ids) == 1
