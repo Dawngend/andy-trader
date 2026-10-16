@@ -76,7 +76,7 @@ def test_fetch_unexpired_intents_excludes_expired_and_orders_by_id():
     later = record_intent(db, build(instrument="B-USD", expiry_seconds=3600))
     earlier = record_intent(db, build(instrument="C-USD", expiry_seconds=3600))
 
-    rows = fetch_unexpired_intents(db, now_iso="2026-10-17T13:00:00+00:00")
+    rows = fetch_unexpired_intents(db, now_iso="2026-10-17T12:30:00+00:00")
 
     assert [row["id"] for row in rows] == [later, earlier]
     assert expired not in [row["id"] for row in rows]

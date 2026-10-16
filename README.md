@@ -658,6 +658,23 @@ python -m andy_trader.weather run --cities london nyc
 python -m andy_trader.weather report
 ```
 
+## Order intents and the dry-run executor
+
+An order intent (`andy_trader/order_intent.py`) is one frozen record per decision: instrument,
+side, size, stop, target, the source decision id, a creation time, a short expiry, and the
+skill gate's verdict at that moment. It is stored in `order_intents` and never mutated.
+
+`andy_trader/dry_run_executor.py` reads unexpired intents and re-checks each one against the
+world as it stands *now* -- a fresh price, a fresh skill-gate read, the 1x leverage cap, a max
+size per coin, and a max-trades-per-hour limit -- then writes a `would_send` or `rejected` row
+to `order_decisions` with the reason. It sends nothing anywhere: `send_order` exists only as the
+seam a later change fills in, and it always raises `NotImplementedError`; the executor calls it
+only if `ALLOW_LIVE_SEND` is flipped True, which it is not by default.
+
+```bash
+python -m andy_trader.dry_run_executor
+```
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
