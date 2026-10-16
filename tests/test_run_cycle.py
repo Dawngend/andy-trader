@@ -65,7 +65,7 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     events = [entry["event"] for entry in entries]
     assert events == [
         "cycle_started", "primary_prices_collected", "fallback_prices_collected",
-        "signals_collected", "store_updated", "cycle_completed",
+        "signals_collected", "probe_trade_completed", "store_updated", "cycle_completed",
     ]
     stored = next(entry for entry in entries if entry["event"] == "store_updated")
     assert stored["predictions"] == 2  # only the minimum-history-one baselines can run
