@@ -41,7 +41,7 @@ comparable, not measuring two different cost worlds.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import math
 import os
 import sqlite3
@@ -169,6 +169,9 @@ class Trade:
 
 
 def initialize_portfolio(connection: sqlite3.Connection) -> None:
+    from andy_trader.order_check import initialize_order_checks
+
+    initialize_order_checks(connection)
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS paper_portfolio_state (
@@ -712,6 +715,8 @@ def run_paper_cycle(
     from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
     from andy_trader.predict import load_closes
     from andy_trader.sizing import realized_volatility, size_fraction as fraction_for_volatility
+    from andy_trader.order_check import check_order, recent_stopouts
+    import statistics
 
     # Resolved here rather than as a default argument: a default is bound once at
     # import, so an environment change would not take effect until the process
@@ -796,13 +801,27 @@ def run_paper_cycle(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crypto_observations'"
             ).fetchone()
             closes = (
-                load_closes(connection, instrument, interval="1h", limit=24)
+                load_closes(connection, instrument, interval="1h", limit=169)
                 if has_observations else []
             )
             volatility = realized_volatility([close for _, close in closes])
             fraction = fraction_for_volatility(volatility)
             vol_text = "unavailable" if volatility is None else f"{volatility:.1%}"
             reason += f"; size {fraction:.2f} at hourly vol {vol_text}"
+            seven_day_vol = None
+            week_start = datetime.fromisoformat(now_iso) - timedelta(days=7)
+            week_closes = [(at, close) for at, close in closes if datetime.fromisoformat(at) >= week_start]
+            if len(week_closes) >= 7:
+                returns = [math.log(b / a) for (_, a), (_, b) in zip(week_closes, week_closes[1:])]
+                seven_day_vol = statistics.pstdev(returns)
+            relative_vol = volatility / seven_day_vol if volatility is not None and seven_day_vol else 0.0
+            data_age = max(0.0, (datetime.fromisoformat(now_iso) - datetime.fromisoformat(closes[-1][0])).total_seconds() / 60) if closes else 60.0
+            fraction = check_order(
+                connection, predictor=predictor, instrument=instrument, side=target,
+                now_iso=now_iso, volatility=relative_vol, size_fraction=fraction,
+                data_age_minutes=data_age,
+                recent_stopouts=recent_stopouts(connection, predictor, instrument, now_iso),
+            )
         trade = execute_paper_trade(
             connection,
             predictor=predictor,
