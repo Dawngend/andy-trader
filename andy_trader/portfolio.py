@@ -504,7 +504,7 @@ def execute_paper_trade(
             position_qty=0.0,
             avg_entry_price=None,
             updated_at=now_iso,
-            reentry_locked=reason.startswith("bracket "),
+            reentry_locked="bracket " in reason,
         )
         trade = Trade(
             predictor=predictor,
@@ -539,7 +539,7 @@ def execute_paper_trade(
             position_qty=0.0,
             avg_entry_price=None,
             updated_at=now_iso,
-            reentry_locked=reason.startswith("bracket "),
+            reentry_locked="bracket " in reason,
         )
         trade = Trade(
             predictor=predictor,
@@ -570,6 +570,10 @@ def execute_paper_trade(
     return trade
 
 
+def _tag_reason(reason_prefix: str, reason: str) -> str:
+    return f"{reason_prefix}: {reason}" if reason_prefix else reason
+
+
 def check_bracket(
     connection: sqlite3.Connection,
     predictor: str,
@@ -578,6 +582,7 @@ def check_bracket(
     *,
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    reason_prefix: str = "",
 ) -> Trade | None:
     """Close at the first touched bracket on the finest stored candle series."""
     state = get_or_create_state(
@@ -627,7 +632,8 @@ def check_bracket(
             return execute_paper_trade(
                 connection, predictor=predictor, instrument=instrument,
                 target_side="flat", price=state.stop_price if stop_hit else state.target_price,
-                now_iso=now_iso, reason="bracket stop" if stop_hit else "bracket target",
+                now_iso=now_iso,
+                reason=_tag_reason(reason_prefix, "bracket stop" if stop_hit else "bracket target"),
                 fee_bps=fee_bps, slippage_bps=slippage_bps,
             )
     return None
@@ -690,6 +696,7 @@ def run_paper_cycle(
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float | None = None,
+    reason_prefix: str = "",
 ) -> PaperCycleResult:
     """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
@@ -753,7 +760,7 @@ def run_paper_cycle(
 
     bracket_trade = check_bracket(
         connection, predictor, instrument, now_iso,
-        fee_bps=fee_bps, slippage_bps=slippage_bps,
+        fee_bps=fee_bps, slippage_bps=slippage_bps, reason_prefix=reason_prefix,
     )
     if bracket_trade is not None:
         equity = mark_to_market(
@@ -792,6 +799,7 @@ def run_paper_cycle(
     else:
         target = desired
         reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
+    reason = _tag_reason(reason_prefix, reason)
 
     trade: Trade | None = None
     if target != current_side:
@@ -873,7 +881,12 @@ def fetch_equity_curve(
     return [dict(row) for row in reversed(rows)]
 
 
-def portfolio_summary(connection: sqlite3.Connection) -> PortfolioSummary:
+def portfolio_summary(
+    connection: sqlite3.Connection,
+    *,
+    include_predictors: Sequence[str] | None = None,
+    exclude_predictors: Sequence[str] = (),
+) -> PortfolioSummary:
     """Roll up portfolio rows without creating a second source of live equity.
 
     Each pair's latest recorded equity is already the value shown by its chart,
@@ -882,6 +895,12 @@ def portfolio_summary(connection: sqlite3.Connection) -> PortfolioSummary:
     and therefore contributes its current cash rather than zero. This read path
     intentionally does not initialize or migrate schema because the dashboard
     must remain unable to mutate the trading database.
+
+    `include_predictors` and `exclude_predictors` let a caller roll up a
+    subset of books -- the dashboard uses `exclude_predictors` to keep the
+    probe book's ungated results out of the gated summary, and
+    `include_predictors` to summarize the probe book on its own. Neither is
+    set by default, so an ordinary call still rolls up every book.
     """
 
     empty_summary = PortfolioSummary(
@@ -910,6 +929,10 @@ def portfolio_summary(connection: sqlite3.Connection) -> PortfolioSummary:
         ORDER BY predictor, instrument
         """
     ).fetchall()
+    if include_predictors is not None:
+        rows = [row for row in rows if row["predictor"] in include_predictors]
+    elif exclude_predictors:
+        rows = [row for row in rows if row["predictor"] not in exclude_predictors]
     if not rows:
         return empty_summary
 
@@ -1029,6 +1052,9 @@ def paper_trade_once(
     max_prediction_age_minutes: float = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     max_data_age_minutes: float | None = None,
     skill_gate_disabled: bool = False,
+    source_predictor: str | None = None,
+    starting_cash: float | None = None,
+    reason_prefix: str = "",
 ) -> PaperTradeAttempt:
     """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
 
@@ -1036,6 +1062,14 @@ def paper_trade_once(
     stale prediction or a stale price -- exactly the scenario the 2026-09-05
     outage created, where reference data was hours old during a certificate
     failure. A refusal here is not an error; it is the correct behavior.
+
+    `source_predictor` lets a book trade a different predictor's calls than
+    the name its own capital is booked under -- the probe book (see
+    `andy_trader.probe_book`) reads `llm:agent` predictions while keeping its
+    own portfolio rows under the "probe" name, so it can never be mistaken
+    for, or mixed into, the gated book that same predictor might also trade
+    under its own name. Defaults to `predictor` so every other caller is
+    unaffected.
     """
 
     from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes
@@ -1045,6 +1079,7 @@ def paper_trade_once(
     max_data_age_minutes = (
         max_data_age_minutes if max_data_age_minutes is not None else DEFAULT_MAX_DATA_AGE_MINUTES
     )
+    source_predictor = source_predictor or predictor
 
     row = connection.execute(
         """
@@ -1052,14 +1087,14 @@ def paper_trade_once(
         WHERE predictor = ? AND instrument = ? AND horizon = ?
         ORDER BY created_at DESC LIMIT 1
         """,
-        (predictor, instrument, horizon),
+        (source_predictor, instrument, horizon),
     ).fetchone()
     if row is None:
         return PaperTradeAttempt(
             predictor=predictor, instrument=instrument, horizon=horizon,
             price=None, price_at=None, prediction_created_at=None, executed_at=now_iso,
             trade=None, equity=None,
-            skipped_reason=f"no {horizon} predictions found for predictor={predictor!r} instrument={instrument!r}",
+            skipped_reason=f"no {horizon} predictions found for predictor={source_predictor!r} instrument={instrument!r}",
         )
 
     closes = load_closes(connection, instrument, interval=interval, limit=1)
@@ -1126,6 +1161,8 @@ def paper_trade_once(
         probability_up=float(row["probability_up"]),
         price=latest_price,
         now_iso=now_iso,
+        starting_cash=starting_cash,
+        reason_prefix=reason_prefix,
     )
     return PaperTradeAttempt(
         predictor=predictor, instrument=instrument, horizon=horizon,

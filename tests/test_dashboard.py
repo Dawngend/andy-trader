@@ -137,6 +137,24 @@ def test_paper_return_includes_the_first_entry_cost() -> None:
     assert portfolios[0]["risk"] == {"tripped": False, "severity": None, "reason": None}
 
 
+def test_portfolios_excludes_the_probe_book_by_default() -> None:
+    connection = _conn()
+    run_paper_cycle(
+        connection, predictor="baseline:momentum", instrument="BTC-USD",
+        probability_up=0.60, price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+    run_paper_cycle(
+        connection, predictor="probe", instrument="BTC-USD",
+        probability_up=0.60, price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+    )
+
+    gated = _portfolios(connection)
+    probe_only = _portfolios(connection, only_predictor="probe")
+
+    assert {p["predictor"] for p in gated} == {"baseline:momentum"}
+    assert {p["predictor"] for p in probe_only} == {"probe"}
+
+
 def test_portfolio_surfaces_a_tripped_risk_state() -> None:
     connection = _conn()
     initialize_risk(connection)

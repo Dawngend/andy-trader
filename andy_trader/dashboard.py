@@ -296,25 +296,57 @@ def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
 
 
 def _portfolio_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
-    """Aggregate P&L across every coin, if andy_trader.portfolio.portfolio_summary exists yet.
+    """Aggregate P&L across every GATED coin, if portfolio_summary exists yet.
 
-    Deliberately tolerant of it not existing: this dashboard should never go
-    down just because a dependent module hasn't landed yet.
+    The probe book (predictor "probe") is deliberately excluded: it trades
+    with no skill gate and no approval step, so rolling it into this number
+    would let an unproven, automatically-opened position move the figure a
+    human reads as "what the gated system has earned." See `_probe_summary`
+    for its own, clearly separate rollup.
+
+    Deliberately tolerant of portfolio_summary not existing: this dashboard
+    should never go down just because a dependent module hasn't landed yet.
     """
 
     try:
         from andy_trader.portfolio import portfolio_summary
+        from andy_trader.probe_book import PROBE_BOOK
     except ImportError:
         return None
     try:
-        summary = portfolio_summary(connection)
+        summary = portfolio_summary(connection, exclude_predictors=(PROBE_BOOK,))
     except Exception:  # noqa: BLE001 - a summary glitch must never take the whole page down
         return None
     return summary.__dict__ if hasattr(summary, "__dict__") else dict(summary)
 
 
-def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
-    """One summary row per (predictor, instrument) pair that has ever paper-traded."""
+def _probe_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
+    """Aggregate P&L across the probe book only -- never mixed into `_portfolio_summary`."""
+
+    try:
+        from andy_trader.portfolio import portfolio_summary
+        from andy_trader.probe_book import PROBE_BOOK
+    except ImportError:
+        return None
+    try:
+        summary = portfolio_summary(connection, include_predictors=(PROBE_BOOK,))
+    except Exception:  # noqa: BLE001 - a summary glitch must never take the whole page down
+        return None
+    return summary.__dict__ if hasattr(summary, "__dict__") else dict(summary)
+
+
+def _portfolios(
+    connection: sqlite3.Connection, *, only_predictor: str | None = None
+) -> list[dict[str, object]]:
+    """One summary row per (predictor, instrument) pair that has ever paper-traded.
+
+    With `only_predictor` omitted, this returns every GATED book -- the probe
+    book (predictor "probe") is excluded so it never appears mixed in with
+    books that cleared the skill gate. Pass `only_predictor="probe"` to get
+    the probe book's own rows instead.
+    """
+
+    from andy_trader.probe_book import PROBE_BOOK
 
     try:
         columns = {
@@ -335,6 +367,10 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
             if "basis_started_at" in columns
             else "NULL AS basis_started_at"
         )
+        predictor_filter = (
+            "s.predictor = ?" if only_predictor is not None else "s.predictor != ?"
+        )
+        filter_value = only_predictor if only_predictor is not None else PROBE_BOOK
         # Books that have actually traded sort first. Ordering alphabetically
         # put eight brand-new, never-traded pairs above eight with a hundred
         # points of history each, so the monitor opened on a wall of empty
@@ -343,9 +379,11 @@ def _portfolios(connection: sqlite3.Connection) -> list[dict[str, object]]:
             f"SELECT s.predictor, s.instrument, {starting_cash_sql}, {basis_sql}, "
             "s.cash, s.position_qty, s.avg_entry_price, s.updated_at "
             "FROM paper_portfolio_state s "
+            f"WHERE {predictor_filter} "
             "ORDER BY (SELECT COUNT(*) FROM paper_trades t "
             "          WHERE t.predictor = s.predictor AND t.instrument = s.instrument) DESC, "
-            "s.predictor, s.instrument"
+            "s.predictor, s.instrument",
+            (filter_value,),
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # no paper trade has ever run yet
@@ -491,6 +529,8 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
         "portfolio_summary": _portfolio_summary(connection),
+        "probe_portfolios": _portfolios(connection, only_predictor="probe"),
+        "probe_summary": _probe_summary(connection),
     }
 
 
@@ -549,6 +589,11 @@ _PAGE = """<!doctype html>
     <div class="card" style="grid-column:1/-1;">
       <h2>Paper Portfolios (CT-08)</h2>
       <table id="portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card" style="grid-column:1/-1;">
+      <h2>Probe Book (ungated)</h2>
+      <p class="sub" style="margin-bottom:8px;">Trades every <code>llm:agent</code> call automatically, with no skill gate and no approval step. PHP 1,000 per coin, booked separately from the gated books above. Never counted toward the skill gate or any real-money evidence bar.</p>
+      <table id="probe_portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Collector Health</h2>
@@ -911,6 +956,40 @@ async function refresh() {
     });
     if (s.portfolios.length === 0) {
       pfBody.appendChild(row([td("no paper trading has run yet -- run: python -m andy_trader.portfolio --predictor <name> --instrument <inst>"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
+    }
+
+    const probeBody = document.querySelector("#probe_portfolios tbody");
+    probeBody.innerHTML = "";
+    (s.probe_portfolios || []).forEach(p => {
+      const sideCell = td(p.position_qty > 0 ? "LONG" : p.position_qty < 0 ? "SHORT" : "flat");
+      sideCell.className = p.position_qty > 0 ? "ok" : p.position_qty < 0 ? "warn" : "muted";
+      const retCell = td(p.return_pct.toFixed(2) + "%");
+      retCell.className = p.return_pct > 0 ? "ok" : (p.return_pct < 0 ? "bad" : "muted");
+      const curveCell = document.createElement("td");
+      curveCell.appendChild(sparkline(p.equity_curve));
+      const riskCell = document.createElement("td");
+      if (p.risk && p.risk.tripped) {
+        const pill = document.createElement("span");
+        pill.className = "pill " + (p.risk.severity === "hard" ? "rejected" : "promoted");
+        pill.style.background = p.risk.severity === "hard" ? "#3a1212" : "#3a2a12";
+        pill.style.color = p.risk.severity === "hard" ? "#f87171" : "#facc15";
+        pill.textContent = p.risk.severity === "hard" ? "HARD HALT" : "SOFT TRIPPED";
+        pill.title = p.risk.reason || "";
+        riskCell.appendChild(pill);
+      } else {
+        const ok = document.createElement("span");
+        ok.className = "muted";
+        ok.textContent = "ok";
+        riskCell.appendChild(ok);
+      }
+      probeBody.appendChild(row([
+        td(p.predictor), td(p.instrument), sideCell,
+        td("$" + p.cash.toFixed(2)), td(p.position_qty.toFixed(6)),
+        td("$" + p.equity.toFixed(2)), retCell, td(p.trade_count), curveCell, riskCell,
+      ]));
+    });
+    if (!s.probe_portfolios || s.probe_portfolios.length === 0) {
+      probeBody.appendChild(row([td("the probe book has not traded yet"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
     }
 
     const healthBody = document.querySelector("#health tbody");

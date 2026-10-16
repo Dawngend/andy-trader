@@ -388,3 +388,35 @@ def test_live_model_scoring_produces_no_journal_noise_when_nothing_promoted(monk
     assert result == 0
     entries = [json.loads(line) for line in journal.read_text().splitlines()]
     assert not any(entry["event"] == "live_model_predictions" for entry in entries)
+
+
+def test_probe_book_runs_for_every_instrument_with_no_opt_in_needed(monkeypatch, tmp_path: Path) -> None:
+    """Unlike --paper-trade pairs, the probe book needs no configuration and no
+    skill gate: it is attempted for every scheduled instrument, every cycle."""
+    from andy_trader.portfolio import PaperTradeAttempt
+
+    journal = _base_env(monkeypatch, tmp_path)
+    calls: list[str] = []
+
+    def fake_probe_trade_once(conn, *, instrument, **kwargs):
+        calls.append(instrument)
+        return PaperTradeAttempt(
+            predictor="probe", instrument=instrument, horizon="1h",
+            price=None, price_at=None, prediction_created_at=None,
+            executed_at="2026-09-27T12:00:00+00:00", trade=None, equity=None,
+            skipped_reason=f"no 1h predictions found for predictor='llm:agent' instrument={instrument!r}",
+        )
+
+    monkeypatch.setattr(run_cycle, "probe_trade_once", fake_probe_trade_once)
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD,ETH-USD,SOL-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet"]  # deliberately no --paper-trade and no probe flag at all
+    )
+
+    assert result == 0
+    assert calls == ["BTC-USD", "ETH-USD", "SOL-USD"]
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    probe_event = next(entry for entry in entries if entry["event"] == "probe_trade_completed")
+    assert {a["instrument"] for a in probe_event["attempts"]} == {"BTC-USD", "ETH-USD", "SOL-USD"}
+    assert all(a["traded"] is False for a in probe_event["attempts"])

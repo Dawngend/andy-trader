@@ -183,3 +183,43 @@ def test_portfolio_without_equity_curve_falls_back_to_cash() -> None:
     assert summary.total_equity == 6_500.0
     assert summary.total_return_pct == expected_return_pct
     assert summary.worst == ("baseline:momentum", "LINK-USD", expected_return_pct)
+
+
+def test_exclude_predictors_keeps_the_probe_book_out_of_the_gated_rollup() -> None:
+    connection = _conn()
+    _add_portfolio(
+        connection, predictor="baseline:momentum", instrument="BTC-USD",
+        starting_cash=10_000.0, cash=0.0,
+        equities=[("2026-09-05T01:00:00+00:00", 11_000.0)], trade_count=1,
+    )
+    _add_portfolio(
+        connection, predictor="probe", instrument="BTC-USD",
+        starting_cash=1_000.0, cash=0.0,
+        equities=[("2026-09-05T01:00:00+00:00", 1.0)], trade_count=50,  # a catastrophic probe result
+    )
+
+    summary = portfolio_summary(connection, exclude_predictors=("probe",))
+
+    assert summary.total_starting_cash == 10_000.0
+    assert summary.total_equity == 11_000.0
+    assert summary.total_trade_count == 1
+
+
+def test_include_predictors_isolates_the_probe_book_on_its_own() -> None:
+    connection = _conn()
+    _add_portfolio(
+        connection, predictor="baseline:momentum", instrument="BTC-USD",
+        starting_cash=10_000.0, cash=0.0,
+        equities=[("2026-09-05T01:00:00+00:00", 11_000.0)], trade_count=1,
+    )
+    _add_portfolio(
+        connection, predictor="probe", instrument="BTC-USD",
+        starting_cash=1_000.0, cash=0.0,
+        equities=[("2026-09-05T01:00:00+00:00", 900.0)], trade_count=3,
+    )
+
+    summary = portfolio_summary(connection, include_predictors=("probe",))
+
+    assert summary.total_starting_cash == 1_000.0
+    assert summary.total_equity == 900.0
+    assert summary.total_trade_count == 3

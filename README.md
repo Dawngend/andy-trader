@@ -465,6 +465,40 @@ python -m andy_trader.paper_gate
 Deliberately **not** included: inverting momentum. A 47% hit rate over one regime is not a
 licence to trade 53% the other way. That is fitting the sign to the sample.
 
+## The probe book
+
+The skill gate above is why `llm:agent` cannot deploy real-stake paper capital until it has
+accumulated 200+ independent settled calls that beat the base rate and cover costs. But it
+cannot *accumulate* that record just by being logged in `crypto_predictions` -- a prediction
+that is never traded never produces a trade-costed, mark-to-market result either, and that is
+exactly the evidence the gate is checking for.
+
+The probe book is the thing that lets evidence start accumulating. Run from `run_cycle.py`
+right after the AI batch writes its predictions, it paper-trades the latest `llm:agent` call for
+every scheduled instrument automatically, with **no skill gate and no approval step**. It reuses
+`andy_trader.portfolio` entirely -- the same sizing, the same 2%/4% stop and target bracket, the
+same fees, slippage and 1x leverage -- so its results are directly comparable to a gated book's.
+The only differences: its capital is booked under the predictor name `"probe"` instead of
+`"llm:agent"`, with its own PHP 1,000 stake per coin (independent of whatever
+`CRYPTO_PAPER_STARTING_CASH` the gated books use); the skill gate (`paper_gate.py`) is bypassed
+outright; and every trade's `reason` is tagged `ungated`, so the audit trail itself explains why
+a trade exists with no settled evidence behind it.
+
+Because the probe book writes to its own book name and never writes new rows to
+`crypto_predictions`, it is invisible to `paper_gate.evaluate_paper_eligibility` (which only
+scores `crypto_predictions` by predictor name) and to any future real-money evidence bar built
+on top of it -- its results can never accidentally count toward either. The dashboard
+(`andy_trader/dashboard.py`) shows it in its own "Probe Book (ungated)" panel, separate from the
+gated "Paper Portfolios" panel and excluded from that panel's aggregate summary.
+
+A position in the probe book never jumps directly from long to short (or short to long): the
+same hysteresis `decide_side` already applies to every book forces it to close to flat first,
+then open the new side on the next cycle, so `PortfolioError`'s guard against a direct flip can
+never trigger.
+
+The probe book has no standalone CLI; it runs as part of `run_cycle.py`
+(`andy_trader/probe_book.py` exposes `probe_trade_once` for that call site and for tests).
+
 ## Two measurement corrections (2026-09-28)
 
 Both were found by measuring the store against itself, and both were reviewed adversarially

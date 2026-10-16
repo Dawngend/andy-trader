@@ -28,6 +28,7 @@ from andy_trader.env import REPO_ROOT, load_env_file
 from andy_trader.llm_agent import build_predictors
 from andy_trader.llm_ledger import initialize_ledger
 from andy_trader.portfolio import paper_trade_once
+from andy_trader.probe_book import probe_trade_once
 from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, predict_once
 from andy_trader.signals import collect_signals, record_signals
 from andy_trader.store import connect, default_database_path, record_observations, settle_due_predictions
@@ -341,6 +342,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 predictors=build_predictors(instruments),
                 maximum_data_age_minutes=maximum_data_age_minutes,
             )
+
+            # The probe book: always on, for every scheduled instrument, no
+            # opt-in and no skill gate -- unlike --paper-trade pairs, which
+            # are configured and gated. It trades whatever `llm:agent` just
+            # called above into its own PHP 1,000-per-coin book so there is
+            # an honestly-costed record of the raw model from day one.
+            probe_results: list[dict[str, object]] = []
+            for instrument in instruments:
+                attempt = probe_trade_once(
+                    connection,
+                    instrument=instrument,
+                    interval=reference_interval,
+                    horizon=reference_interval,
+                    max_data_age_minutes=maximum_data_age_minutes,
+                )
+                probe_results.append(
+                    {
+                        "instrument": instrument,
+                        "traded": attempt.trade is not None,
+                        "side": attempt.trade.side if attempt.trade else None,
+                        "equity": attempt.equity,
+                        "skipped_reason": attempt.skipped_reason,
+                        "risk_allowed": attempt.risk_allowed,
+                        "risk_reason": attempt.risk_reason,
+                        "forced_exit": attempt.forced_exit,
+                    }
+                )
+            _journal("probe_trade_completed", attempts=probe_results)
+
             settled = settle_due_predictions(connection, interval=reference_interval)
 
             # The 1-minute continuation path. Opt-in, and deliberately separate
@@ -544,6 +574,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  paper: {label} risk-blocked: {attempt['risk_reason']}")
         elif attempt["traded"]:
             print(f"  paper: {label} -> {attempt['side']} (equity={attempt['equity']:.2f})")
+    for attempt in probe_results:
+        label = f"probe {attempt['instrument']}"
+        if attempt["skipped_reason"]:
+            print(f"  {label} skipped: {attempt['skipped_reason']}")
+        elif attempt["forced_exit"]:
+            print(f"  {label} RISK INTERLOCK forced exit: {attempt['risk_reason']}")
+        elif not attempt["risk_allowed"]:
+            print(f"  {label} risk-blocked: {attempt['risk_reason']}")
+        elif attempt["traded"]:
+            print(f"  {label} -> {attempt['side']} (equity={attempt['equity']:.2f})")
     _journal("cycle_completed", degraded=len(problems))
     return 0
 
