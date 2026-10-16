@@ -56,6 +56,24 @@ settle   ->  resolve blind      price lookup only, never reads the prediction
 score    ->  Brier + skill      is this better than the base rate, and by how much
 ```
 
+## The AI Step Under Seven Rules
+
+The AI is one more predictor, and it is off unless `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` are set. Its decision output is a probability for the next hourly close; code handles position size and exits, and the project places no real orders.
+
+| Rule | Code that enforces it | How to see its effect |
+| --- | --- | --- |
+| Fixed exits are set by code | `portfolio.py` stores a 2% stop and 4% target by default and closes at the first touched bracket. | Inspect paper trade reasons for `bracket stop` and `bracket target`. |
+| Position size is set by code from volatility | `sizing.py` scales the cash fraction by recent hourly volatility, then applies its floor and cap. | Inspect the position size in the paper portfolio and trade records. |
+| The list order is tested | `llm_agent.py` alternates ranked and shuffled lists; `rank_bias.py` compares conviction by displayed position. | Run `python -m andy_trader.rank_bias`. |
+| Unused signals are measured by ablation | `ablation.py` removes each saved context section and compares the resulting probabilities. | Run `python -m andy_trader.ablation`. |
+| A rule-based check reads every entry | `order_check.py`, called from `portfolio.py`, scores each entry and can halve its size when risk is above the historical 90th percentile. | Run `python -m andy_trader.order_check` to see flagged entries and bracket stops. |
+| The ledger keeps what the AI saw | `llm_ledger.py` stores the rendered context, raw response, model, list position and decision with each call. | Inspect the `llm_decisions` table in the project database. |
+| Saved decisions are replayed on a cheaper model before any upgrade | `replay.py` reruns saved contexts and compares paired decisions, settled Brier score and usage. | Run `python -m andy_trader.replay --model <cheaper-model>`. |
+
+The same skill gate that blocks every other predictor blocks the AI until it beats the base rate on a real sample. So far, nothing in this project has beaten it.
+
+These rules come from the DX Research Group paper [“What LLM Trading Agents Actually Do in Production”](https://arxiv.org/abs/2609.05663), which itself found no directional edge.
+
 ## Quick start
 
 ```bash
