@@ -65,7 +65,8 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     events = [entry["event"] for entry in entries]
     assert events == [
         "cycle_started", "primary_prices_collected", "fallback_prices_collected",
-        "signals_collected", "probe_trade_completed", "store_updated", "cycle_completed",
+        "signals_collected", "probe_trade_completed", "probe_x10_trade_completed",
+        "store_updated", "cycle_completed",
     ]
     stored = next(entry for entry in entries if entry["event"] == "store_updated")
     assert stored["predictions"] == 2  # only the minimum-history-one baselines can run
@@ -420,3 +421,42 @@ def test_probe_book_runs_for_every_instrument_with_no_opt_in_needed(monkeypatch,
     probe_event = next(entry for entry in entries if entry["event"] == "probe_trade_completed")
     assert {a["instrument"] for a in probe_event["attempts"]} == {"BTC-USD", "ETH-USD", "SOL-USD"}
     assert all(a["traded"] is False for a in probe_event["attempts"])
+
+
+def test_x10_probe_book_runs_right_after_the_1x_one_for_every_instrument(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The 10x book is wired in next to the 1x one -- same instruments, same
+    cycle, its own journal event so the two can never be read as one."""
+    from andy_trader.portfolio import PaperTradeAttempt
+
+    journal = _base_env(monkeypatch, tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    def fake(book: str):
+        def run(conn, *, instrument, **kwargs):
+            calls.append((book, instrument))
+            return PaperTradeAttempt(
+                predictor=book, instrument=instrument, horizon="1h",
+                price=None, price_at=None, prediction_created_at=None,
+                executed_at="2026-09-27T12:00:00+00:00", trade=None, equity=None,
+                skipped_reason="no 1h predictions found",
+            )
+        return run
+
+    monkeypatch.setattr(run_cycle, "probe_trade_once", fake("probe"))
+    monkeypatch.setattr(run_cycle, "probe_x10_trade_once", fake("probe_x10"))
+
+    result = run_cycle.main(
+        ["--instruments", "BTC-USD,ETH-USD", "--intervals", "1h", "--horizons", "1h",
+         "--skip-signals", "--quiet"]
+    )
+
+    assert result == 0
+    assert calls == [
+        ("probe", "BTC-USD"), ("probe", "ETH-USD"),
+        ("probe_x10", "BTC-USD"), ("probe_x10", "ETH-USD"),
+    ]
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    x10_event = next(entry for entry in entries if entry["event"] == "probe_x10_trade_completed")
+    assert {a["instrument"] for a in x10_event["attempts"]} == {"BTC-USD", "ETH-USD"}

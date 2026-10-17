@@ -298,11 +298,11 @@ def _registry(connection: sqlite3.Connection) -> list[dict[str, object]]:
 def _portfolio_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
     """Aggregate P&L across every GATED coin, if portfolio_summary exists yet.
 
-    The probe book (predictor "probe") is deliberately excluded: it trades
-    with no skill gate and no approval step, so rolling it into this number
-    would let an unproven, automatically-opened position move the figure a
-    human reads as "what the gated system has earned." See `_probe_summary`
-    for its own, clearly separate rollup.
+    Both probe books ("probe" and the 10x "probe_x10") are deliberately
+    excluded: they trade with no skill gate and no approval step, so rolling
+    either into this number would let an unproven, automatically-opened
+    position move the figure a human reads as "what the gated system has
+    earned." See `_probe_summary` for their own, clearly separate rollups.
 
     Deliberately tolerant of portfolio_summary not existing: this dashboard
     should never go down just because a dependent module hasn't landed yet.
@@ -310,43 +310,54 @@ def _portfolio_summary(connection: sqlite3.Connection) -> dict[str, object] | No
 
     try:
         from andy_trader.portfolio import portfolio_summary
-        from andy_trader.probe_book import PROBE_BOOK
+        from andy_trader.probe_book import PROBE_BOOK, PROBE_X10_BOOK
     except ImportError:
         return None
     try:
-        summary = portfolio_summary(connection, exclude_predictors=(PROBE_BOOK,))
+        summary = portfolio_summary(
+            connection, exclude_predictors=(PROBE_BOOK, PROBE_X10_BOOK)
+        )
     except Exception:  # noqa: BLE001 - a summary glitch must never take the whole page down
         return None
     return summary.__dict__ if hasattr(summary, "__dict__") else dict(summary)
 
 
-def _probe_summary(connection: sqlite3.Connection) -> dict[str, object] | None:
-    """Aggregate P&L across the probe book only -- never mixed into `_portfolio_summary`."""
+def _probe_summary(
+    connection: sqlite3.Connection, *, book: str = "probe"
+) -> dict[str, object] | None:
+    """Aggregate P&L across one probe book -- never mixed into `_portfolio_summary`.
+
+    The 1x `probe` and the 10x `probe_x10` are summarized separately, never
+    added together: a PHP 1,000 stake at 10x and the same stake at 1x are not
+    two helpings of the same thing, and one number covering both would hide
+    exactly the difference the experiment exists to measure.
+    """
 
     try:
         from andy_trader.portfolio import portfolio_summary
-        from andy_trader.probe_book import PROBE_BOOK
     except ImportError:
         return None
     try:
-        summary = portfolio_summary(connection, include_predictors=(PROBE_BOOK,))
+        summary = portfolio_summary(connection, include_predictors=(book,))
     except Exception:  # noqa: BLE001 - a summary glitch must never take the whole page down
         return None
     return summary.__dict__ if hasattr(summary, "__dict__") else dict(summary)
 
 
 def _portfolios(
-    connection: sqlite3.Connection, *, only_predictor: str | None = None
+    connection: sqlite3.Connection,
+    *,
+    only_predictor: str | Sequence[str] | None = None,
 ) -> list[dict[str, object]]:
     """One summary row per (predictor, instrument) pair that has ever paper-traded.
 
-    With `only_predictor` omitted, this returns every GATED book -- the probe
-    book (predictor "probe") is excluded so it never appears mixed in with
-    books that cleared the skill gate. Pass `only_predictor="probe"` to get
-    the probe book's own rows instead.
+    With `only_predictor` omitted, this returns every GATED book -- both probe
+    books ("probe" and the 10x "probe_x10") are excluded so neither appears
+    mixed in with books that cleared the skill gate. Pass a name, or several,
+    to get those books' own rows instead.
     """
 
-    from andy_trader.probe_book import PROBE_BOOK
+    from andy_trader.probe_book import PROBE_BOOK, PROBE_X10_BOOK
 
     try:
         columns = {
@@ -367,23 +378,35 @@ def _portfolios(
             if "basis_started_at" in columns
             else "NULL AS basis_started_at"
         )
-        predictor_filter = (
-            "s.predictor = ?" if only_predictor is not None else "s.predictor != ?"
-        )
-        filter_value = only_predictor if only_predictor is not None else PROBE_BOOK
+        # Same read-only courtesy as starting_cash above: every book that
+        # predates the leverage column was 1x.
+        leverage_sql = "s.leverage" if "leverage" in columns else "1.0 AS leverage"
+        if only_predictor is None:
+            names: tuple[str, ...] = (PROBE_BOOK, PROBE_X10_BOOK)
+            membership = "NOT IN"
+        else:
+            names = (
+                (only_predictor,)
+                if isinstance(only_predictor, str)
+                else tuple(only_predictor)
+            )
+            membership = "IN"
+        placeholders = ", ".join("?" for _ in names)
+        predictor_filter = f"s.predictor {membership} ({placeholders})"
         # Books that have actually traded sort first. Ordering alphabetically
         # put eight brand-new, never-traded pairs above eight with a hundred
         # points of history each, so the monitor opened on a wall of empty
         # charts and looked broken when it was merely sorted badly.
         rows = connection.execute(
             f"SELECT s.predictor, s.instrument, {starting_cash_sql}, {basis_sql}, "
+            f"{leverage_sql}, "
             "s.cash, s.position_qty, s.avg_entry_price, s.updated_at "
             "FROM paper_portfolio_state s "
             f"WHERE {predictor_filter} "
             "ORDER BY (SELECT COUNT(*) FROM paper_trades t "
             "          WHERE t.predictor = s.predictor AND t.instrument = s.instrument) DESC, "
             "s.predictor, s.instrument",
-            (filter_value,),
+            names,
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # no paper trade has ever run yet
@@ -433,6 +456,7 @@ def _portfolios(
             {
                 "predictor": predictor,
                 "instrument": instrument,
+                "leverage": float(row["leverage"]),
                 "cash": float(row["cash"]),
                 "position_qty": float(row["position_qty"]),
                 "avg_entry_price": row["avg_entry_price"],
@@ -529,8 +553,11 @@ def build_dashboard_state(connection: sqlite3.Connection) -> dict[str, object]:
         "registry": _registry(connection),
         "portfolios": _portfolios(connection),
         "portfolio_summary": _portfolio_summary(connection),
-        "probe_portfolios": _portfolios(connection, only_predictor="probe"),
-        "probe_summary": _probe_summary(connection),
+        "probe_portfolios": _portfolios(
+            connection, only_predictor=("probe", "probe_x10")
+        ),
+        "probe_summary": _probe_summary(connection, book="probe"),
+        "probe_x10_summary": _probe_summary(connection, book="probe_x10"),
     }
 
 
@@ -591,9 +618,10 @@ _PAGE = """<!doctype html>
       <table id="portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card" style="grid-column:1/-1;">
-      <h2>Probe Book (ungated)</h2>
-      <p class="sub" style="margin-bottom:8px;">Trades every <code>llm:agent</code> call automatically, with no skill gate and no approval step. PHP 1,000 per coin, booked separately from the gated books above. Never counted toward the skill gate or any real-money evidence bar.</p>
-      <table id="probe_portfolios"><thead><tr><th>Predictor</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
+      <h2>Probe Books (ungated)</h2>
+      <p class="sub" style="margin-bottom:8px;">Trade every <code>llm:agent</code> call automatically, with no skill gate and no approval step. PHP 1,000 per coin, booked separately from the gated books above. Never counted toward the skill gate or any real-money evidence bar. Two books on the same calls: <code>probe</code> at 1x and <code>probe_x10</code> at 10x, so the cost of leverage is visible instead of argued about. Both are paper.</p>
+      <p class="updated" id="probe_summaries"></p>
+      <table id="probe_portfolios"><thead><tr><th>Predictor</th><th>Leverage</th><th>Instrument</th><th>Side</th><th>Cash</th><th>Position</th><th>Equity</th><th>Return</th><th>Trades</th><th>Curve</th><th>Risk (CT-10)</th></tr></thead><tbody></tbody></table>
     </div>
     <div class="card">
       <h2>Collector Health</h2>
@@ -982,15 +1010,26 @@ async function refresh() {
         ok.textContent = "ok";
         riskCell.appendChild(ok);
       }
+      const levCell = td(((p.leverage || 1) === 1 ? "1x" : (p.leverage || 1) + "x"));
+      levCell.className = (p.leverage || 1) > 1 ? "warn" : "muted";
       probeBody.appendChild(row([
-        td(p.predictor), td(p.instrument), sideCell,
+        td(p.predictor), levCell, td(p.instrument), sideCell,
         td("$" + p.cash.toFixed(2)), td(p.position_qty.toFixed(6)),
         td("$" + p.equity.toFixed(2)), retCell, td(p.trade_count), curveCell, riskCell,
       ]));
     });
     if (!s.probe_portfolios || s.probe_portfolios.length === 0) {
-      probeBody.appendChild(row([td("the probe book has not traded yet"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
+      probeBody.appendChild(row([td("neither probe book has traded yet"), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td(""), td("")]));
     }
+
+    const probeSummaries = document.querySelector("#probe_summaries");
+    probeSummaries.textContent = [
+      ["probe (1x)", s.probe_summary],
+      ["probe_x10 (10x)", s.probe_x10_summary],
+    ].map(([label, sum]) => sum && sum.total_starting_cash
+      ? label + ": $" + sum.total_equity.toFixed(2) + " of $" + sum.total_starting_cash.toFixed(2)
+        + " (" + sum.total_return_pct.toFixed(2) + "%, " + sum.total_trade_count + " trades)"
+      : label + ": no trades yet").join("  ·  ");
 
     const healthBody = document.querySelector("#health tbody");
     healthBody.innerHTML = "";

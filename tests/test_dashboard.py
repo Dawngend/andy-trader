@@ -4,7 +4,15 @@ from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
-from andy_trader.dashboard import _collector_health, _json_safe, _latest_prices, _portfolios, _registry
+from andy_trader.dashboard import (
+    _PAGE,
+    _collector_health,
+    _json_safe,
+    _latest_prices,
+    _portfolios,
+    _registry,
+    build_dashboard_state,
+)
 from andy_trader.portfolio import run_paper_cycle
 from andy_trader.risk import initialize_risk
 from andy_trader.store import Candle, initialize_database, record_observations
@@ -153,6 +161,34 @@ def test_portfolios_excludes_the_probe_book_by_default() -> None:
 
     assert {p["predictor"] for p in gated} == {"baseline:momentum"}
     assert {p["predictor"] for p in probe_only} == {"probe"}
+
+
+def test_probe_view_shows_the_x10_book_next_to_the_1x_one_and_keeps_both_out_of_the_gated_view() -> None:
+    """The 10x book belongs in the probe panel with its leverage visible, and
+    nowhere near the gated summary -- it is ungated capital at ten times the
+    size, which is the last thing that should move a "what the gated system
+    earned" number."""
+    connection = _conn()
+    for predictor, leverage in (("baseline:momentum", None), ("probe", None), ("probe_x10", 10.0)):
+        run_paper_cycle(
+            connection, predictor=predictor, instrument="BTC-USD",
+            probability_up=0.60, price=100.0, now_iso="2026-09-05T00:00:00+00:00",
+            starting_cash=1_000.0, leverage=leverage,
+        )
+
+    state = build_dashboard_state(connection)
+    probe_view = {p["predictor"]: p for p in state["probe_portfolios"]}
+
+    assert set(probe_view) == {"probe", "probe_x10"}
+    assert probe_view["probe"]["leverage"] == 1.0
+    assert probe_view["probe_x10"]["leverage"] == 10.0
+    # Gated view and gated summary see neither probe book.
+    assert {p["predictor"] for p in state["portfolios"]} == {"baseline:momentum"}
+    assert state["portfolio_summary"]["total_starting_cash"] == 1_000.0
+    # The two probe books are summarized separately, never added together.
+    assert state["probe_summary"]["total_starting_cash"] == 1_000.0
+    assert state["probe_x10_summary"]["total_starting_cash"] == 1_000.0
+    assert "probe_x10" in _PAGE and "Leverage" in _PAGE
 
 
 def test_portfolio_surfaces_a_tripped_risk_state() -> None:
