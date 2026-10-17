@@ -13,6 +13,7 @@ from andy_trader.portfolio import (
     DEFAULT_LONG_THRESHOLD,
     DEFAULT_SHORT_THRESHOLD,
     PortfolioError,
+    check_bracket,
     decide_side,
     execute_paper_trade,
     fetch_equity_curve,
@@ -294,10 +295,10 @@ def test_run_paper_cycle_stays_flat_below_threshold() -> None:
 
 
 def _bar(connection: sqlite3.Connection, *, at: str, high: float, low: float,
-         interval: str = "1m") -> None:
+         interval: str = "1m", open_price: float = 100.0) -> None:
     record_observations(connection, [Candle(
         instrument="BTC-USD", venue="bybit", interval=interval, open_time=at,
-        open=100.0, high=high, low=low, close=100.0, volume=1.0,
+        open=open_price, high=high, low=low, close=100.0, volume=1.0,
     )])
 
 
@@ -580,6 +581,67 @@ def test_a_bar_through_the_liquidation_price_closes_there_and_says_so(
     assert result.trade.reason == "liquidated"
     assert result.equity > 0.0  # liquidated with the last tenth of the margin left
     assert result.equity < 1_000.0 * 0.15
+
+
+@pytest.mark.parametrize("side,bar_open,high,low,liquidation", [
+    ("long", 90.0, 92.0, 89.0, 91.0),
+    ("short", 110.0, 111.0, 108.0, 109.0),
+])
+def test_a_bar_that_opens_past_liquidation_liquidates_even_though_the_stop_is_nearer(
+    side: str, bar_open: float, high: float, low: float, liquidation: float,
+) -> None:
+    """The stop only fills ahead of liquidation while price moves through it.
+    A bar that gaps open beyond the liquidation level jumped both levels at
+    once, so the margin was gone before the stop could ever be filled."""
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side=side,
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+    )
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso=later)
+    # The default 2% stop sits well inside the 9% liquidation level, which is
+    # exactly the ordering the gap has to override.
+    assert state.stop_price == pytest.approx(98.0 if side == "long" else 102.0)
+    _bar(connection, at=later, open_price=bar_open, high=high, low=low)
+
+    trade = check_bracket(connection, "p", "BTC-USD", later)
+
+    assert trade is not None
+    assert trade.reason == "liquidated"
+    assert trade.price == pytest.approx(liquidation)
+
+
+def test_configured_leverage_does_not_change_under_an_open_position() -> None:
+    """A position was sized at the leverage it opened with. Adopting a new one
+    mid-trade would check liquidation against margin that was never posted;
+    the change has to wait until the book is flat."""
+    connection = _conn()
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+    )
+    while_open = get_or_create_state(
+        connection, predictor="p", instrument="BTC-USD", now_iso=later, leverage=2.0,
+    )
+    assert while_open.leverage == pytest.approx(10.0)
+
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="flat",
+        price=100.0, now_iso=later, reason="close",
+    )
+    once_flat = get_or_create_state(
+        connection, predictor="p", instrument="BTC-USD", now_iso=later, leverage=2.0,
+    )
+    assert once_flat.leverage == pytest.approx(2.0)
+    # And it stuck: the next caller that passes nothing sees the new value.
+    assert get_or_create_state(
+        connection, predictor="p", instrument="BTC-USD", now_iso=later,
+    ).leverage == pytest.approx(2.0)
 
 
 def test_leveraged_equity_never_goes_below_zero() -> None:

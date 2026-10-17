@@ -326,21 +326,29 @@ def get_or_create_state(
         stored_leverage = (
             float(row["leverage"]) if row["leverage"] is not None else DEFAULT_LEVERAGE
         )
+        position_qty = float(row["position_qty"])
+        # A configured change only takes effect once the book is flat. An open
+        # position was sized at the leverage it was opened with, so adopting a
+        # new one mid-trade would check liquidation against a margin that was
+        # never posted.
+        effective_leverage = (
+            leverage if leverage is not None and position_qty == 0 else stored_leverage
+        )
         state = PortfolioState(
             predictor=row["predictor"],
             instrument=row["instrument"],
             starting_cash=float(row["starting_cash"]),
             cash=float(row["cash"]),
-            position_qty=float(row["position_qty"]),
+            position_qty=position_qty,
             avg_entry_price=row["avg_entry_price"],
             updated_at=row["updated_at"],
             stop_price=row["stop_price"],
             target_price=row["target_price"],
             entry_at=row["entry_at"],
             reentry_locked=bool(row["reentry_locked"]),
-            leverage=leverage if leverage is not None else stored_leverage,
+            leverage=effective_leverage,
         )
-        if leverage is not None and leverage != stored_leverage:
+        if effective_leverage != stored_leverage:
             # The book's configured leverage is the authority, so a row created
             # before the book was leveraged (or migrated from an older schema)
             # picks it up instead of silently trading at 1x forever.
@@ -678,12 +686,17 @@ def check_bracket(
     """Close at the first touched bracket on the finest stored candle series.
 
     For a leveraged book the bracket has a third level: the liquidation price
-    (see `liquidation_price`). It is only ever taken when it sits strictly
-    closer to the entry than the stop does -- otherwise the price must have
-    crossed the stop on its way there, so the stop is what fills. At 10x the
-    stop (2%) is far tighter than liquidation (9%), so a 10x book is normally
-    stopped out and never liquidated; the check exists for the leverage high
-    enough that the order reverses.
+    (see `liquidation_price`). Within a bar it is only taken when it sits
+    strictly closer to the entry than the stop does -- otherwise the price must
+    have crossed the stop on its way there, so the stop is what fills. At 10x
+    the stop (2%) is far tighter than liquidation (9%), so a 10x book is
+    normally stopped out and never liquidated; the check exists for the
+    leverage high enough that the order reverses.
+
+    The level order only holds while price moves continuously. A bar that
+    *opens* already past liquidation gapped over both levels at once, so the
+    stop never had a chance to fill and liquidation is what happened -- that
+    case is checked first.
     """
 
     state = get_or_create_state(
@@ -706,7 +719,7 @@ def check_bracket(
         return None
     bars = connection.execute(
         """
-        SELECT interval, open_time, high, low FROM crypto_observations
+        SELECT interval, open_time, open, high, low FROM crypto_observations
         WHERE instrument = ? AND open_time >= ? AND open_time <= ?
           AND degraded = 0 AND high IS NOT NULL AND low IS NOT NULL
         """,
@@ -730,21 +743,32 @@ def check_bracket(
     for bar in sorted(bars, key=lambda row: row["open_time"]):
         if interval_minutes(bar["interval"]) != finest:
             continue
+        bar_open = bar["open"]
         if state.position_qty > 0:
             stop_hit = bar["low"] <= state.stop_price
             target_hit = bar["high"] >= state.target_price
+            gapped = (
+                liquidation is not None
+                and bar_open is not None
+                and bar_open <= liquidation
+            )
             liquidated = (
                 liquidation is not None
                 and bar["low"] <= liquidation
-                and liquidation > state.stop_price
+                and (gapped or liquidation > state.stop_price)
             )
         else:
             stop_hit = bar["high"] >= state.stop_price
             target_hit = bar["low"] <= state.target_price
+            gapped = (
+                liquidation is not None
+                and bar_open is not None
+                and bar_open >= liquidation
+            )
             liquidated = (
                 liquidation is not None
                 and bar["high"] >= liquidation
-                and liquidation < state.stop_price
+                and (gapped or liquidation < state.stop_price)
             )
         if liquidated:
             exit_price, exit_reason = liquidation, "liquidated"
