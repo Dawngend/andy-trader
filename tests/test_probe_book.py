@@ -3,7 +3,19 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from andy_trader.probe_book import PROBE_BOOK, SOURCE_PREDICTOR, STARTING_CASH_PHP, probe_trade_once
+import pytest
+
+from andy_trader.portfolio import initialize_portfolio, mark_to_market
+from andy_trader.probe_book import (
+    PROBE_BOOK,
+    PROBE_X10_BOOK,
+    PROBE_X10_LEVERAGE,
+    SOURCE_PREDICTOR,
+    STARTING_CASH_PHP,
+    probe_trade_once,
+    probe_x10_trade_once,
+)
+from andy_trader.risk import check_and_enforce, rearm_kill_switch
 from andy_trader.store import Candle, Prediction, connect, record_observations, record_prediction
 
 
@@ -113,3 +125,89 @@ def test_probe_never_jumps_directly_from_long_to_short(tmp_path: Path) -> None:
             (PROBE_BOOK,),
         ).fetchone()
         assert state["position_qty"] < 0  # ended up short, reached safely through flat
+
+
+def test_x10_book_takes_ten_times_the_1x_position_on_the_same_call(tmp_path: Path) -> None:
+    """Same predictor, same stake, same prediction -- ten times the notional.
+    That is the entire difference between the two books, and the only honest
+    way to compare leverage is to put the identical call through both."""
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    with connect(database) as connection:
+        _seed_cycle(connection, now=now, probability_up=0.9)
+        one_x = probe_trade_once(connection, instrument="BTC-USD", now=now)
+        ten_x = probe_x10_trade_once(connection, instrument="BTC-USD", now=now)
+
+        rows = {
+            row["predictor"]: row
+            for row in connection.execute(
+                "SELECT predictor, starting_cash, position_qty, leverage FROM paper_portfolio_state"
+            )
+        }
+
+    assert one_x.trade is not None and ten_x.trade is not None
+    assert ten_x.trade.side == "long"
+    assert ten_x.trade.qty == pytest.approx(one_x.trade.qty * PROBE_X10_LEVERAGE)
+    assert PROBE_X10_LEVERAGE == 10.0
+    assert set(rows) == {PROBE_BOOK, PROBE_X10_BOOK}  # never written under "llm:agent"
+    assert rows[PROBE_BOOK]["leverage"] == 1.0
+    assert rows[PROBE_X10_BOOK]["leverage"] == 10.0
+    # Same stake: 10x is ten times the exposure, not ten times the money.
+    assert rows[PROBE_X10_BOOK]["starting_cash"] == STARTING_CASH_PHP
+
+
+def test_x10_trade_reason_says_ungated_x10(tmp_path: Path) -> None:
+    database = tmp_path / "paper.db"
+    now = datetime.now(UTC)
+    with connect(database) as connection:
+        _seed_cycle(connection, now=now, probability_up=0.9)
+        attempt = probe_x10_trade_once(connection, instrument="BTC-USD", now=now)
+
+    assert attempt.trade is not None
+    assert "ungated x10" in attempt.trade.reason
+
+
+def test_x10_book_is_held_by_the_same_interlock_and_stays_tripped_until_rearmed(
+    tmp_path: Path,
+) -> None:
+    """Item 7 of the build decision: the x10 book gets no exemption. A trip
+    latches -- a later healthy mark does not quietly clear it -- and only an
+    explicit human rearm lets it trade again."""
+    database = tmp_path / "paper.db"
+    now_iso = datetime.now(UTC).isoformat()
+    with connect(database) as connection:
+        # check_and_enforce reads paper_equity_curve, so the paper schema has
+        # to exist before it is ever called.
+        initialize_portfolio(connection)
+        # One honest mark at the full stake, so the interlock has a day-open
+        # and a peak to measure the drop against.
+        mark_to_market(
+            connection, predictor=PROBE_X10_BOOK, instrument="BTC-USD",
+            price=100.0, now_iso=now_iso, starting_cash=STARTING_CASH_PHP,
+        )
+
+        tripped = check_and_enforce(
+            connection, predictor=PROBE_X10_BOOK, instrument="BTC-USD",
+            starting_cash=STARTING_CASH_PHP, now_iso=now_iso, current_equity=900.0,
+        )
+        assert tripped.allowed is False
+        assert tripped.severity == "soft"
+
+        # Recovered mark, still blocked: the trip latches until a human clears it.
+        still_blocked = check_and_enforce(
+            connection, predictor=PROBE_X10_BOOK, instrument="BTC-USD",
+            starting_cash=STARTING_CASH_PHP, now_iso=now_iso,
+            current_equity=STARTING_CASH_PHP,
+        )
+        assert still_blocked.allowed is False
+
+        assert rearm_kill_switch(
+            connection, predictor=PROBE_X10_BOOK, instrument="BTC-USD",
+            now_iso=now_iso, note="Dawn reviewed it",
+        ) is True
+        after_rearm = check_and_enforce(
+            connection, predictor=PROBE_X10_BOOK, instrument="BTC-USD",
+            starting_cash=STARTING_CASH_PHP, now_iso=now_iso,
+            current_equity=STARTING_CASH_PHP,
+        )
+        assert after_rearm.allowed is True

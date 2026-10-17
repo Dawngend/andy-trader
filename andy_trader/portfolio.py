@@ -9,17 +9,23 @@ backtested ones, and records every trade and every mark-to-market snapshot as
 an append-only audit trail -- the same "write before you can lie about it"
 discipline the rest of the project follows.
 
-**Long, flat, or short -- always 1x, never leveraged.** Shorting here means
-borrowing exactly the notional already at risk and selling it, not borrowing
-*beyond* your capital -- the risk profile is the mirror image of going long,
-not bigger than it. A negative `position_qty` represents the short: cash
-rises by the sale proceeds at entry (it is simulated, not really spendable
-mid-position -- `cash + position_qty * price` is still the only honest
-equity number) and falls by the cost to buy back and cover at exit. Genuine
-margin leverage -- borrowing more notional than the account actually holds --
-is a different, harder problem (liquidation price, margin calls, borrow
-cost) this project has deliberately not built, and getting that quietly
-wrong is a worse failure mode than not having it.
+**Long, flat, or short -- 1x unless a book explicitly asks for more.** Every
+book defaults to `leverage = 1.0`, which is the whole of what this module did
+before leverage existed. A book that sets it higher (today only the
+`probe_x10` paper experiment) multiplies its opening notional by it and gains
+a liquidation price; see `liquidation_price` and `check_bracket`. Nothing
+here can place a real order either way -- it is simulated cash throughout.
+
+Shorting at 1x means borrowing exactly the notional already at risk and
+selling it, not borrowing *beyond* your capital -- the risk profile is the
+mirror image of going long, not bigger than it. A negative `position_qty`
+represents the short: cash rises by the sale proceeds at entry (it is
+simulated, not really spendable mid-position -- `cash + position_qty * price`
+is still the only honest equity number) and falls by the cost to buy back and
+cover at exit. Leverage above 1 does borrow beyond the account, in either
+direction, which is why it brings a liquidation price with it and why the
+only book using it is a paper experiment. Borrow/funding cost is still not
+modelled, so a leveraged book's result is optimistic by exactly that much.
 
 Flipping directly from long to short (or short to long) always passes
 through flat first, one trade per cycle, same as everything else here: a
@@ -107,6 +113,36 @@ def _bracket_prices(entry: float, side: Side) -> tuple[float, float]:
     return entry * (1 + stop), entry * (1 - target)
 
 
+DEFAULT_LEVERAGE = 1.0
+# How much of the posted margin an adverse move may consume before the
+# position is force-closed. Deliberately below 1.0: a venue liquidates while
+# some margin is still left, it does not wait for the account to reach exactly
+# zero and then hope the fill lands there.
+LIQUIDATION_MARGIN_FRACTION = 0.9
+
+
+def _validate_leverage(leverage: float) -> float:
+    if not math.isfinite(leverage) or leverage < 1:
+        raise PortfolioError(f"leverage must be at least 1, got {leverage!r}")
+    return float(leverage)
+
+
+def liquidation_price(entry: float, side: Side, leverage: float) -> float | None:
+    """Price at which an adverse move has eaten 90% of the posted margin.
+
+    None for an unleveraged book: at 1x there is nothing borrowed, so there is
+    nothing to liquidate -- a long can only ever decay toward zero, and a short
+    here borrows exactly the notional already at risk (see module docstring).
+    """
+
+    if leverage <= 1.0:
+        return None
+    margin_move = LIQUIDATION_MARGIN_FRACTION / leverage
+    if side == "long":
+        return entry * (1 - margin_move)
+    return entry * (1 + margin_move)
+
+
 DEFAULT_FEE_BPS = 10.0
 DEFAULT_SLIPPAGE_BPS = 5.0
 DEFAULT_LONG_THRESHOLD = 0.55  # only go long when a predictor is meaningfully confident
@@ -136,6 +172,7 @@ class PortfolioState:
     target_price: float | None = None
     entry_at: str | None = None
     reentry_locked: bool = False
+    leverage: float = DEFAULT_LEVERAGE
 
 
 @dataclass(frozen=True)
@@ -186,6 +223,7 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
             target_price REAL,
             entry_at TEXT,
             reentry_locked INTEGER NOT NULL DEFAULT 0,
+            leverage REAL NOT NULL DEFAULT 1,
             PRIMARY KEY (predictor, instrument)
         )
         """
@@ -250,6 +288,10 @@ def initialize_portfolio(connection: sqlite3.Connection) -> None:
         ("target_price", "REAL"),
         ("entry_at", "TEXT"),
         ("reentry_locked", "INTEGER NOT NULL DEFAULT 0"),
+        # Every book that existed before leverage did was 1x, which is exactly
+        # what this default says -- so an old database migrates without any
+        # row changing meaning.
+        ("leverage", "REAL NOT NULL DEFAULT 1"),
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE paper_portfolio_state ADD COLUMN {name} {definition}")
@@ -262,6 +304,7 @@ def get_or_create_state(
     predictor: str,
     instrument: str,
     starting_cash: float | None = None,
+    leverage: float | None = None,
     now_iso: str,
 ) -> PortfolioState:
     # Resolved here, not as a default argument, because this function is the
@@ -272,13 +315,18 @@ def get_or_create_state(
     # the stake had been set to PHP 1,000.
     if starting_cash is None:
         starting_cash = configured_starting_cash()
+    if leverage is not None:
+        leverage = _validate_leverage(leverage)
     initialize_portfolio(connection)
     row = connection.execute(
         "SELECT * FROM paper_portfolio_state WHERE predictor = ? AND instrument = ?",
         (predictor, instrument),
     ).fetchone()
     if row is not None:
-        return PortfolioState(
+        stored_leverage = (
+            float(row["leverage"]) if row["leverage"] is not None else DEFAULT_LEVERAGE
+        )
+        state = PortfolioState(
             predictor=row["predictor"],
             instrument=row["instrument"],
             starting_cash=float(row["starting_cash"]),
@@ -290,14 +338,22 @@ def get_or_create_state(
             target_price=row["target_price"],
             entry_at=row["entry_at"],
             reentry_locked=bool(row["reentry_locked"]),
+            leverage=leverage if leverage is not None else stored_leverage,
         )
+        if leverage is not None and leverage != stored_leverage:
+            # The book's configured leverage is the authority, so a row created
+            # before the book was leveraged (or migrated from an older schema)
+            # picks it up instead of silently trading at 1x forever.
+            _save_state(connection, state)
+        return state
+    row_leverage = leverage if leverage is not None else DEFAULT_LEVERAGE
     connection.execute(
         """
         INSERT INTO paper_portfolio_state
-        (predictor, instrument, starting_cash, cash, position_qty, avg_entry_price, updated_at)
-        VALUES (?, ?, ?, ?, 0.0, NULL, ?)
+        (predictor, instrument, starting_cash, cash, position_qty, avg_entry_price, updated_at, leverage)
+        VALUES (?, ?, ?, ?, 0.0, NULL, ?, ?)
         """,
-        (predictor, instrument, starting_cash, starting_cash, now_iso),
+        (predictor, instrument, starting_cash, starting_cash, now_iso, row_leverage),
     )
     connection.commit()
     return PortfolioState(
@@ -308,6 +364,7 @@ def get_or_create_state(
         position_qty=0.0,
         avg_entry_price=None,
         updated_at=now_iso,
+        leverage=row_leverage,
     )
 
 
@@ -316,7 +373,8 @@ def _save_state(connection: sqlite3.Connection, state: PortfolioState) -> None:
         """
         UPDATE paper_portfolio_state
         SET cash = ?, position_qty = ?, avg_entry_price = ?, updated_at = ?,
-            stop_price = ?, target_price = ?, entry_at = ?, reentry_locked = ?
+            stop_price = ?, target_price = ?, entry_at = ?, reentry_locked = ?,
+            leverage = ?
         WHERE predictor = ? AND instrument = ?
         """,
         (
@@ -328,6 +386,7 @@ def _save_state(connection: sqlite3.Connection, state: PortfolioState) -> None:
             state.target_price,
             state.entry_at,
             int(state.reentry_locked),
+            state.leverage,
             state.predictor,
             state.instrument,
         ),
@@ -379,12 +438,19 @@ def execute_paper_trade(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float | None = None,
     size_fraction: float = 1.0,
+    leverage: float | None = None,
 ) -> Trade | None:
     """Move the paper position to target_side if it is not already there.
 
     Returns None if no trade was needed (already at target_side). Fee and
     slippage are both charged against the notional traded, exactly once,
     deducted from cash -- this is real simulated cost, not a cosmetic number.
+
+    `leverage` multiplies the opening notional: at 10x, a PHP 1,000 stake
+    opens PHP 10,000 of exposure, so a 1% move is a 10% move on the stake.
+    Because fee and slippage are charged against notional, both scale with it
+    automatically. It defaults to the book's stored value (1x for every book
+    that existed before leverage did), so an unleveraged caller is unaffected.
     """
 
     if price <= 0 or not price == price:  # noqa: PLR0133 - nan-safe without importing math
@@ -397,8 +463,13 @@ def execute_paper_trade(
         predictor=predictor,
         instrument=instrument,
         starting_cash=starting_cash,
+        leverage=leverage,
         now_iso=now_iso,
     )
+    # The book's own stored leverage, not the argument: a close must use
+    # whatever the position was actually opened at, even when the caller that
+    # happens to be closing it passed nothing.
+    book_leverage = state.leverage
     current_side: Side = (
         "long" if state.position_qty > 0 else "short" if state.position_qty < 0 else "flat"
     )
@@ -414,7 +485,7 @@ def execute_paper_trade(
 
     if target_side == "long":
         # Open long from flat: deploy the chosen share of cash, net of costs.
-        notional = state.cash * size_fraction
+        notional = state.cash * size_fraction * book_leverage
         total_cost = notional * cost_rate
         deployable = notional - total_cost
         if deployable <= 0:
@@ -434,6 +505,7 @@ def execute_paper_trade(
             stop_price=stop_price,
             target_price=target_price,
             entry_at=now_iso,
+            leverage=book_leverage,
         )
         trade = Trade(
             predictor=predictor,
@@ -454,7 +526,7 @@ def execute_paper_trade(
         # Cash rises by the sale proceeds -- this is bookkeeping for a
         # simulated borrow, not literally spendable mid-position; only
         # `cash + position_qty * price` is ever the real equity number.
-        notional = state.cash * size_fraction
+        notional = state.cash * size_fraction * book_leverage
         total_cost = notional * cost_rate
         proceeds = notional - total_cost
         if proceeds <= 0:
@@ -475,6 +547,7 @@ def execute_paper_trade(
             stop_price=stop_price,
             target_price=target_price,
             entry_at=now_iso,
+            leverage=book_leverage,
         )
         trade = Trade(
             predictor=predictor,
@@ -495,7 +568,7 @@ def execute_paper_trade(
         proceeds = notional - total_cost
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
-        new_cash = state.cash + proceeds
+        new_cash = _floor_at_zero(state.cash + proceeds, book_leverage)
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -505,6 +578,7 @@ def execute_paper_trade(
             avg_entry_price=None,
             updated_at=now_iso,
             reentry_locked="bracket " in reason,
+            leverage=book_leverage,
         )
         trade = Trade(
             predictor=predictor,
@@ -530,7 +604,7 @@ def execute_paper_trade(
         outlay = notional + total_cost
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
-        new_cash = state.cash - outlay
+        new_cash = _floor_at_zero(state.cash - outlay, book_leverage)
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -540,6 +614,7 @@ def execute_paper_trade(
             avg_entry_price=None,
             updated_at=now_iso,
             reentry_locked="bracket " in reason,
+            leverage=book_leverage,
         )
         trade = Trade(
             predictor=predictor,
@@ -570,6 +645,22 @@ def execute_paper_trade(
     return trade
 
 
+def _floor_at_zero(equity: float, leverage: float) -> float:
+    """Never let a leveraged book report negative equity.
+
+    A leveraged position is closed at its liquidation price long before the
+    margin is gone, so this should not bind; it is here because "you owe the
+    venue money" is a claim a paper book has no business making, and a single
+    gap through the liquidation level must not be able to invent one. Left
+    alone at 1x so every unleveraged book's arithmetic is byte-for-byte what
+    it was before leverage existed.
+    """
+
+    if leverage <= 1.0:
+        return equity
+    return max(0.0, equity)
+
+
 def _tag_reason(reason_prefix: str, reason: str) -> str:
     return f"{reason_prefix}: {reason}" if reason_prefix else reason
 
@@ -584,7 +675,17 @@ def check_bracket(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     reason_prefix: str = "",
 ) -> Trade | None:
-    """Close at the first touched bracket on the finest stored candle series."""
+    """Close at the first touched bracket on the finest stored candle series.
+
+    For a leveraged book the bracket has a third level: the liquidation price
+    (see `liquidation_price`). It is only ever taken when it sits strictly
+    closer to the entry than the stop does -- otherwise the price must have
+    crossed the stop on its way there, so the stop is what fills. At 10x the
+    stop (2%) is far tighter than liquidation (9%), so a 10x book is normally
+    stopped out and never liquidated; the check exists for the leverage high
+    enough that the order reverses.
+    """
+
     state = get_or_create_state(
         connection, predictor=predictor, instrument=instrument, now_iso=now_iso
     )
@@ -618,6 +719,13 @@ def check_bracket(
         unit = interval[-1]
         return int(interval[:-1]) * {"m": 1, "h": 60, "d": 1440}[unit]
 
+    open_side: Side = "long" if state.position_qty > 0 else "short"
+    liquidation = (
+        liquidation_price(float(state.avg_entry_price), open_side, state.leverage)
+        if state.avg_entry_price is not None
+        else None
+    )
+
     finest = min(interval_minutes(bar["interval"]) for bar in bars)
     for bar in sorted(bars, key=lambda row: row["open_time"]):
         if interval_minutes(bar["interval"]) != finest:
@@ -625,17 +733,33 @@ def check_bracket(
         if state.position_qty > 0:
             stop_hit = bar["low"] <= state.stop_price
             target_hit = bar["high"] >= state.target_price
+            liquidated = (
+                liquidation is not None
+                and bar["low"] <= liquidation
+                and liquidation > state.stop_price
+            )
         else:
             stop_hit = bar["high"] >= state.stop_price
             target_hit = bar["low"] <= state.target_price
-        if stop_hit or target_hit:
-            return execute_paper_trade(
-                connection, predictor=predictor, instrument=instrument,
-                target_side="flat", price=state.stop_price if stop_hit else state.target_price,
-                now_iso=now_iso,
-                reason=_tag_reason(reason_prefix, "bracket stop" if stop_hit else "bracket target"),
-                fee_bps=fee_bps, slippage_bps=slippage_bps,
+            liquidated = (
+                liquidation is not None
+                and bar["high"] >= liquidation
+                and liquidation < state.stop_price
             )
+        if liquidated:
+            exit_price, exit_reason = liquidation, "liquidated"
+        elif stop_hit:
+            exit_price, exit_reason = state.stop_price, "bracket stop"
+        elif target_hit:
+            exit_price, exit_reason = state.target_price, "bracket target"
+        else:
+            continue
+        return execute_paper_trade(
+            connection, predictor=predictor, instrument=instrument,
+            target_side="flat", price=exit_price, now_iso=now_iso,
+            reason=_tag_reason(reason_prefix, exit_reason),
+            fee_bps=fee_bps, slippage_bps=slippage_bps,
+        )
     return None
 
 
@@ -658,7 +782,7 @@ def mark_to_market(
         now_iso=now_iso,
     )
     position_value = state.position_qty * price
-    equity = state.cash + position_value
+    equity = _floor_at_zero(state.cash + position_value, state.leverage)
     connection.execute(
         """
         INSERT INTO paper_equity_curve
@@ -697,6 +821,7 @@ def run_paper_cycle(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     starting_cash: float | None = None,
     reason_prefix: str = "",
+    leverage: float | None = None,
 ) -> PaperCycleResult:
     """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
@@ -717,6 +842,16 @@ def run_paper_cycle(
     blocked by risk regardless of the interlock's verdict -- reducing risk is
     always allowed. The interlock's only powers are: block a new entry, or
     force an existing position flat. It can never trap capital in a position.
+
+    **Order of operations differs by leverage, deliberately.** An unleveraged
+    book evaluates the interlock first, exactly as it always has. A leveraged
+    book resolves its bracket first, because at 10x the bar CLOSE and the
+    price the stop actually filled at are two very different losses: a 5%
+    adverse close is a 50% loss on the stake, well past the permanent halt,
+    while the 2% stop that fired on the way there only cost 20%. Letting the
+    interlock judge a leveraged book on the close would hard-halt it for a
+    loss the stop had already prevented it from taking. So the bracket fills,
+    and then the interlock sees the real realized number.
     """
 
     from andy_trader.risk import check_and_enforce  # local import: risk owns portfolio's risk, not the reverse
@@ -736,6 +871,7 @@ def run_paper_cycle(
         predictor=predictor,
         instrument=instrument,
         starting_cash=starting_cash,
+        leverage=leverage,
         now_iso=now_iso,
     )
     current_side: Side = (
@@ -744,33 +880,68 @@ def run_paper_cycle(
         else "flat"
     )
 
-    # Mark-to-market at the live price, computed now rather than read from
-    # history, so the interlock reacts to what this cycle's price is doing to
-    # the position it is currently holding -- not to last cycle's number.
-    live_equity = current_state.cash + current_state.position_qty * price
-
-    decision = check_and_enforce(
-        connection,
-        predictor=predictor,
-        instrument=instrument,
-        starting_cash=current_state.starting_cash,
-        now_iso=now_iso,
-        current_equity=live_equity,
-    )
-
-    bracket_trade = check_bracket(
-        connection, predictor, instrument, now_iso,
-        fee_bps=fee_bps, slippage_bps=slippage_bps, reason_prefix=reason_prefix,
-    )
-    if bracket_trade is not None:
-        equity = mark_to_market(
-            connection, predictor=predictor, instrument=instrument,
-            price=price, now_iso=now_iso, starting_cash=starting_cash,
+    def _interlock(equity_now: float):
+        return check_and_enforce(
+            connection,
+            predictor=predictor,
+            instrument=instrument,
+            starting_cash=current_state.starting_cash,
+            now_iso=now_iso,
+            current_equity=equity_now,
         )
-        return PaperCycleResult(
-            trade=bracket_trade, equity=equity, risk_allowed=decision.allowed,
-            risk_reason=decision.reason, forced_exit=False,
+
+    def _bracket() -> Trade | None:
+        return check_bracket(
+            connection, predictor, instrument, now_iso,
+            fee_bps=fee_bps, slippage_bps=slippage_bps, reason_prefix=reason_prefix,
         )
+
+    if current_state.leverage > 1.0:
+        # Leveraged: bracket first, then the interlock on the realized fill.
+        # See the order-of-operations note in this function's docstring.
+        bracket_trade = _bracket()
+        if bracket_trade is not None:
+            filled_state = get_or_create_state(
+                connection, predictor=predictor, instrument=instrument, now_iso=now_iso
+            )
+            decision = _interlock(
+                _floor_at_zero(
+                    filled_state.cash + filled_state.position_qty * price,
+                    filled_state.leverage,
+                )
+            )
+            equity = mark_to_market(
+                connection, predictor=predictor, instrument=instrument,
+                price=price, now_iso=now_iso, starting_cash=starting_cash,
+            )
+            return PaperCycleResult(
+                trade=bracket_trade, equity=equity, risk_allowed=decision.allowed,
+                risk_reason=decision.reason, forced_exit=False,
+            )
+        decision = _interlock(
+            _floor_at_zero(
+                current_state.cash + current_state.position_qty * price,
+                current_state.leverage,
+            )
+        )
+    else:
+        # Mark-to-market at the live price, computed now rather than read from
+        # history, so the interlock reacts to what this cycle's price is doing to
+        # the position it is currently holding -- not to last cycle's number.
+        live_equity = current_state.cash + current_state.position_qty * price
+
+        decision = _interlock(live_equity)
+
+        bracket_trade = _bracket()
+        if bracket_trade is not None:
+            equity = mark_to_market(
+                connection, predictor=predictor, instrument=instrument,
+                price=price, now_iso=now_iso, starting_cash=starting_cash,
+            )
+            return PaperCycleResult(
+                trade=bracket_trade, equity=equity, risk_allowed=decision.allowed,
+                risk_reason=decision.reason, forced_exit=False,
+            )
 
     if current_side == "flat" and current_state.reentry_locked:
         if DEFAULT_SHORT_THRESHOLD < probability_up < DEFAULT_LONG_THRESHOLD:
@@ -842,6 +1013,7 @@ def run_paper_cycle(
             slippage_bps=slippage_bps,
             starting_cash=starting_cash,
             size_fraction=fraction,
+            leverage=leverage,
         )
 
     equity = mark_to_market(
@@ -1055,6 +1227,7 @@ def paper_trade_once(
     source_predictor: str | None = None,
     starting_cash: float | None = None,
     reason_prefix: str = "",
+    leverage: float | None = None,
 ) -> PaperTradeAttempt:
     """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
 
@@ -1070,6 +1243,10 @@ def paper_trade_once(
     for, or mixed into, the gated book that same predictor might also trade
     under its own name. Defaults to `predictor` so every other caller is
     unaffected.
+
+    `leverage` is the book's leverage, stored on its portfolio row and applied
+    to every position it opens. Defaults to the row's own value, 1x for every
+    book that has one.
     """
 
     from andy_trader.predict import DEFAULT_MAX_DATA_AGE_MINUTES, load_closes
@@ -1139,7 +1316,8 @@ def paper_trade_once(
         from andy_trader.paper_gate import evaluate_paper_eligibility
 
         state = get_or_create_state(
-            connection, predictor=predictor, instrument=instrument, now_iso=now_iso
+            connection, predictor=predictor, instrument=instrument,
+            leverage=leverage, now_iso=now_iso,
         )
         if state.position_qty == 0:
             verdict = evaluate_paper_eligibility(
@@ -1163,6 +1341,7 @@ def paper_trade_once(
         now_iso=now_iso,
         starting_cash=starting_cash,
         reason_prefix=reason_prefix,
+        leverage=leverage,
     )
     return PaperTradeAttempt(
         predictor=predictor, instrument=instrument, horizon=horizon,

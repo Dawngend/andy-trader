@@ -19,11 +19,13 @@ from andy_trader.portfolio import (
     fetch_recent_trades,
     get_or_create_state,
     initialize_portfolio,
+    liquidation_price,
     main,
     mark_to_market,
     paper_trade_once,
     run_paper_cycle,
 )
+from andy_trader.risk import fetch_kill_switch_state
 from andy_trader.store import Candle, Prediction, connect, initialize_database, record_observations, record_prediction
 
 
@@ -470,6 +472,226 @@ def test_existing_portfolio_schema_is_migrated_with_a_starting_cash_denominator(
         now_iso="2026-09-05T00:00:00+00:00",
     )
     assert state.starting_cash == 10_000.0
+
+
+def test_leverage_defaults_to_one_and_changes_nothing_about_an_unleveraged_open() -> None:
+    """The whole safety claim of the leverage change: at 1x, explicitly asked
+    for or left alone, the arithmetic is identical to what it was before
+    leverage existed."""
+    implicit = _conn()
+    explicit = _conn()
+    opened = "2026-09-05T00:00:00+00:00"
+    default_trade = execute_paper_trade(
+        implicit, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0,
+    )
+    one_x_trade = execute_paper_trade(
+        explicit, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=1.0,
+    )
+    assert default_trade is not None and one_x_trade is not None
+    assert default_trade.qty == one_x_trade.qty == pytest.approx(998.5 / 100.0)
+    assert default_trade.cash_after == one_x_trade.cash_after == pytest.approx(0.0)
+    state = get_or_create_state(implicit, predictor="p", instrument="BTC-USD", now_iso=opened)
+    assert state.leverage == 1.0
+    assert liquidation_price(100.0, "long", 1.0) is None  # nothing borrowed, nothing to liquidate
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_ten_times_leverage_opens_ten_times_the_notional(side: str) -> None:
+    one_x = _conn()
+    ten_x = _conn()
+    opened = "2026-09-05T00:00:00+00:00"
+    small = execute_paper_trade(
+        one_x, predictor="p", instrument="BTC-USD", target_side=side,
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0,
+    )
+    big = execute_paper_trade(
+        ten_x, predictor="p", instrument="BTC-USD", target_side=side,
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+    )
+    assert small is not None and big is not None
+    assert big.qty == pytest.approx(small.qty * 10.0)
+    # Fee and slippage are charged on notional, so they scale with it too --
+    # leverage is not a way to get ten times the exposure at 1x cost.
+    assert big.fee_cost == pytest.approx(small.fee_cost * 10.0)
+    assert big.slippage_cost == pytest.approx(small.slippage_cost * 10.0)
+    # The stake itself is unchanged: equity right after opening is the stake
+    # minus the (ten times larger) entry cost, not ten times the stake.
+    equity = mark_to_market(
+        ten_x, predictor="p", instrument="BTC-USD", price=100.0, now_iso=opened,
+    )
+    assert equity == pytest.approx(1_000.0 - 15.0)
+
+
+def test_two_percent_adverse_move_costs_about_twenty_percent_of_a_10x_stake() -> None:
+    connection = _conn()
+    opened = "2026-09-05T00:00:00+00:00"
+    closed = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+    )
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="flat",
+        price=98.0, now_iso=closed, reason="close",
+    )
+    equity = mark_to_market(
+        connection, predictor="p", instrument="BTC-USD", price=98.0, now_iso=closed,
+    )
+    loss_fraction = 1.0 - equity / 1_000.0
+    # 2% of ten times the stake, plus the two-way 15bps charged on that same
+    # ten-times notional: ~20% from the move, ~3% from the costs.
+    assert 0.20 < loss_fraction < 0.25
+
+
+def test_liquidation_price_is_entry_moved_by_ninety_percent_of_the_margin() -> None:
+    assert liquidation_price(100.0, "long", 10.0) == pytest.approx(91.0)
+    assert liquidation_price(100.0, "short", 10.0) == pytest.approx(109.0)
+    assert liquidation_price(100.0, "long", 2.0) == pytest.approx(55.0)
+    assert liquidation_price(100.0, "short", 2.0) == pytest.approx(145.0)
+
+
+def test_a_bar_through_the_liquidation_price_closes_there_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At the default 2% stop a 10x book is always stopped out before its 9%
+    liquidation level, so this widens the stop past it -- otherwise the branch
+    could never be reached and the formula would be untested decoration."""
+    connection = _conn()
+    initialize_database(connection)
+    monkeypatch.setenv("CRYPTO_STOP_PCT", "15")
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+    )
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso=later)
+    assert state.stop_price == pytest.approx(85.0)  # deliberately below the 91.0 liquidation
+    _bar(connection, at=later, high=100.0, low=90.0)
+
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=90.0, now_iso=later,
+                             starting_cash=1_000.0, leverage=10.0)
+
+    assert result.trade is not None
+    assert result.trade.price == pytest.approx(91.0)
+    assert result.trade.reason == "liquidated"
+    assert result.equity > 0.0  # liquidated with the last tenth of the margin left
+    assert result.equity < 1_000.0 * 0.15
+
+
+def test_leveraged_equity_never_goes_below_zero() -> None:
+    """A leveraged book may lose its whole stake; it may never report owing
+    money. 100x here because at that size the costs alone exceed what the
+    liquidation leaves behind."""
+    connection = _conn()
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=100.0,
+    )
+    assert mark_to_market(
+        connection, predictor="p", instrument="BTC-USD", price=80.0, now_iso=later,
+    ) == 0.0
+    closed = execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="flat",
+        price=80.0, now_iso=later, reason="close",
+    )
+    assert closed is not None
+    assert closed.cash_after == 0.0
+
+
+def test_existing_portfolio_schema_migrates_to_leverage_one() -> None:
+    """Every book that predates leverage was 1x, so the migration must leave
+    it trading at exactly 1x rather than inheriting anything."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE paper_portfolio_state (
+            predictor TEXT NOT NULL, instrument TEXT NOT NULL, cash REAL NOT NULL,
+            position_qty REAL NOT NULL, avg_entry_price REAL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (predictor, instrument)
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO paper_portfolio_state VALUES (?, ?, ?, ?, ?, ?)",
+        ("p", "BTC-USD", 1_000.0, 0.0, None, "2026-09-05T00:00:00+00:00"),
+    )
+
+    initialize_portfolio(connection)
+    initialize_portfolio(connection)  # idempotent
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(paper_portfolio_state)")}
+    assert "leverage" in columns
+    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD",
+                                now_iso="2026-09-05T00:01:00+00:00")
+    assert state.leverage == 1.0
+    trade = execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso="2026-09-05T00:01:00+00:00", reason="open",
+    )
+    assert trade is not None
+    assert trade.qty == pytest.approx(998.5 / 100.0)  # 1x off the migrated cash
+
+
+def _open_and_mark(connection: sqlite3.Connection, *, leverage: float | None, opened: str) -> None:
+    execute_paper_trade(
+        connection, predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=leverage,
+    )
+    mark_to_market(connection, predictor="p", instrument="BTC-USD", price=100.0, now_iso=opened)
+
+
+def test_a_leveraged_book_resolves_its_bracket_before_the_interlock_sees_the_bar_close() -> None:
+    """A 10x long entered at 100 whose bar closes at 95 is, on the close
+    alone, a 51% loss -- past the permanent 40% halt. But its 2% stop filled
+    at 98 on the way down, which cost 23%. The stop is what happened, so the
+    interlock must judge the fill and not the close, or the kill switch
+    permanently halts a book for a loss it was protected from taking."""
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    _open_and_mark(connection, leverage=10.0, opened=opened)
+    _bar(connection, at=later, high=100.0, low=97.0)
+
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=95.0, now_iso=later,
+                             starting_cash=1_000.0, leverage=10.0)
+
+    assert result.trade is not None
+    assert result.trade.reason == "bracket stop"
+    assert result.trade.price == pytest.approx(98.0)
+    assert result.equity == pytest.approx(770.62, abs=0.5)  # the realized loss, ~23%
+    switch = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert switch is None or switch["severity"] != "hard"
+
+
+def test_an_unleveraged_book_still_lets_the_interlock_see_the_bar_close_first() -> None:
+    """The 1x order of operations is unchanged: the interlock is evaluated on
+    this cycle's live mark before the bracket is resolved, so a collapse in
+    the bar close trips the switch even though the stop also filled."""
+    connection = _conn()
+    initialize_database(connection)
+    opened = "2026-09-05T00:00:00+00:00"
+    later = "2026-09-05T00:01:00+00:00"
+    _open_and_mark(connection, leverage=None, opened=opened)
+    _bar(connection, at=later, high=100.0, low=97.0)
+
+    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
+                             probability_up=0.9, price=55.0, now_iso=later,
+                             starting_cash=1_000.0)
+
+    assert result.trade is not None
+    assert result.trade.reason == "bracket stop"
+    assert result.risk_allowed is False
+    switch = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert switch is not None and switch["severity"] == "hard"
 
 
 def test_cli_uses_the_requested_horizon_and_wall_clock_execution_time(

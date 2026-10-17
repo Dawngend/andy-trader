@@ -488,7 +488,7 @@ Because the probe book writes to its own book name and never writes new rows to
 `crypto_predictions`, it is invisible to `paper_gate.evaluate_paper_eligibility` (which only
 scores `crypto_predictions` by predictor name) and to any future real-money evidence bar built
 on top of it -- its results can never accidentally count toward either. The dashboard
-(`andy_trader/dashboard.py`) shows it in its own "Probe Book (ungated)" panel, separate from the
+(`andy_trader/dashboard.py`) shows it in its own "Probe Books (ungated)" panel, separate from the
 gated "Paper Portfolios" panel and excluded from that panel's aggregate summary.
 
 A position in the probe book never jumps directly from long to short (or short to long): the
@@ -498,6 +498,13 @@ never trigger.
 
 The probe book has no standalone CLI; it runs as part of `run_cycle.py`
 (`andy_trader/probe_book.py` exposes `probe_trade_once` for that call site and for tests).
+
+Alongside it runs `probe_x10`: the same calls and the same PHP 1,000 stake per coin at ten times
+the leverage, so a 2% move is a 20% move on the stake and it carries a liquidation price the 1x
+book does not. It exists because "fast 10x trades would compound quicker" is a claim, and the
+honest way to answer it is to put identical calls through both books and read the two equity
+curves side by side -- leverage multiplies the losses just as faithfully as the wins. It is
+**paper only**: simulated money, real prices, no real order anywhere.
 
 ## Two measurement corrections (2026-09-28)
 

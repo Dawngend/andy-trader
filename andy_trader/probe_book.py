@@ -10,8 +10,13 @@ every scheduled instrument, with no configuration and no gate, so there is a
 visible, honestly-costed record of what the raw model would have done from
 day one.
 
+There are two probe books, the 1x `probe` and the 10x `probe_x10`. They read
+the same predictions and differ only in leverage, so putting the same calls
+through both is what makes the cost of leverage visible rather than argued
+about. Both are paper: simulated money, real prices, no real order anywhere.
+
 It reuses `andy_trader.portfolio` entirely -- same sizing, same 2% stop / 4%
-target bracket, same fees, slippage and 1x leverage, same hysteresis that
+target bracket, same fees and slippage, same hysteresis that
 forces a long-to-short (or short-to-long) swing through flat first. The only
 differences from a gated book are: its capital is booked under the "probe"
 name instead of "llm:agent", so it can never be mistaken for, or merged
@@ -39,6 +44,16 @@ PROBE_BOOK = "probe"
 SOURCE_PREDICTOR = "llm:agent"
 STARTING_CASH_PHP = 1_000.0
 REASON_TAG = "ungated"
+
+# The 10x paper experiment. Same predictor, same stake, same bracket, same
+# interlock -- the single difference is that every position it opens is ten
+# times the notional, so a 2% move is a 20% move on the stake. It is a
+# separate book name so its results can never be mixed into the 1x probe's
+# track record, and it is paper only: nothing in this module can place a real
+# order.
+PROBE_X10_BOOK = "probe_x10"
+PROBE_X10_LEVERAGE = 10.0
+REASON_TAG_X10 = "ungated x10"
 
 
 def probe_trade_once(
@@ -70,4 +85,39 @@ def probe_trade_once(
         skill_gate_disabled=True,
         starting_cash=STARTING_CASH_PHP,
         reason_prefix=REASON_TAG,
+    )
+
+
+def probe_x10_trade_once(
+    connection: sqlite3.Connection,
+    *,
+    instrument: str,
+    interval: str = "1h",
+    horizon: str = "1h",
+    now: datetime | None = None,
+    max_data_age_minutes: float | None = None,
+) -> PaperTradeAttempt:
+    """Paper-trade the same `llm:agent` prediction into the 10x book.
+
+    Identical to `probe_trade_once` in every respect except the book name, the
+    leverage, and the reason tag -- same source predictor, same PHP 1,000
+    stake, same staleness refusals, same risk interlock and kill switch. The
+    10x stake buys a liquidation price the 1x book does not have; at the
+    default 2% stop the stop is far tighter than it, so this book is normally
+    stopped out rather than liquidated.
+    """
+
+    return paper_trade_once(
+        connection,
+        predictor=PROBE_X10_BOOK,
+        source_predictor=SOURCE_PREDICTOR,
+        instrument=instrument,
+        interval=interval,
+        horizon=horizon,
+        now=now,
+        max_data_age_minutes=max_data_age_minutes,
+        skill_gate_disabled=True,
+        starting_cash=STARTING_CASH_PHP,
+        reason_prefix=REASON_TAG_X10,
+        leverage=PROBE_X10_LEVERAGE,
     )
