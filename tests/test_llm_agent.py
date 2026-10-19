@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import random
 import sqlite3
+import subprocess
+from urllib.error import HTTPError
 from uuid import UUID
 
 import pytest
@@ -44,6 +46,7 @@ def _configured(monkeypatch):
     monkeypatch.delenv("LLM_MIN_MINUTES", raising=False)
     monkeypatch.delenv("LLM_DAILY_CALLS", raising=False)
     monkeypatch.delenv("LLM_LIST_ORDER", raising=False)
+    monkeypatch.setenv("LLM_FALLBACKS", "")
 
 
 def _predict(predictor, connection, instrument="BTC-USD", at=NOW):
@@ -349,3 +352,110 @@ def test_ledger_migration_runs_twice():
         assert columns.count("list_arm") == 1
         assert columns.count("list_seed") == 1
         assert connection.execute("SELECT status FROM llm_decisions").fetchone()[0] == "ok"
+
+
+def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.delenv("LLM_FALLBACKS")
+    def gateway(_):
+        raise HTTPError("https://example.invalid", 402, "credits", {}, None)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    seen = []
+    def run(args, **kwargs):
+        seen.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.6
+        rows = fetch_decisions(connection, 10)
+        assert {row["model"] for row in rows} == {"fallback/agy"}
+        assert {row["request_count"] for row in rows} == {2}
+    args, kwargs = seen[0]
+    assert args[:4] == ["/agy", "-p", "--model", "gemini-3.8-flash-high"]
+    assert len(args) == 5 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
+    assert kwargs["timeout"] == 90
+
+
+def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_FALLBACKS", "agy,codex")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: None if name == "agy" else f"/{name}")
+    seen = []
+    def run(args, **kwargs):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.7} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.65
+        assert {row["model"] for row in fetch_decisions(connection, 10)} == {"fallback/codex"}
+        assert {row["request_count"] for row in fetch_decisions(connection, 10)} == {3}
+    assert seen[0][:6] == ["/codex", "exec", "-m", "gpt-6-astra", "--sandbox", "read-only"]
+    assert len(seen[0]) == 7
+
+
+def test_all_providers_fail_one_error_row(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.delenv("LLM_FALLBACKS")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        if args[0] == "/agy":
+            return subprocess.CompletedProcess(args, 0, "bad JSON", "")
+        raise subprocess.CalledProcessError(1, args)
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
+        rows = fetch_decisions(connection, 10)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "error" and rows[0]["p_up"] is None
+        assert rows[0]["request_count"] == 4
+        assert all(name in rows[0]["reason"] for name in ("gateway", "agy", "codex", "claude"))
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_subscription_fallback_waits_fifteen_minutes(monkeypatch, tmp_path, provider):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    monkeypatch.setenv("LLM_FALLBACKS", provider)
+    count = 0
+    def gateway(_):
+        nonlocal count
+        count += 1
+        raise TimeoutError("gateway")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=14))
+        assert count == 1 and len(fetch_decisions(connection, 10)) == 2
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=15))
+        assert count == 2
+
+
+def test_fallback_attempts_respect_daily_cap(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_FALLBACKS", "agy,codex,claude")
+    monkeypatch.setenv("LLM_DAILY_CALLS", "2")
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    count = 0
+    def gateway(_):
+        nonlocal count
+        count += 1
+        raise TimeoutError("gateway")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: None)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=1))
+        assert count == 1
+        rows = fetch_decisions(connection, 10)
+        assert {row["request_count"] for row in rows} == {0, 2}
+        assert {row["status"] for row in rows} == {"error", "capped"}
