@@ -9,6 +9,8 @@ import math
 import os
 import random
 import queue
+import shutil
+import subprocess
 import threading
 import sqlite3
 import statistics
@@ -89,11 +91,15 @@ def render_context(connection: sqlite3.Connection, instruments: Sequence[str], n
     return "\n".join(lines)
 
 
-def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen, timeout: float = 120) -> dict:
-    body = {"model": model or os.environ["LLM_MODEL"], "messages": [
+def _messages(context: str) -> list[dict[str, str]]:
+    return [
         {"role": "system", "content": "Return JSON only: {\"calls\": [{\"instrument\": \"...\", \"p_up\": 0.0, \"reason\": \"one sentence\"}]}. p_up is the probability that the next hourly close is above the current close. Code decides position size, leverage, and exits."},
         {"role": "user", "content": context},
-    ]}
+    ]
+
+
+def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen, timeout: float = 120) -> dict:
+    body = {"model": model or os.environ["LLM_MODEL"], "messages": _messages(context)}
     request = urllib.request.Request(
         os.environ["LLM_BASE_URL"].rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -120,6 +126,23 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
     if error is not None:
         raise error
     return response
+
+
+def ask_cli(context: str, provider: str) -> dict:
+    commands = {
+        "agy": ["-p", "--model", "gemini-3.8-flash-high"],
+        "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
+        "claude": ["-p", "--model", "haiku"],
+    }
+    if provider not in commands:
+        raise ValueError(f"Unknown fallback provider: {provider}")
+    executable = shutil.which(provider)
+    if not executable:
+        raise FileNotFoundError(f"{provider} CLI not found")
+    prompt = json.dumps(_messages(context), ensure_ascii=False)
+    result = subprocess.run([executable, *commands[provider], prompt], capture_output=True,
+                            text=True, timeout=90, check=True)
+    return {"choices": [{"message": {"content": result.stdout.strip()}}]}
 
 
 def _parse(response: dict, instruments: Sequence[str]) -> dict[str, tuple[float, str]]:
@@ -180,18 +203,33 @@ class LlmPredictor:
         list_arm = ("ranked" if hour % 2 == 0 else "shuffled") if list_mode == "alternate" else list_mode
         config_rev = hashlib.sha1(f"{model}|{minutes:g}|{TEMPLATE_REV}|{list_mode}|{list_arm}".encode()).hexdigest()[:8]
         since = (datetime.fromisoformat(now_iso) - timedelta(minutes=minutes)).isoformat()
+        subscription_since = (datetime.fromisoformat(now_iso) - timedelta(minutes=15)).isoformat()
+        subscription_recent = connection.execute("""
+            SELECT 1 FROM llm_decisions
+            WHERE created_at > ? AND created_at <= ? AND model IN ('fallback/codex', 'fallback/claude')
+              AND status NOT IN ('replay', 'ablation', 'capped') LIMIT 1
+        """, (subscription_since, now_iso)).fetchone()
         recent = connection.execute("""
             SELECT batch_id FROM llm_decisions
             WHERE created_at >= ? AND created_at <= ? AND config_rev = ? AND status NOT IN ('replay', 'ablation', 'capped')
             ORDER BY created_at DESC, id DESC LIMIT 1
         """, (since, now_iso, config_rev)).fetchone()
-        if recent:
+        if recent or subscription_recent:
+            if subscription_recent and not recent:
+                recent = connection.execute("""
+                    SELECT batch_id FROM llm_decisions
+                    WHERE created_at > ? AND created_at <= ? AND model IN ('fallback/codex', 'fallback/claude')
+                      AND status NOT IN ('replay', 'ablation', 'capped')
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                """, (subscription_since, now_iso)).fetchone()
             rows = connection.execute(
                 "SELECT instrument, p_up FROM llm_decisions WHERE batch_id = ? AND status != 'ablation'",
                 (recent["batch_id"],),
             ).fetchall()
             if {row["instrument"] for row in rows} == set(self.instruments):
                 return {row["instrument"]: row["p_up"] for row in rows}
+            if subscription_recent:
+                return {row["instrument"]: row["p_up"] for row in rows if row["p_up"] is not None}
 
         batch_id = uuid.uuid4().hex
         self.batch_id = batch_id
@@ -212,31 +250,52 @@ class LlmPredictor:
         raw = None
         error = None
         status = "ok"
+        provider = "gateway"
+        request_count = 0
+        fallbacks = [name.strip().lower() for name in os.environ.get("LLM_FALLBACKS", "agy,codex,claude").split(",") if name.strip()]
         if used >= daily_calls:
             status = "capped"
         else:
-            try:
-                response = ask_model(rendered) if self.request_timeout is None else ask_with_timeout(rendered, self.request_timeout)
-                raw = json.dumps(response, sort_keys=True)
-                calls = _parse(response, self.instruments)
-            except Exception as exc:
+            errors = []
+            for candidate in ("gateway", *fallbacks):
+                if used + request_count >= daily_calls:
+                    errors.append("daily call cap reached")
+                    break
+                request_count += 1
+                try:
+                    candidate_response = (ask_model(rendered) if self.request_timeout is None else ask_with_timeout(rendered, self.request_timeout)) if candidate == "gateway" else ask_cli(rendered, candidate)
+                    candidate_calls = _parse(candidate_response, self.instruments)
+                    response = candidate_response
+                    raw = json.dumps(response, sort_keys=True)
+                    calls = candidate_calls
+                    provider = candidate
+                    break
+                except Exception as exc:
+                    errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+            if response is None:
                 status = "error"
-                error = f"{type(exc).__name__}: {exc}"
+                error = "; ".join(errors)
                 calls = {}
         if status == "capped":
             calls = {}
+        if status == "error":
+            record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=None,
+                            model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
+                            list_arm=list_arm, list_seed=list_seed, rendered_context=rendered,
+                            p_up=None, reason=error, status="error", request_count=request_count)
+            return {}
         retry_response = None
         retry_raw = None
-        request_count = 1 if status != "capped" else 0
         missing = [item for item in ordered if item[0] not in calls]
         missing_names = [item[0] for item in missing]
-        if status == "ok" and missing and used + 1 < daily_calls:
+        if status == "ok" and missing and used + request_count < daily_calls:
             try:
                 retry_context = render_context(connection, missing_names, now_iso, missing)
                 retry_context += "\nReturn the same JSON for only the instruments listed above."
-                request_count = 2
-                retry_response = (ask_model(retry_context) if self.request_timeout is None
-                                  else ask_with_timeout(retry_context, self.request_timeout))
+                request_count += 1
+                retry_response = ((ask_model(retry_context) if self.request_timeout is None
+                                   else ask_with_timeout(retry_context, self.request_timeout))
+                                  if provider == "gateway" else ask_cli(retry_context, provider))
                 retry_raw = json.dumps(retry_response, sort_keys=True)
                 calls.update(_parse(retry_response, missing_names))
             except Exception:
@@ -246,11 +305,11 @@ class LlmPredictor:
             probability, reason = calls.get(instrument, (0.5, "No call for instrument"))
             row_status = status if status != "ok" else ("ok" if instrument in calls else "missing")
             probabilities[instrument] = probability
-            retried = request_count == 2 and instrument in missing_names
+            retried = retry_response is not None and instrument in missing_names
             row_response = retry_response if retried else response
             row_usage = row_response.get("usage", {}) if isinstance(row_response, dict) else {}
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=instrument,
-                            model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
+                            model=model if provider == "gateway" else f"fallback/{provider}", template_rev=TEMPLATE_REV, config_rev=config_rev,
                             list_arm=list_arm, list_seed=list_seed, list_position=position,
                             rendered_context=retry_context if retried else rendered,
                             raw_response=retry_raw if retried else raw,

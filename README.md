@@ -65,6 +65,8 @@ score    ->  Brier + skill      is this better than the base rate, and by how mu
 The AI is one more predictor, and it is off unless `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` are set. Its decision output is a probability for the next hourly close; code handles position size and exits. The default paper pipeline places no real orders; the separate Bybit sender requires explicit opt-in as documented below.
 
 If a batch omits instruments, the AI retries those instruments once when the daily call cap allows it.
+`LLM_FALLBACKS` is a comma-separated list of CLI providers to try when the gateway fails.
+The default order is `agy,codex,claude`.
 
 | Rule | Code that enforces it | How to see its effect |
 | --- | --- | --- |
