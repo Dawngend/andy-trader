@@ -682,6 +682,7 @@ def check_bracket(
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     reason_prefix: str = "",
+    fresh_minutes: float | None = None,
 ) -> Trade | None:
     """Close at the first touched bracket on the finest stored candle series.
 
@@ -725,6 +726,10 @@ def check_bracket(
         """,
         (instrument, state.entry_at, now_iso),
     ).fetchall()
+    if fresh_minutes is not None:
+        moment = datetime.fromisoformat(now_iso)
+        bars = [bar for bar in bars if bar["interval"] == "1m"
+                and 60 <= (moment - datetime.fromisoformat(bar["open_time"])).total_seconds() <= fresh_minutes * 60]
     if not bars:
         return None
 
@@ -846,6 +851,7 @@ def run_paper_cycle(
     starting_cash: float | None = None,
     reason_prefix: str = "",
     leverage: float | None = None,
+    fresh_minutes: float | None = None,
 ) -> PaperCycleResult:
     """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
@@ -918,6 +924,7 @@ def run_paper_cycle(
         return check_bracket(
             connection, predictor, instrument, now_iso,
             fee_bps=fee_bps, slippage_bps=slippage_bps, reason_prefix=reason_prefix,
+            fresh_minutes=fresh_minutes,
         )
 
     if current_state.leverage > 1.0:
@@ -1252,6 +1259,7 @@ def paper_trade_once(
     starting_cash: float | None = None,
     reason_prefix: str = "",
     leverage: float | None = None,
+    batch_id: str | None = None,
 ) -> PaperTradeAttempt:
     """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
 
@@ -1282,14 +1290,21 @@ def paper_trade_once(
     )
     source_predictor = source_predictor or predictor
 
-    row = connection.execute(
-        """
-        SELECT probability_up, reference_price, created_at FROM crypto_predictions
-        WHERE predictor = ? AND instrument = ? AND horizon = ?
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        (source_predictor, instrument, horizon),
-    ).fetchone()
+    if batch_id is None:
+        row = connection.execute(
+            """
+            SELECT probability_up, reference_price, created_at FROM crypto_predictions
+            WHERE predictor = ? AND instrument = ? AND horizon = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (source_predictor, instrument, horizon),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT p_up AS probability_up, created_at FROM llm_decisions "
+            "WHERE batch_id = ? AND instrument = ? AND status = 'ok' ORDER BY id DESC LIMIT 1",
+            (batch_id, instrument),
+        ).fetchone()
     if row is None:
         return PaperTradeAttempt(
             predictor=predictor, instrument=instrument, horizon=horizon,
@@ -1299,6 +1314,13 @@ def paper_trade_once(
         )
 
     closes = load_closes(connection, instrument, interval=interval, limit=1)
+    if batch_id is not None:
+        closes = [(row["open_time"], float(row["close"])) for row in connection.execute(
+            "SELECT open_time, close FROM crypto_observations WHERE instrument = ? "
+            "AND venue = 'binance' AND interval = '1m' AND degraded = 0 AND close > 0 "
+            "AND open_time <= ? ORDER BY open_time DESC, first_seen_at DESC LIMIT 1",
+            (instrument, (now - timedelta(minutes=1)).isoformat()),
+        )]
     if not closes:
         return PaperTradeAttempt(
             predictor=predictor, instrument=instrument, horizon=horizon,
@@ -1366,6 +1388,7 @@ def paper_trade_once(
         starting_cash=starting_cash,
         reason_prefix=reason_prefix,
         leverage=leverage,
+        fresh_minutes=max_data_age_minutes if batch_id is not None else None,
     )
     return PaperTradeAttempt(
         predictor=predictor, instrument=instrument, horizon=horizon,

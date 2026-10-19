@@ -770,3 +770,11 @@ Position sizes are held at a stake the author would genuinely risk rather than a
 because scale-invariant percentage returns hide a real constraint: live venues enforce a minimum
 order notional, so a book funded too thinly per instrument produces trades that could never actually
 be placed. Simulating a size you would not really trade is a quiet way to get an unexecutable result.
+
+## Probe Watch
+
+Run the paper-only probe watcher with:
+
+    python run_probe_watch.py
+
+Use --database PATH to override the database. The scheduled task AndyTrader-ProbeWatch runs it every minute. Each pass fetches Binance minute bars, runs risk and bracket exits for probe and probe_x10, marks equity, then requests AI only when LLM_MIN_MINUTES and LLM_DAILY_CALLS allow. Model requests time out after 25 seconds. Prices older than 2.5 minutes are skipped. Each batch can trade once per book. Closed trades (including entry costs) and stale-price skips are recorded in .probe-watch.jsonl. run_cycle.py no longer requests AI batches or trades these books.

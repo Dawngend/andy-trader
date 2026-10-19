@@ -64,6 +64,7 @@ def probe_trade_once(
     horizon: str = "1h",
     now: datetime | None = None,
     max_data_age_minutes: float | None = None,
+    batch_id: str | None = None,
 ) -> PaperTradeAttempt:
     """Paper-trade the latest `llm:agent` prediction into the probe book.
 
@@ -82,6 +83,7 @@ def probe_trade_once(
         horizon=horizon,
         now=now,
         max_data_age_minutes=max_data_age_minutes,
+        batch_id=batch_id,
         skill_gate_disabled=True,
         starting_cash=STARTING_CASH_PHP,
         reason_prefix=REASON_TAG,
@@ -96,6 +98,7 @@ def probe_x10_trade_once(
     horizon: str = "1h",
     now: datetime | None = None,
     max_data_age_minutes: float | None = None,
+    batch_id: str | None = None,
 ) -> PaperTradeAttempt:
     """Paper-trade the same `llm:agent` prediction into the 10x book.
 
@@ -116,6 +119,7 @@ def probe_x10_trade_once(
         horizon=horizon,
         now=now,
         max_data_age_minutes=max_data_age_minutes,
+        batch_id=batch_id,
         skill_gate_disabled=True,
         starting_cash=STARTING_CASH_PHP,
         reason_prefix=REASON_TAG_X10,

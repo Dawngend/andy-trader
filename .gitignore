@@ -55,3 +55,6 @@ desktop.ini
 .DS_Store
 .pytest-scaling*/
 .sender.lock
+
+.probe-watch.lock
+.probe-watch.jsonl

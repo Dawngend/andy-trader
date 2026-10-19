@@ -8,6 +8,8 @@ import json
 import math
 import os
 import random
+import queue
+import threading
 import sqlite3
 import statistics
 from typing import Sequence
@@ -66,6 +68,20 @@ def render_context(connection: sqlite3.Connection, instruments: Sequence[str], n
         returns = [math.log(b / a) for a, b in zip(closes[-25:-1], closes[-24:]) if a > 0 and b > 0]
         volatility = f"{statistics.pstdev(returns):.6f}" if len(returns) == 24 else "unavailable"
         lines.append(f"{position}. {instrument}: close {closes[-1]:.8g}; 1h {change(1)}; 4h {change(4)}; 24h {change(24)}; 24h volatility {volatility}")
+    lines.append("## SECTION: minute_moves")
+    moment = datetime.fromisoformat(now_iso)
+    for position, (instrument, _, _) in enumerate(ordered, 1):
+        bars = {datetime.fromisoformat(at): price for at, price in
+                load_closes(connection, instrument, interval="1m", limit=60)
+                if datetime.fromisoformat(at) <= moment - timedelta(minutes=1)}
+        latest = max(bars, default=None)
+        if (latest is None or (moment - latest).total_seconds() > 180
+                or any(latest - timedelta(minutes=m) not in bars for m in (5, 15, 30))):
+            text = "no fresh 1m bars"
+        else:
+            text = "; ".join(f"{m}m {(bars[latest] / bars[latest - timedelta(minutes=m)] - 1) * 100:.4f}%"
+                             for m in (5, 15, 30))
+        lines.append(f"{position}. {instrument}: {text}")
     for name in (FUNDING_RATE, LONG_RATIO, FEAR_GREED):
         lines.append(f"## SECTION: {name}")
         for position, (instrument, _, _) in enumerate(ordered, 1):
@@ -73,7 +89,7 @@ def render_context(connection: sqlite3.Connection, instruments: Sequence[str], n
     return "\n".join(lines)
 
 
-def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen) -> dict:
+def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen, timeout: float = 120) -> dict:
     body = {"model": model or os.environ["LLM_MODEL"], "messages": [
         {"role": "system", "content": "Return JSON only: {\"calls\": [{\"instrument\": \"...\", \"p_up\": 0.0, \"reason\": \"one sentence\"}]}. p_up is the probability that the next hourly close is above the current close. Code decides position size, leverage, and exits."},
         {"role": "user", "content": context},
@@ -84,8 +100,26 @@ def ask_model(context: str, *, model: str | None = None, opener=urllib.request.u
         headers={"Authorization": "Bearer " + os.environ["LLM_API_KEY"], "Content-Type": "application/json"},
         method="POST",
     )
-    with opener(request, timeout=120) as response:
+    with opener(request, timeout=timeout) as response:
         return json.loads(response.read())
+
+
+def ask_with_timeout(context: str, timeout: float) -> dict:
+    # Only the request runs in the daemon; late replies cannot write to SQLite.
+    result = queue.Queue()
+    def request():
+        try:
+            result.put((ask_model(context, timeout=timeout), None))
+        except Exception as exc:
+            result.put((None, exc))
+    threading.Thread(target=request, daemon=True).start()
+    try:
+        response, error = result.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError(f"Model request exceeded {timeout}s") from None
+    if error is not None:
+        raise error
+    return response
 
 
 def _parse(response: dict, instruments: Sequence[str]) -> dict[str, tuple[float, str]]:
@@ -114,7 +148,9 @@ class LlmPredictor:
     name = "agent"
     minimum_history = 1
 
-    def __init__(self, instruments: Sequence[str]):
+    def __init__(self, instruments: Sequence[str], *, request_timeout: float | None = None):
+        self.request_timeout = request_timeout
+        self.batch_id = None
         self.instruments = tuple(dict.fromkeys(instruments))
         self._batch: dict[str, float] | None = None
 
@@ -158,6 +194,7 @@ class LlmPredictor:
                 return {row["instrument"]: row["p_up"] for row in rows}
 
         batch_id = uuid.uuid4().hex
+        self.batch_id = batch_id
         list_seed = batch_id
         ordered = _ordered_prices(connection, self.instruments)
         if list_arm == "shuffled":
@@ -176,7 +213,7 @@ class LlmPredictor:
             status = "capped"
         else:
             try:
-                response = ask_model(rendered)
+                response = ask_model(rendered) if self.request_timeout is None else ask_with_timeout(rendered, self.request_timeout)
                 raw = json.dumps(response, sort_keys=True)
                 calls = _parse(response, self.instruments)
             except Exception as exc:
