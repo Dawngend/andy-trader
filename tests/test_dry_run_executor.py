@@ -137,6 +137,8 @@ def test_never_calls_send_order(monkeypatch):
         raise AssertionError("send_order must never be called while ALLOW_LIVE_SEND is off")
 
     monkeypatch.setattr(executor, "send_order", fail)
+    from andy_trader import bybit_sender
+    monkeypatch.setattr(bybit_sender, "send_live", fail)
     report = executor.run_dry_run(db, now_iso=NOW)
     assert report["would_send"] == 1
 

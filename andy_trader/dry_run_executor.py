@@ -1,17 +1,17 @@
-"""Dry-run executor: decides what each order intent *would* do. Sends nothing.
+"""Dry-run executor with an explicit --live sender seam.
 
 For every unexpired, not-yet-decided intent, re-checks against the world as
 it stands right now -- a fresh price, a fresh skill-gate read, a 1x leverage
 cap, a max size per coin, and a trade-rate limit -- and writes a
-`would_send` or `rejected` row with the reason. `send_order` exists only as
-the seam a later change fills in; this module never calls it unless
-`ALLOW_LIVE_SEND` is set, and the function itself always raises.
+`would_send` or `rejected` row with the reason. The legacy send_order stub
+is never called. Live sending requires --live and the sender's process env gate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import argparse
 import sqlite3
 
 from andy_trader.order_intent import fetch_unexpired_intents, utc_now_iso
@@ -21,9 +21,7 @@ MAX_LEVERAGE = 1.0
 DEFAULT_MAX_SIZE_PER_COIN = 500.0
 DEFAULT_MAX_TRADES_PER_HOUR = 4
 
-# Off by default. The executor only ever calls `send_order` when this is set
-# True by a caller, and `send_order` itself still raises NotImplementedError
-# -- flipping this flag does not make the executor send anything.
+# Legacy compatibility constant, ignored by the executor.
 ALLOW_LIVE_SEND = False
 
 
@@ -158,6 +156,7 @@ def run_dry_run(
     now_iso: str | None = None,
     max_size_per_coin: float = DEFAULT_MAX_SIZE_PER_COIN,
     max_trades_per_hour: int = DEFAULT_MAX_TRADES_PER_HOUR,
+    live_sender=None,
 ) -> dict[str, int]:
     """Decide every unexpired, undecided intent. Returns a would_send/rejected count."""
 
@@ -177,21 +176,26 @@ def run_dry_run(
         _record_decision(connection, decision, checked_at=checked_at)
         if decision.decision == "would_send":
             would_send += 1
-            if ALLOW_LIVE_SEND:
-                send_order(intent)
+            if live_sender is not None:
+                live_sender(connection, intent)
         else:
             rejected += 1
 
     return {"checked": len(intents), "would_send": would_send, "rejected": rejected}
 
 
-def main() -> None:
+def main(argv=None) -> None:
     from pathlib import Path
 
     from andy_trader.store import connect, default_database_path
+    from andy_trader import bybit_sender
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--live', action='store_true')
+    args = parser.parse_args(argv)
 
     connection = connect(Path(default_database_path()))
-    report = run_dry_run(connection)
+    report = run_dry_run(connection, live_sender=bybit_sender.send_live if args.live else None)
     print(
         f"Checked {report['checked']} intent(s): "
         f"{report['would_send']} would_send, {report['rejected']} rejected."

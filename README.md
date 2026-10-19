@@ -58,7 +58,7 @@ score    ->  Brier + skill      is this better than the base rate, and by how mu
 
 ## The AI Step Under Seven Rules
 
-The AI is one more predictor, and it is off unless `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` are set. Its decision output is a probability for the next hourly close; code handles position size and exits, and the project places no real orders.
+The AI is one more predictor, and it is off unless `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` are set. Its decision output is a probability for the next hourly close; code handles position size and exits. The default paper pipeline places no real orders; the separate Bybit sender requires explicit opt-in as documented below.
 
 | Rule | Code that enforces it | How to see its effect |
 | --- | --- | --- |
@@ -674,13 +674,81 @@ skill gate's verdict at that moment. It is stored in `order_intents` and never m
 `andy_trader/dry_run_executor.py` reads unexpired intents and re-checks each one against the
 world as it stands *now* -- a fresh price, a fresh skill-gate read, the 1x leverage cap, a max
 size per coin, and a max-trades-per-hour limit -- then writes a `would_send` or `rejected` row
-to `order_decisions` with the reason. It sends nothing anywhere: `send_order` exists only as the
-seam a later change fills in, and it always raises `NotImplementedError`; the executor calls it
-only if `ALLOW_LIVE_SEND` is flipped True, which it is not by default.
+to `order_decisions` with the reason. By default it sends nothing. The legacy `send_order`
+stub still raises `SendNotImplemented` and is never called. `ALLOW_LIVE_SEND` stays False
+and is ignored. The separate Bybit sender is available only through the explicit live seam below.
 
 ```bash
 python -m andy_trader.dry_run_executor
 ```
+
+## Bybit Live Sender (Off By Default)
+
+Enabling real execution needs Dawn's explicit go after reviewing the paper evidence in
+`research/real_money_evidence_bar.md`. Building this module does not enable it. No source
+edit is ever needed to enable or disable it.
+
+Both switches are required for the executor to make any HTTP call:
+
+- The actual process environment has `ANDY_SENDER_LIVE=on`, exactly lowercase, with no spaces.
+- The command is `python -m andy_trader.dry_run_executor --live`.
+
+Without either switch, execution is dry run with zero sender HTTP calls. To verify it is
+off in PowerShell, remove the switch and run without the flag:
+
+```powershell
+Remove-Item Env:ANDY_SENDER_LIVE -ErrorAction SilentlyContinue
+python -m andy_trader.dry_run_executor
+```
+
+`BYBIT_API_KEY` and `BYBIT_API_SECRET` must be supplied through the process environment.
+The `.env` loader ignores both credentials and both `ANDY_SENDER_*` switches. Credentials
+and signatures go only in authentication headers and are redacted from the journal.
+Testnet (`https://api-testnet.bybit.com`) is the default. Only the exact process value
+`ANDY_SENDER_NET=mainnet` selects real mainnet (`https://api.bybit.com`).
+
+The sender supports USDT linear perpetuals in one-way mode, with **10x leverage and isolated
+margin**. Dawn must switch the account to isolated margin herself; the sender never changes
+margin mode. The paper intent's leverage remains 1. Its absolute paper size scales margin as
+`16 * clamp(size / 500, 0.1, 1.0)` USDT, with a **16 USDT margin cap** (about PHP 1,000).
+Notional is margin times 10 before quantity rounding. Quantity, stop and target round down
+to the exchange steps. Minimum-quantity or minimum-notional failures are refused, never
+resized upward. BTCUSDT may exceed this budget and be refused; that is expected.
+
+The sender's own limits apply in addition to the unchanged dry-run checks:
+
+- At most four live order attempts in a rolling hour, globally, to contain a runaway loop.
+- At most 8 USDT of worst-case entry-to-stop risk per UTC day, including the candidate:
+  `qty * abs(entry_price - rounded_stop)`. Every saved attempt counts regardless of status,
+  including rejected, cancelled and manually cleared orders. This is a risk reservation,
+  not a realized-P&L calculation or a guarantee against slippage.
+- Any tripped kill switch for the intent's predictor/instrument blocks entry. Stored prices
+  older than 90 minutes, ticker divergence above 3%, and stops wider than 5% are refused.
+  At 10x, a stop wider than that can approach liquidation before it can protect the trade.
+
+An OS-held `.sender.lock` serializes sends and releases automatically if the process exits.
+The database records a unique intent and deterministic order link before submitting an
+entry. A transport failure stays `pending` and is never retried. Existing exchange positions
+and non-terminal local rows block stacking. Refusals and dry runs write no `live_orders` row;
+they appear in the logging journal. Exchange acknowledgements and confirmation are saved
+in `live_orders.exchange_response`, including partial filled quantities. The original order
+quantity stays reserved for daily risk even if only part of the order filled.
+
+Confirmation polls realtime then history every two seconds, for at most 15 attempts. Timeout
+requests cancellation and reconciles once more. Filled positions get up to three protection
+reads; persistently missing stop/target triggers a reduce-only close. A close is recorded as
+`error_naked_closed` only after fill confirmation; uncertainty stays blocked for review.
+
+Check Bybit's positions and orders first before clearing any local block:
+
+```powershell
+python -m andy_trader.bybit_sender status
+python -m andy_trader.bybit_sender clear 123 --reason "Checked Bybit: no remaining position or order"
+```
+
+`status` lists non-terminal rows and their age. Only `filled`, `cancelled`, `rejected` and
+`cleared_by_dawn` are terminal. Clearing records the reason and UTC time; it does not cancel
+anything at Bybit, remove daily/hourly usage, or permit the same intent to be sent again.
 
 ## Honest expectations
 
