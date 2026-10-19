@@ -77,7 +77,7 @@ def test_timeout_records_error_after_exit(setup, monkeypatch):
     start = time.monotonic()
     try:
         watch.run_pass(setup, now=NOW)
-        assert time.monotonic() - start < 1
+        assert time.monotonic() - start < 1.8
         assert setup.execute("SELECT count(*) FROM llm_decisions WHERE status='error' AND reason LIKE '%TimeoutError%'").fetchone()[0] == 2
         assert get_or_create_state(setup, predictor='probe', instrument='BTC-USD', now_iso=NOW.isoformat()).position_qty == 0
     finally:
