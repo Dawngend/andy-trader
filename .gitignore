@@ -58,3 +58,5 @@ desktop.ini
 
 .probe-watch.lock
 .probe-watch.jsonl
+.trade-watch-state.json
+.trade-watch.jsonl

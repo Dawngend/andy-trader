@@ -1,5 +1,9 @@
 # Andy Trader
 
+### Paper Trade Watch
+
+Run `python trade_watch.py` every two minutes. It reads the database without changing it and never places trades. It checks new paper trades for price, fee, size, and open-position brackets, then checks the latest 1m BTC bar, new AI decision statuses, and new risk events. Results go to `.trade-watch.jsonl`; new problems also appear in `research/watch_alert.md`. To launch a repair command for new problems, use `python trade_watch.py --fixer "your command"`. The command is limited to one launch per ten minutes.
+
 A calibrated-forecast harness for short-horizon crypto directional prediction.
 
 The point of this project is not the model. It is the measurement.
