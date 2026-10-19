@@ -115,12 +115,105 @@ def test_batch_clamps_missing_and_reuses(monkeypatch, tmp_path):
         assert _predict(first, connection, "ETH-USD") == 0.5
         second = LlmPredictor(INSTRUMENTS)
         assert _predict(second, connection, at=NOW + timedelta(minutes=30)) == 0.65
-        assert len(calls) == 1
+        assert len(calls) == 2
         rows = fetch_decisions(connection, 10)
         assert len(rows) == 2
         assert {row["status"] for row in rows} == {"ok", "missing"}
         assert len({row["batch_id"] for row in rows}) == 1
-        assert len({row["rendered_context"] for row in rows}) == 1
+        assert len({row["rendered_context"] for row in rows}) == 2
+
+
+def test_complete_batch_does_not_retry(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    contexts = []
+    def fake(context):
+        contexts.append(context)
+        return _reply(*({"instrument": name, "p_up": 0.6} for name in INSTRUMENTS))
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", fake)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        assert len(contexts) == 1
+        assert {row["request_count"] for row in fetch_decisions(connection, 10)} == {1}
+
+
+def test_retry_only_missing_instruments_and_saves_response(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    instruments = (*INSTRUMENTS, "SOL-USD", "XRP-USD")
+    contexts = []
+    first = _reply({"instrument": "BTC-USD", "p_up": 0.6})
+    retry = _reply(*({"instrument": name, "p_up": 0.7} for name in instruments[1:]))
+    def fake(context):
+        contexts.append(context)
+        return first if len(contexts) == 1 else retry
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", fake)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(instruments), connection)
+        assert len(contexts) == 2
+        assert "BTC-USD" not in contexts[1]
+        assert all(name in contexts[1] for name in instruments[1:])
+        rows = {row["instrument"]: row for row in fetch_decisions(connection, 10)}
+        assert len(rows) == 4
+        assert len({row["batch_id"] for row in rows.values()}) == 1
+        assert {row["request_count"] for row in rows.values()} == {2}
+        assert rows["BTC-USD"]["raw_response"] == json.dumps(first, sort_keys=True)
+        assert all(rows[name]["raw_response"] == json.dumps(retry, sort_keys=True)
+                   for name in instruments[1:])
+
+
+def test_partial_retry_leaves_one_missing(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    instruments = (*INSTRUMENTS, "SOL-USD", "XRP-USD")
+    replies = iter((_reply({"instrument": "BTC-USD", "p_up": 0.6}),
+                    _reply({"instrument": "ETH-USD", "p_up": 0.7},
+                           {"instrument": "SOL-USD", "p_up": 0.8})))
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: next(replies))
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(instruments), connection)
+        rows = {row["instrument"]: row for row in fetch_decisions(connection, 10)}
+        assert {name for name, row in rows.items() if row["status"] == "ok"} == set(instruments[:3])
+        assert (rows["XRP-USD"]["p_up"], rows["XRP-USD"]["status"], rows["XRP-USD"]["reason"]) == (
+            0.5, "missing", "No call for instrument")
+
+
+@pytest.mark.parametrize("retry_result", [TimeoutError("late"), {"choices": [{"message": {"content": "bad json"}}]}])
+def test_failed_retry_preserves_first_answer(monkeypatch, tmp_path, retry_result):
+    _configured(monkeypatch)
+    count = 0
+    def fake(_):
+        nonlocal count
+        count += 1
+        if count == 1:
+            return _reply({"instrument": "BTC-USD", "p_up": 0.6})
+        if isinstance(retry_result, Exception):
+            raise retry_result
+        return retry_result
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", fake)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.6
+        rows = {row["instrument"]: row for row in fetch_decisions(connection, 10)}
+        assert count == 2
+        assert rows["BTC-USD"]["status"] == "ok"
+        assert rows["ETH-USD"]["status"] == "missing"
+        assert rows["ETH-USD"]["request_count"] == 2
+
+
+@pytest.mark.parametrize("cap,expected_calls", [(1, 1), (2, 2)])
+def test_daily_cap_limits_and_counts_retry(monkeypatch, tmp_path, cap, expected_calls):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_DAILY_CALLS", str(cap))
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    calls = []
+    def fake(context):
+        calls.append(context)
+        return _reply({"instrument": "BTC-USD", "p_up": 0.6})
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", fake)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=1))
+        assert len(calls) == expected_calls
+        rows = fetch_decisions(connection, 10)
+        assert {row["status"] for row in rows} == {"ok", "missing", "capped"}
+        assert max(row["request_count"] for row in rows) == expected_calls
 
 
 def test_lower_probability_is_clamped(monkeypatch, tmp_path):

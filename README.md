@@ -64,6 +64,8 @@ score    ->  Brier + skill      is this better than the base rate, and by how mu
 
 The AI is one more predictor, and it is off unless `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` are set. Its decision output is a probability for the next hourly close; code handles position size and exits. The default paper pipeline places no real orders; the separate Bybit sender requires explicit opt-in as documented below.
 
+If a batch omits instruments, the AI retries those instruments once when the daily call cap allows it.
+
 | Rule | Code that enforces it | How to see its effect |
 | --- | --- | --- |
 | Fixed exits are set by code | `portfolio.py` stores a 2% stop and 4% target by default and closes at the first touched bracket. | Inspect paper trade reasons for `bracket stop` and `bracket target`. |

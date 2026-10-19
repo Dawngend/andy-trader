@@ -1,4 +1,4 @@
-"""One optional model request for a batch of hourly price forecasts."""
+"""Optional model requests for a batch of hourly price forecasts."""
 
 from __future__ import annotations
 
@@ -202,8 +202,11 @@ class LlmPredictor:
         rendered = render_context(connection, self.instruments, now_iso, ordered)
         day = datetime.fromisoformat(now_iso).astimezone(UTC).date().isoformat()
         used = connection.execute("""
-            SELECT COUNT(DISTINCT batch_id) FROM llm_decisions
-            WHERE substr(created_at, 1, 10) = ? AND status NOT IN ('capped', 'replay', 'ablation')
+            SELECT COALESCE(SUM(requests), 0) FROM (
+                SELECT MAX(request_count) AS requests FROM llm_decisions
+                WHERE substr(created_at, 1, 10) = ? AND status NOT IN ('capped', 'replay', 'ablation')
+                GROUP BY batch_id
+            )
         """, (day,)).fetchone()[0]
         response = None
         raw = None
@@ -222,19 +225,38 @@ class LlmPredictor:
                 calls = {}
         if status == "capped":
             calls = {}
+        retry_response = None
+        retry_raw = None
+        request_count = 1 if status != "capped" else 0
+        missing = [item for item in ordered if item[0] not in calls]
+        missing_names = [item[0] for item in missing]
+        if status == "ok" and missing and used + 1 < daily_calls:
+            try:
+                retry_context = render_context(connection, missing_names, now_iso, missing)
+                retry_context += "\nReturn the same JSON for only the instruments listed above."
+                request_count = 2
+                retry_response = (ask_model(retry_context) if self.request_timeout is None
+                                  else ask_with_timeout(retry_context, self.request_timeout))
+                retry_raw = json.dumps(retry_response, sort_keys=True)
+                calls.update(_parse(retry_response, missing_names))
+            except Exception:
+                pass  # Keep the first response and missing defaults.
         probabilities = {}
-        usage = response.get("usage", {}) if isinstance(response, dict) else {}
         for position, (instrument, _, _) in enumerate(ordered, 1):
             probability, reason = calls.get(instrument, (0.5, "No call for instrument"))
             row_status = status if status != "ok" else ("ok" if instrument in calls else "missing")
             probabilities[instrument] = probability
+            retried = request_count == 2 and instrument in missing_names
+            row_response = retry_response if retried else response
+            row_usage = row_response.get("usage", {}) if isinstance(row_response, dict) else {}
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=instrument,
                             model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
                             list_arm=list_arm, list_seed=list_seed, list_position=position,
-                            rendered_context=rendered, raw_response=raw,
+                            rendered_context=retry_context if retried else rendered,
+                            raw_response=retry_raw if retried else raw,
                             p_up=probability, reason=error or reason, status=row_status,
-                            prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
-                            cost=usage.get("cost"))
+                            prompt_tokens=row_usage.get("prompt_tokens"), completion_tokens=row_usage.get("completion_tokens"),
+                            cost=row_usage.get("cost"), request_count=request_count)
         return probabilities
 
 
