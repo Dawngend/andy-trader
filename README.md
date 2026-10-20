@@ -475,6 +475,9 @@ licence to trade 53% the other way. That is fitting the sign to the sample.
 
 ## The probe book
 
+The AI batch context shows the last five closed `probe` trades per instrument as a small sample hint.
+Those recent results are not evidence for the skill gate.
+
 The skill gate above is why `llm:agent` cannot deploy real-stake paper capital until it has
 accumulated 200+ independent settled calls that beat the base rate and cover costs. But it
 cannot *accumulate* that record just by being logged in `crypto_predictions` -- a prediction

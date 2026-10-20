@@ -9,9 +9,11 @@ from uuid import UUID
 
 import pytest
 
+from andy_trader.ablation import run_ablation
 from andy_trader.baselines import PredictionContext, default_baselines
 from andy_trader.llm_agent import LlmPredictor, _ordered_prices, _parse, ask_model, build_predictors, render_context
 from andy_trader.llm_ledger import fetch_decisions, initialize_ledger, latest_decision, record_decision
+from andy_trader.portfolio import execute_paper_trade
 from andy_trader.store import Candle, connect, record_observations
 
 
@@ -58,10 +60,74 @@ def test_context_sections_order_and_determinism(tmp_path):
         first = render_context(connection, INSTRUMENTS, NOW.isoformat())
         assert first == render_context(connection, INSTRUMENTS, NOW.isoformat())
         assert first.index("1. ETH-USD") < first.index("2. BTC-USD")
-        for name in ("prices", "funding_rate", "long_ratio", "fear_greed"):
+        for name in ("prices", "funding_rate", "long_ratio", "fear_greed", "recent_results"):
             assert f"## SECTION: {name}" in first
         assert "24h volatility" in first
         assert "unavailable" in first
+
+
+def test_recent_results_from_closed_probe_trades(tmp_path):
+    with _db(tmp_path) as connection:
+        for instrument, exits in (("BTC-USD", (110, 90, 120, 80, 105, 95)),
+                                  ("ETH-USD", (110, 110, 90))):
+            for index, exit_price in enumerate(exits):
+                opened = NOW - timedelta(hours=20 - 2 * index)
+                for side, price, at, reason in (
+                    ("long", 100, opened, "open"),
+                    ("flat", exit_price, opened + timedelta(hours=1), f"close {instrument} {index}"),
+                ):
+                    execute_paper_trade(connection, predictor="probe", instrument=instrument,
+                                        target_side=side, price=price, now_iso=at.isoformat(),
+                                        reason=reason, fee_bps=0, slippage_bps=0, starting_cash=1000)
+        for side, price, reason in (("short", 100, "x10 open"), ("flat", 90, "x10 close")):
+            execute_paper_trade(connection, predictor="probe_x10", instrument="BTC-USD",
+                                target_side=side, price=price, now_iso=(NOW - timedelta(hours=2)).isoformat(),
+                                reason=reason, fee_bps=0, slippage_bps=0, starting_cash=1000,
+                                leverage=10)
+        execute_paper_trade(connection, predictor="probe", instrument="BTC-USD",
+                            target_side="short", price=100, now_iso=(NOW - timedelta(minutes=30)).isoformat(),
+                            reason="still open", fee_bps=0, slippage_bps=0)
+
+        section = render_context(connection, INSTRUMENTS, NOW.isoformat()).split("## SECTION: recent_results\n")[1]
+        assert "probe book: closed trades 9; wins 5; average pnl +1.11%" in section
+        assert "1. ETH-USD:\n  3 closed trades only, too few to mean much" in section
+        assert "2. BTC-USD:" in section
+        assert "close BTC-USD 0" not in section
+        assert "close BTC-USD 5; pnl -5.00%" in section
+        assert "close BTC-USD 2; pnl +20.00%" in section
+        assert "x10" not in section and "still open" not in section
+        assert section.count("close BTC-USD") == 5
+
+
+def test_recent_results_empty_database_and_ablation(tmp_path):
+    with _db(tmp_path) as connection:
+        context = render_context(connection, INSTRUMENTS, NOW.isoformat())
+        assert "probe book: closed trades 0; wins 0; average pnl +0.00%" in context
+        assert "0 closed trades only, too few to mean much" in context
+        record_decision(connection, created_at=NOW.isoformat(), batch_id="test", instrument="BTC-USD",
+                        model="fake-model", rendered_context=context, p_up=0.6, status="ok")
+        seen = []
+        run_ablation(connection, ask=lambda reduced: (
+            seen.append(reduced) or _reply({"instrument": "BTC-USD", "p_up": 0.6})
+        ))
+        assert any("## SECTION: recent_results" not in reduced and "## SECTION: prices" in reduced
+                   for reduced in seen)
+
+
+def test_recent_results_short_includes_costs_and_respects_time(tmp_path):
+    with _db(tmp_path) as connection:
+        execute_paper_trade(connection, predictor="probe", instrument="BTC-USD",
+                            target_side="short", price=100, now_iso=(NOW - timedelta(hours=1)).isoformat(),
+                            reason="short open", starting_cash=1000)
+        execute_paper_trade(connection, predictor="probe", instrument="BTC-USD",
+                            target_side="flat", price=80, now_iso=NOW.isoformat(), reason="short close")
+        execute_paper_trade(connection, predictor="probe", instrument="BTC-USD",
+                            target_side="long", price=100, now_iso=(NOW + timedelta(hours=1)).isoformat(),
+                            reason="future open")
+        section = render_context(connection, INSTRUMENTS, NOW.isoformat()).split("## SECTION: recent_results\n")[1]
+        assert "short; entry 100; exit 80; reason short close; pnl +19.73%" in section
+        assert "probe book: closed trades 1; wins 1; average pnl +19.73%" in section
+        assert "future open" not in section
 
 
 def test_missing_history_sorts_last_after_known_moves(tmp_path):

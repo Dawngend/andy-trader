@@ -21,6 +21,7 @@ import uuid
 from andy_trader.baselines import MAX_CONFIDENCE, MIN_CONFIDENCE, PredictionContext, default_baselines
 from andy_trader.llm_ledger import initialize_ledger, record_decision
 from andy_trader.predict import load_closes
+from andy_trader.probe_book import PROBE_BOOK
 from andy_trader.signals import FEAR_GREED, FUNDING_RATE, LONG_RATIO, initialize_signals
 
 TEMPLATE_REV = "v1"
@@ -50,6 +51,50 @@ def _signal(connection: sqlite3.Connection, name: str, instrument: str | None, n
         return "unavailable"
     age = (datetime.fromisoformat(now_iso) - datetime.fromisoformat(row["observed_time"])).total_seconds() / 3600
     return f"{float(row['value']):.6g}; age {age:.2f}h"
+
+
+def _recent_results(connection: sqlite3.Connection, ordered: list[tuple[str, list[float], float | None]],
+                    now_iso: str) -> list[str]:
+    lines = ["## SECTION: recent_results"]
+    closed: dict[str, list[tuple[str, float, float, str, float]]] = {}
+    openings = {}
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paper_trades'").fetchone():
+        rows = connection.execute("""
+            SELECT instrument, side, qty, price, fee_cost, slippage_cost, executed_at, reason
+            FROM paper_trades
+            WHERE predictor = ? AND executed_at <= ?
+            ORDER BY executed_at, id
+        """, (PROBE_BOOK, now_iso))
+        for row in rows:
+            instrument = row["instrument"]
+            if row["side"] != "flat":
+                openings[instrument] = row
+                continue
+            entry = openings.pop(instrument, None)
+            if entry is None:
+                continue
+            direction = 1 if entry["side"] == "long" else -1
+            notional = entry["qty"] * entry["price"]
+            pnl = (direction * entry["qty"] * (row["price"] - entry["price"])
+                   - entry["fee_cost"] - entry["slippage_cost"]
+                   - row["fee_cost"] - row["slippage_cost"])
+            pnl_pct = pnl / notional * 100 if notional else 0.0
+            closed.setdefault(instrument, []).append(
+                (entry["side"], entry["price"], row["price"], row["reason"], pnl_pct))
+
+    all_results = [trade[-1] for trades in closed.values() for trade in trades]
+    wins = sum(pnl > 0 for pnl in all_results)
+    average = sum(all_results) / len(all_results) if all_results else 0.0
+    lines.append(f"probe book: closed trades {len(all_results)}; wins {wins}; average pnl {average:+.2f}%")
+    for position, (instrument, _, _) in enumerate(ordered, 1):
+        trades = closed.get(instrument, [])
+        lines.append(f"{position}. {instrument}:")
+        if len(trades) < 5:
+            noun = "trade" if len(trades) == 1 else "trades"
+            lines.append(f"  {len(trades)} closed {noun} only, too few to mean much")
+        for side, entry, exit_price, reason, pnl_pct in reversed(trades[-5:]):
+            lines.append(f"  {side}; entry {entry:.8g}; exit {exit_price:.8g}; reason {reason}; pnl {pnl_pct:+.2f}%")
+    return lines
 
 
 def render_context(connection: sqlite3.Connection, instruments: Sequence[str], now_iso: str,
@@ -88,12 +133,13 @@ def render_context(connection: sqlite3.Connection, instruments: Sequence[str], n
         lines.append(f"## SECTION: {name}")
         for position, (instrument, _, _) in enumerate(ordered, 1):
             lines.append(f"{position}. {instrument}: {_signal(connection, name, None if name == FEAR_GREED else instrument, now_iso)}")
+    lines.extend(_recent_results(connection, ordered, now_iso))
     return "\n".join(lines)
 
 
 def _messages(context: str) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": "Return JSON only: {\"calls\": [{\"instrument\": \"...\", \"p_up\": 0.0, \"reason\": \"one sentence\"}]}. p_up is the probability that the next hourly close is above the current close. Code decides position size, leverage, and exits."},
+        {"role": "system", "content": "Return JSON only: {\"calls\": [{\"instrument\": \"...\", \"p_up\": 0.0, \"reason\": \"one sentence\"}]}. p_up is the probability that the next hourly close is above the current close. Code decides position size, leverage, and exits. Past results are a small sample and are not proof."},
         {"role": "user", "content": context},
     ]
 
