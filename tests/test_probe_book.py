@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from andy_trader.portfolio import initialize_portfolio, mark_to_market
+from andy_trader.portfolio import initialize_portfolio, mark_to_market, run_paper_cycle
 from andy_trader.probe_book import (
     PROBE_BOOK,
     PROBE_X10_BOOK,
@@ -125,6 +125,67 @@ def test_probe_never_jumps_directly_from_long_to_short(tmp_path: Path) -> None:
             (PROBE_BOOK,),
         ).fetchone()
         assert state["position_qty"] < 0  # ended up short, reached safely through flat
+
+
+@pytest.mark.parametrize("book", (probe_trade_once, probe_x10_trade_once))
+def test_probe_holds_signal_flip_until_minimum_age(tmp_path: Path, book) -> None:
+    now = datetime(2026, 10, 20, 0, tzinfo=UTC)
+    with connect(tmp_path / "paper.db") as connection:
+        _seed_cycle(connection, now=now, probability_up=0.9)
+        assert book(connection, instrument="BTC-USD", now=now).trade.side == "long"
+
+        five = now + timedelta(minutes=5)
+        _seed_cycle(connection, now=five, probability_up=0.1)
+        assert book(connection, instrument="BTC-USD", now=five).trade is None
+
+        sixteen = now + timedelta(minutes=16)
+        _seed_cycle(connection, now=sixteen, probability_up=0.1)
+        assert book(connection, instrument="BTC-USD", now=sixteen).trade.side == "flat"
+
+
+@pytest.mark.parametrize("book", (probe_trade_once, probe_x10_trade_once))
+def test_stop_exits_during_minimum_hold(tmp_path: Path, book) -> None:
+    now = datetime(2026, 10, 20, 0, tzinfo=UTC)
+    with connect(tmp_path / "paper.db") as connection:
+        _seed_cycle(connection, now=now, probability_up=0.9)
+        assert book(connection, instrument="BTC-USD", now=now).trade.side == "long"
+        later = now + timedelta(minutes=2)
+        _seed_cycle(connection, now=later, probability_up=0.9, price=97)
+        attempt = book(connection, instrument="BTC-USD", now=later)
+        assert attempt.trade.side == "flat"
+        assert "bracket stop" in attempt.trade.reason
+
+
+@pytest.mark.parametrize("value,flip_minute,expected", [
+    ("0", 5, "flat"), ("bad", 5, None), ("-3", 5, None),
+])
+def test_probe_hold_setting(tmp_path: Path, monkeypatch, value, flip_minute, expected) -> None:
+    monkeypatch.setenv("PROBE_MIN_HOLD_MINUTES", value)
+    now = datetime(2026, 10, 20, 0, tzinfo=UTC)
+    with connect(tmp_path / "paper.db") as connection:
+        _seed_cycle(connection, now=now, probability_up=0.9)
+        probe_trade_once(connection, instrument="BTC-USD", now=now)
+        flip = now + timedelta(minutes=flip_minute)
+        _seed_cycle(connection, now=flip, probability_up=0.1)
+        attempt = probe_trade_once(connection, instrument="BTC-USD", now=flip)
+        assert (attempt.trade.side if attempt.trade else None) == expected
+        if expected is None:
+            later = now + timedelta(minutes=16)
+            _seed_cycle(connection, now=later, probability_up=0.1)
+            assert probe_trade_once(connection, instrument="BTC-USD", now=later).trade.side == "flat"
+
+
+def test_gated_cycle_has_no_probe_hold(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBE_MIN_HOLD_MINUTES", "60")
+    now = datetime(2026, 10, 20, 0, tzinfo=UTC)
+    with connect(tmp_path / "paper.db") as connection:
+        opened = run_paper_cycle(connection, predictor="gated", instrument="BTC-USD",
+                                 probability_up=0.9, price=100, now_iso=now.isoformat())
+        assert opened.trade.side == "long"
+        flipped = run_paper_cycle(connection, predictor="gated", instrument="BTC-USD",
+                                  probability_up=0.1, price=100,
+                                  now_iso=(now + timedelta(minutes=5)).isoformat())
+        assert flipped.trade.side == "flat"
 
 
 def test_x10_book_takes_ten_times_the_1x_position_on_the_same_call(tmp_path: Path) -> None:

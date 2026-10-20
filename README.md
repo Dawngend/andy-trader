@@ -786,3 +786,5 @@ Run the paper-only probe watcher with:
     python run_probe_watch.py
 
 Use --database PATH to override the database. The scheduled task AndyTrader-ProbeWatch runs it every minute. Each pass fetches Binance minute bars, runs risk and bracket exits for probe and probe_x10, marks equity, then requests AI only when LLM_MIN_MINUTES and LLM_DAILY_CALLS allow. Model requests time out after 25 seconds. Prices older than 2.5 minutes are skipped. Each batch can trade once per book. Closed trades (including entry costs) and stale-price skips are recorded in .probe-watch.jsonl. run_cycle.py no longer requests AI batches or trades these books.
+`PROBE_MIN_HOLD_MINUTES` defaults to 15; probe and probe_x10 ignore signal exits until this age, while stops, targets, liquidation, and the risk interlock still close immediately. Set it to 0 to disable the hold.
+Hourly trade-limit `throttled` risk events are recorded once per book and instrument per clock hour.

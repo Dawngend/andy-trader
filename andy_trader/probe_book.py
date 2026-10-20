@@ -36,6 +36,8 @@ toward either.
 from __future__ import annotations
 
 from datetime import datetime
+import math
+import os
 import sqlite3
 
 from andy_trader.portfolio import PaperTradeAttempt, paper_trade_once
@@ -54,6 +56,15 @@ REASON_TAG = "ungated"
 PROBE_X10_BOOK = "probe_x10"
 PROBE_X10_LEVERAGE = 10.0
 REASON_TAG_X10 = "ungated x10"
+MIN_HOLD_ENV = "PROBE_MIN_HOLD_MINUTES"
+
+
+def configured_min_hold_minutes() -> float:
+    try:
+        minutes = float(os.environ.get(MIN_HOLD_ENV, "15"))
+    except ValueError:
+        return 15.0
+    return minutes if math.isfinite(minutes) and minutes >= 0 else 15.0
 
 
 def probe_trade_once(
@@ -87,6 +98,7 @@ def probe_trade_once(
         skill_gate_disabled=True,
         starting_cash=STARTING_CASH_PHP,
         reason_prefix=REASON_TAG,
+        min_hold_minutes=configured_min_hold_minutes(),
     )
 
 
@@ -124,4 +136,5 @@ def probe_x10_trade_once(
         starting_cash=STARTING_CASH_PHP,
         reason_prefix=REASON_TAG_X10,
         leverage=PROBE_X10_LEVERAGE,
+        min_hold_minutes=configured_min_hold_minutes(),
     )
