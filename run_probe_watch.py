@@ -110,6 +110,7 @@ def run_pass(connection, *, now=None):
     try:
         for book, leverage, _ in BOOKS:
             for instrument, price in prices.items():
+                # Protective exits run before AI; the minimum hold applies only to signal exits.
                 state = get_or_create_state(connection, predictor=book, instrument=instrument,
                                             starting_cash=1000, leverage=leverage, now_iso=moment.isoformat())
                 decision = check_and_enforce(connection, predictor=book, instrument=instrument,

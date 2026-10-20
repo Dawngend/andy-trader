@@ -142,9 +142,10 @@ def test_minute_moves_and_ablation(setup):
     assert any('## SECTION: minute_moves' not in text and '## SECTION: prices' in text for text in seen)
 
 
-def test_batch_selection_ignores_newest(setup):
+def test_batch_selection_ignores_newest(setup, monkeypatch):
     from andy_trader.llm_ledger import record_decision
     from andy_trader.probe_book import probe_trade_once
+    monkeypatch.setenv('PROBE_MIN_HOLD_MINUTES', '0')
     watch.run_pass(setup, now=NOW)
     record_decision(setup, batch_id='sell', instrument='BTC-USD', p_up=.1, status='ok', created_at=NOW.isoformat())
     record_decision(setup, batch_id='newest-buy', instrument='BTC-USD', p_up=.9, status='ok', created_at=NOW.isoformat())

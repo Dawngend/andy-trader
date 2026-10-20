@@ -7,6 +7,7 @@ import pytest
 from andy_trader.portfolio import initialize_portfolio, mark_to_market
 from andy_trader.risk import (
     RiskLimits,
+    _record_event,
     check_and_enforce,
     fetch_kill_switch_state,
     initialize_risk,
@@ -180,6 +181,20 @@ def test_trade_rate_throttle_blocks_without_tripping_the_kill_switch() -> None:
 
     state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
     assert state is None or not state["tripped"]  # no persistent trip from a rate throttle
+
+    check_and_enforce(connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+                      now_iso="2026-09-05T00:51:00+00:00")
+    assert connection.execute("SELECT COUNT(*) FROM risk_events WHERE event = 'throttled'").fetchone()[0] == 1
+
+    # The rolling trade count can still be at its limit in the next clock hour.
+    check_and_enforce(connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+                      now_iso="2026-09-05T01:00:00+00:00")
+    assert connection.execute("SELECT COUNT(*) FROM risk_events WHERE event = 'throttled'").fetchone()[0] == 2
+
+    for minute in (0, 1):
+        _record_event(connection, predictor="p", instrument="BTC-USD", event="other",
+                      reason="test", now_iso=f"2026-09-05T01:{minute:02d}:00+00:00")
+    assert connection.execute("SELECT COUNT(*) FROM risk_events WHERE event = 'other'").fetchone()[0] == 2
 
 
 def test_already_tripped_kill_switch_blocks_without_recomputing() -> None:

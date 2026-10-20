@@ -260,7 +260,14 @@ def check_and_enforce(
 
     if trades_last_hour >= limits.max_trades_per_hour:
         reason = f"{trades_last_hour} trades in the last hour >= rate limit {limits.max_trades_per_hour}"
-        _record_event(connection, predictor=predictor, instrument=instrument, event="throttled", reason=reason, now_iso=now_iso)
+        hour_start = datetime.fromisoformat(now_iso).replace(minute=0, second=0, microsecond=0)
+        already_recorded = connection.execute(
+            "SELECT 1 FROM risk_events WHERE predictor = ? AND instrument = ? "
+            "AND event = 'throttled' AND recorded_at >= ? AND recorded_at < ? LIMIT 1",
+            (predictor, instrument, hour_start.isoformat(), (hour_start + _ONE_HOUR).isoformat()),
+        ).fetchone()
+        if not already_recorded:
+            _record_event(connection, predictor=predictor, instrument=instrument, event="throttled", reason=reason, now_iso=now_iso)
         return RiskDecision(allowed=False, reason=reason, **common)
 
     return RiskDecision(allowed=True, reason="within all configured limits", **common)

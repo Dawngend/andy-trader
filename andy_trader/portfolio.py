@@ -852,6 +852,7 @@ def run_paper_cycle(
     reason_prefix: str = "",
     leverage: float | None = None,
     fresh_minutes: float | None = None,
+    min_hold_minutes: float = 0,
 ) -> PaperCycleResult:
     """One full cycle: check the risk interlock, decide, trade if allowed, mark to market.
 
@@ -1001,6 +1002,12 @@ def run_paper_cycle(
     else:
         target = desired
         reason = f"probability_up={probability_up:.4f} (was {current_side}) -> {target}"
+    if (predictor in ("probe", "probe_x10") and target != current_side
+            and current_side != "flat" and not forced_exit
+            and current_state.entry_at is not None
+            and datetime.fromisoformat(now_iso) - datetime.fromisoformat(current_state.entry_at)
+            < timedelta(minutes=min_hold_minutes)):
+        target = current_side
     reason = _tag_reason(reason_prefix, reason)
 
     trade: Trade | None = None
@@ -1260,6 +1267,7 @@ def paper_trade_once(
     reason_prefix: str = "",
     leverage: float | None = None,
     batch_id: str | None = None,
+    min_hold_minutes: float = 0,
 ) -> PaperTradeAttempt:
     """Paper-trade the latest live prediction for one (predictor, instrument), if fresh enough.
 
@@ -1389,6 +1397,7 @@ def paper_trade_once(
         reason_prefix=reason_prefix,
         leverage=leverage,
         fresh_minutes=max_data_age_minutes if batch_id is not None else None,
+        min_hold_minutes=min_hold_minutes,
     )
     return PaperTradeAttempt(
         predictor=predictor, instrument=instrument, horizon=horizon,
