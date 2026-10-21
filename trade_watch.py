@@ -13,6 +13,11 @@ import sys
 import urllib.parse
 import urllib.request
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 from andy_trader.store import default_database_path
 
 ROOT = Path(__file__).resolve().parent
@@ -258,12 +263,39 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
     return line
 
 
+def default_registry_reader(name):
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def telegram_settings(environ=os.environ, registry=None):
+    registry = registry or default_registry_reader
+
+    def read_registry(name):
+        try:
+            return registry(name)
+        except Exception:
+            return None
+
+    token = environ.get("ANDY_TELEGRAM_TOKEN")
+    chat_id = environ.get("ANDY_TELEGRAM_CHAT_ID")
+    if token is None and sys.platform == "win32":
+        token = read_registry("ANDY_TELEGRAM_TOKEN")
+    if chat_id is None and sys.platform == "win32":
+        chat_id = read_registry("ANDY_TELEGRAM_CHAT_ID")
+    return token, chat_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixer", help="Command to launch for a new problem")
     args = parser.parse_args()
-    token = os.environ.get("ANDY_TELEGRAM_TOKEN")
-    chat_id = os.environ.get("ANDY_TELEGRAM_CHAT_ID")
+    token, chat_id = telegram_settings()
     notifier = (lambda messages: send_phone_alert(token, chat_id, messages)) if token and chat_id else None
     try:
         run_pass(fixer=args.fixer, notifier=notifier)

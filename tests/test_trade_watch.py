@@ -269,6 +269,7 @@ def test_main_needs_both_env_vars_for_notifier(monkeypatch, env):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(trade_watch, "default_registry_reader", lambda name: None)
     captured = {}
     monkeypatch.setattr(trade_watch, "run_pass",
                          lambda **kwargs: captured.update(kwargs))
@@ -285,6 +286,31 @@ def test_main_builds_notifier_when_both_env_vars_set(monkeypatch):
                          lambda **kwargs: captured.update(kwargs))
     trade_watch.main()
     assert captured["notifier"] is not None
+
+
+def test_telegram_settings_from_environment():
+    env = {"ANDY_TELEGRAM_TOKEN": "tok", "ANDY_TELEGRAM_CHAT_ID": "chat"}
+    assert trade_watch.telegram_settings(environ=env, registry=lambda name: None) == ("tok", "chat")
+
+
+def test_telegram_settings_falls_back_to_registry(monkeypatch):
+    monkeypatch.setattr(trade_watch.sys, "platform", "win32")
+    registry_values = {"ANDY_TELEGRAM_TOKEN": "reg-tok", "ANDY_TELEGRAM_CHAT_ID": "reg-chat"}
+    env = {"ANDY_TELEGRAM_TOKEN": "tok"}
+    settings = trade_watch.telegram_settings(environ=env, registry=registry_values.get)
+    assert settings == ("tok", "reg-chat")
+
+
+def test_telegram_settings_none_when_nowhere_found(monkeypatch):
+    monkeypatch.setattr(trade_watch.sys, "platform", "win32")
+    assert trade_watch.telegram_settings(environ={}, registry=lambda name: None) == (None, None)
+
+
+def test_telegram_settings_registry_error_does_not_crash(monkeypatch):
+    monkeypatch.setattr(trade_watch.sys, "platform", "win32")
+    def raising_registry(name):
+        raise OSError("registry unavailable")
+    assert trade_watch.telegram_settings(environ={}, registry=raising_registry) == (None, None)
 
 
 def test_send_phone_alert_posts_form_body(monkeypatch):

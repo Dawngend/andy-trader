@@ -6,6 +6,8 @@ Run `python trade_watch.py` every two minutes. It reads the database without cha
 
 To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
 
+`trade_watch.py` reads those settings from the process environment or, on Windows, from the current user's registry, so an already-running watch picks up a value `telegram_setup.py` just saved without signing out and back in.
+
 A calibrated-forecast harness for short-horizon crypto directional prediction.
 
 The point of this project is not the model. It is the measurement.
