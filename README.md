@@ -4,7 +4,7 @@
 
 Run `python trade_watch.py` every two minutes. It reads the database without changing it and never places trades. It checks new paper trades for price, fee, size, and open-position brackets, then checks the latest 1m BTC bar, new AI decision statuses, and new risk events. Results go to `.trade-watch.jsonl`; new problems also appear in `research/watch_alert.md`. To launch a repair command for new problems, use `python trade_watch.py --fixer "your command"`. The command is limited to one launch per ten minutes.
 
-To get a phone notification for new problems, run `setx ANDY_NOTIFY_URL https://ntfy.sh/<topic>` with your own topic, then install the ntfy app on your phone and subscribe to that same topic. Nothing is sent when `ANDY_NOTIFY_URL` is unset.
+To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
 
 A calibrated-forecast harness for short-horizon crypto directional prediction.
 

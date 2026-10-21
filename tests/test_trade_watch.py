@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
+import sys
 
 import pytest
 
@@ -212,7 +213,8 @@ def test_no_notifier_means_no_call(watch):
 
 def test_notifier_called_once_for_new_problem(watch, monkeypatch):
     calls = []
-    monkeypatch.setattr(trade_watch, "send_phone_alert", lambda url, messages: calls.append(messages))
+    monkeypatch.setattr(trade_watch, "send_phone_alert",
+                         lambda token, chat_id, messages: calls.append(messages))
     add_trade(watch[0], 123, fee=0)
     run(watch, notifier=lambda messages: calls.append(messages))
     assert len(calls) == 1
@@ -250,5 +252,58 @@ def test_old_state_file_without_last_notified_still_loads(watch):
 
 
 def test_send_phone_alert_swallows_connection_error(capsys):
-    trade_watch.send_phone_alert("http://127.0.0.1:1/closed", ["hello"])
-    assert "trade watch notifier failed" in capsys.readouterr().err
+    trade_watch.send_phone_alert("secret-token", "123", ["hello"])
+    err = capsys.readouterr().err
+    assert "telegram alert failed" in err
+    assert "secret-token" not in err
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {"ANDY_TELEGRAM_TOKEN": "tok"},
+    {"ANDY_TELEGRAM_CHAT_ID": "chat"},
+])
+def test_main_needs_both_env_vars_for_notifier(monkeypatch, env):
+    monkeypatch.setattr(sys, "argv", ["trade_watch.py"])
+    for key in ("ANDY_TELEGRAM_TOKEN", "ANDY_TELEGRAM_CHAT_ID"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    captured = {}
+    monkeypatch.setattr(trade_watch, "run_pass",
+                         lambda **kwargs: captured.update(kwargs))
+    trade_watch.main()
+    assert captured["notifier"] is None
+
+
+def test_main_builds_notifier_when_both_env_vars_set(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["trade_watch.py"])
+    monkeypatch.setenv("ANDY_TELEGRAM_TOKEN", "tok")
+    monkeypatch.setenv("ANDY_TELEGRAM_CHAT_ID", "chat")
+    captured = {}
+    monkeypatch.setattr(trade_watch, "run_pass",
+                         lambda **kwargs: captured.update(kwargs))
+    trade_watch.main()
+    assert captured["notifier"] is not None
+
+
+def test_send_phone_alert_posts_form_body(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def close(self):
+            pass
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = request.data
+        captured["method"] = request.get_method()
+        return FakeResponse()
+
+    monkeypatch.setattr(trade_watch.urllib.request, "urlopen", fake_urlopen)
+    trade_watch.send_phone_alert("tok123", "chat456", ["line one", "line two"])
+    assert captured["url"] == "https://api.telegram.org/bottok123/sendMessage"
+    assert captured["method"] == "POST"
+    body = captured["body"].decode("utf-8")
+    assert "chat_id=chat456" in body
+    assert "line+one" in body and "line+two" in body

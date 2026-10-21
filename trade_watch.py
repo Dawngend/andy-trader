@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 from andy_trader.store import default_database_path
@@ -170,16 +171,15 @@ def launch_fixer(command):
                      creationflags=flags)
 
 
-def send_phone_alert(url, messages):
-    body = "\n".join(messages)[:500].encode("utf-8")
-    request = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Title": "Andy Trader alert", "Priority": "high"},
-    )
+def send_phone_alert(token, chat_id, messages):
+    text = "\n".join(messages)[:500]
+    body = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    request = urllib.request.Request(url, data=body, method="POST")
     try:
         urllib.request.urlopen(request, timeout=5).close()
     except Exception as exc:
-        print(f"trade watch notifier failed: {exc}", file=sys.stderr)
+        print(f"telegram alert failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
@@ -262,8 +262,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixer", help="Command to launch for a new problem")
     args = parser.parse_args()
-    notify_url = os.environ.get("ANDY_NOTIFY_URL")
-    notifier = (lambda messages: send_phone_alert(notify_url, messages)) if notify_url else None
+    token = os.environ.get("ANDY_TELEGRAM_TOKEN")
+    chat_id = os.environ.get("ANDY_TELEGRAM_CHAT_ID")
+    notifier = (lambda messages: send_phone_alert(token, chat_id, messages)) if token and chat_id else None
     try:
         run_pass(fixer=args.fixer, notifier=notifier)
     except Exception as exc:
