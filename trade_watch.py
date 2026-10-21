@@ -200,7 +200,7 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
             raise ValueError("state file is not a JSON object")
         state = loaded
         needs_baseline = state["last_trade_id"] is None
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError, KeyError):
         state = {"last_trade_id": 0, "last_ai_id": 0, "last_risk_id": 0,
                  "open_problems": [], "last_fixer_launch": None, "last_notified": None}
         needs_baseline = True

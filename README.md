@@ -4,7 +4,7 @@
 
 Run `python trade_watch.py` every two minutes. It reads the database without changing it and never places trades. It checks new paper trades for price, fee, size, and open-position brackets, then checks the latest 1m BTC bar, new AI decision statuses, and new risk events. Results go to `.trade-watch.jsonl`; new problems also appear in `research/watch_alert.md`. To launch a repair command for new problems, use `python trade_watch.py --fixer "your command"`. The command is limited to one launch per ten minutes.
 
-To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
+To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts; it will ask you to confirm it found the right chat before saving anything. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
 
 `trade_watch.py` reads those settings from the process environment or, on Windows, from the current user's registry, so an already-running watch picks up a value `telegram_setup.py` just saved without signing out and back in.
 

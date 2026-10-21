@@ -16,15 +16,28 @@ def default_opener(url, data=None):
 
 
 def default_setx(name, value):
-    subprocess.run(["setx", name, value], check=True, capture_output=True)
+    try:
+        subprocess.run(["setx", name, value], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        raise RuntimeError("setx failed for " + name) from None
 
 
 def find_chat_id(token, opener):
     reply = opener(f"https://api.telegram.org/bot{token}/getUpdates")
     results = reply.get("result") or []
-    if not results:
-        return None
-    return str(results[-1]["message"]["chat"]["id"])
+    for update in reversed(results):
+        message = update.get("message")
+        if message is not None:
+            return message
+    return None
+
+
+def describe_sender(message):
+    chat = message["chat"]
+    sender = message.get("from") or {}
+    who = sender.get("username") or sender.get("first_name") or "someone"
+    title = chat.get("title") or chat.get("first_name")
+    return who, title
 
 
 def send_test_message(token, chat_id, opener):
@@ -33,10 +46,17 @@ def send_test_message(token, chat_id, opener):
 
 
 def setup(opener=default_opener, setx=default_setx, token=None, prompt=input):
-    token = token or getpass.getpass("Paste your Telegram bot token (from @BotFather): ")
-    chat_id = find_chat_id(token, opener)
-    if chat_id is None:
+    token = (token or getpass.getpass("Paste your Telegram bot token (from @BotFather): ")).strip()
+    message = find_chat_id(token, opener)
+    if message is None:
         print("Send any message to your bot in Telegram first, then run this again.")
+        return 1
+    chat_id = str(message["chat"]["id"])
+    who, title = describe_sender(message)
+    where = f' in "{title}"' if title else ""
+    answer = prompt(f"Most recent message{where} is from {who}. Is this you? (y/n): ")
+    if answer.strip().lower() != "y":
+        print("Not confirmed, nothing saved.")
         return 1
     setx("ANDY_TELEGRAM_TOKEN", token)
     setx("ANDY_TELEGRAM_CHAT_ID", chat_id)

@@ -161,6 +161,28 @@ def test_failed_state_save_keeps_old_cursor(watch, monkeypatch):
     assert run(watch)["trades_reviewed"] == [123]
 
 
+def test_incomplete_state_file_starts_fresh_baseline(tmp_path):
+    db = sqlite3.connect(tmp_path / "trades.db")
+    db.executescript("""
+        CREATE TABLE paper_trades (id INTEGER PRIMARY KEY);
+        CREATE TABLE llm_decisions (id INTEGER PRIMARY KEY, status TEXT);
+        CREATE TABLE risk_events (id INTEGER PRIMARY KEY, event TEXT);
+        CREATE TABLE crypto_observations (instrument TEXT, interval TEXT, open_time TEXT,
+            degraded INTEGER);
+        INSERT INTO paper_trades VALUES (12);
+    """)
+    db.execute("INSERT INTO crypto_observations VALUES ('BTC-USD', '1m', ?, 0)",
+               ((NOW - timedelta(minutes=1)).isoformat(),))
+    db.commit()
+    db.close()
+    paths = {"db_path": tmp_path / "trades.db", "state_path": tmp_path / "state.json",
+             "log_path": tmp_path / "log.jsonl", "alert_path": tmp_path / "alert.md"}
+    paths["state_path"].write_text("{}", encoding="utf-8")
+    line = trade_watch.run_pass(**paths, now=NOW)
+    assert line["trades_reviewed"] == []
+    assert json.loads(paths["state_path"].read_text())["last_trade_id"] == 12
+
+
 def test_unreadable_database_still_outputs(tmp_path):
     paths = {"db_path": tmp_path / "missing.db", "state_path": tmp_path / "state.json",
              "log_path": tmp_path / "log.jsonl", "alert_path": tmp_path / "alert.md"}
