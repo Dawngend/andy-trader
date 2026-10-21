@@ -183,8 +183,10 @@ def send_phone_alert(token, chat_id, messages):
     request = urllib.request.Request(url, data=body, method="POST")
     try:
         urllib.request.urlopen(request, timeout=5).close()
+        return True
     except Exception as exc:
         print(f"telegram alert failed: {type(exc).__name__}", file=sys.stderr)
+        return False
 
 
 def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
@@ -193,9 +195,12 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
     db_path = Path(db_path or default_database_path())
     state_path, log_path, alert_path = map(Path, (state_path, log_path, alert_path))
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("state file is not a JSON object")
+        state = loaded
         needs_baseline = state["last_trade_id"] is None
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         state = {"last_trade_id": 0, "last_ai_id": 0, "last_risk_id": 0,
                  "open_problems": [], "last_fixer_launch": None, "last_notified": None}
         needs_baseline = True
@@ -222,7 +227,13 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
 
     old = {json.dumps(item, sort_keys=True) for item in state["open_problems"]}
     new = [item for item in problems if json.dumps(item["identity"], sort_keys=True) not in old]
-    state["open_problems"] = [item["identity"] for item in problems]
+    new_keys = {json.dumps(item["identity"], sort_keys=True) for item in new}
+
+    def open_problems(notifier_handled):
+        undelivered = new_keys if not (fixer_handled and notifier_handled) else set()
+        return [item["identity"] for item in problems
+                if json.dumps(item["identity"], sort_keys=True) not in undelivered]
+
     line = {"at": now.isoformat(), "trades_reviewed": reviewed,
             "problems": problems, "notes": notes}
     try:
@@ -240,26 +251,41 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
                                   encoding="utf-8")
         except Exception as exc:
             print(f"trade watch alert failed: {exc}", file=sys.stderr)
+    fixer_handled = True
     if fixer and new:
+        fixer_handled = False
         try:
             previous = state["last_fixer_launch"]
             if previous is None or (now - datetime.fromisoformat(previous)).total_seconds() >= 600:
                 launch_fixer(fixer)
                 state["last_fixer_launch"] = now.isoformat()
+                fixer_handled = True
         except Exception as exc:
             print(f"trade watch fixer failed: {exc}", file=sys.stderr)
-    if notifier and new:
+
+    notifier_pending = bool(notifier and new)
+    state["open_problems"] = open_problems(notifier_handled=not notifier_pending)
+    try:
+        save_state(state_path, state)
+        saved = True
+    except Exception as exc:
+        print(f"trade watch state save failed: {exc}", file=sys.stderr)
+        saved = False
+
+    if notifier_pending and saved:
         try:
             previous = state.get("last_notified")
             if previous is None or (now - datetime.fromisoformat(previous)).total_seconds() >= 600:
-                notifier([item["message"] for item in new])
-                state["last_notified"] = now.isoformat()
+                result = notifier([item["message"] for item in new])
+                if result is not False:
+                    state["last_notified"] = now.isoformat()
+                    state["open_problems"] = open_problems(notifier_handled=True)
+                    try:
+                        save_state(state_path, state)
+                    except Exception as exc:
+                        print(f"trade watch state save failed: {exc}", file=sys.stderr)
         except Exception as exc:
             print(f"trade watch notifier failed: {exc}", file=sys.stderr)
-    try:
-        save_state(state_path, state)
-    except Exception as exc:
-        print(f"trade watch state save failed: {exc}", file=sys.stderr)
     return line
 
 
