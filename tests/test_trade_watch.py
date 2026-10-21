@@ -161,7 +161,20 @@ def test_failed_state_save_keeps_old_cursor(watch, monkeypatch):
     assert run(watch)["trades_reviewed"] == [123]
 
 
-def test_incomplete_state_file_starts_fresh_baseline(tmp_path):
+def test_failed_state_save_skips_phone_alert(watch, monkeypatch, capsys):
+    db, paths = watch
+    add_trade(db, fee=0)
+    def fail(path, state):
+        raise OSError("disk full")
+    monkeypatch.setattr(trade_watch, "save_state", fail)
+    calls = []
+    run(watch, notifier=calls.append)
+    assert calls == []
+    assert "trade watch state save failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("contents", ["{}", "not json", "[]", "42", '"just a string"'])
+def test_incomplete_state_file_starts_fresh_baseline(tmp_path, contents):
     db = sqlite3.connect(tmp_path / "trades.db")
     db.executescript("""
         CREATE TABLE paper_trades (id INTEGER PRIMARY KEY);
@@ -177,7 +190,7 @@ def test_incomplete_state_file_starts_fresh_baseline(tmp_path):
     db.close()
     paths = {"db_path": tmp_path / "trades.db", "state_path": tmp_path / "state.json",
              "log_path": tmp_path / "log.jsonl", "alert_path": tmp_path / "alert.md"}
-    paths["state_path"].write_text("{}", encoding="utf-8")
+    paths["state_path"].write_text(contents, encoding="utf-8")
     line = trade_watch.run_pass(**paths, now=NOW)
     assert line["trades_reviewed"] == []
     assert json.loads(paths["state_path"].read_text())["last_trade_id"] == 12
@@ -218,6 +231,22 @@ def test_fixer_rate_limit(watch, monkeypatch):
     add_trade(watch[0], 124, fee=0)
     run(watch, NOW + timedelta(minutes=2), fixer="fix things")
     assert launches == ["fix things"]
+
+
+def test_fixer_throttled_identity_is_retried_once_it_clears(watch, monkeypatch):
+    launches = []
+    monkeypatch.setattr(trade_watch, "launch_fixer", launches.append)
+    add_trade(watch[0], 123, fee=0)
+    run(watch, NOW + timedelta(minutes=2), fixer="fix things")
+    assert launches == ["fix things"]
+    # Bar goes stale while still inside the fixer's 10-minute throttle: skipped, not marked seen.
+    run(watch, NOW + timedelta(minutes=6), fixer="fix things")
+    assert launches == ["fix things"]
+    state = json.loads(watch[1]["state_path"].read_text())
+    assert "stale_btc_bar" not in state["open_problems"]
+    # Throttle clears; the still-stale bar must be retried, not treated as already seen.
+    run(watch, NOW + timedelta(minutes=13), fixer="fix things")
+    assert launches == ["fix things", "fix things"]
 
 
 def test_idle_line_waits_ten_minutes(watch):
@@ -262,6 +291,29 @@ def test_notifier_rate_limited_ten_minutes(watch):
     assert len(calls) == 2
 
 
+def test_notifier_throttled_identity_is_retried_once_it_clears(watch):
+    calls = []
+    add_trade(watch[0], 123, fee=0)
+    run(watch, NOW + timedelta(minutes=2), notifier=calls.append)
+    assert len(calls) == 1
+    # Bar goes stale while still inside the notifier's 10-minute throttle: skipped, not marked seen.
+    run(watch, NOW + timedelta(minutes=6), notifier=calls.append)
+    assert len(calls) == 1
+    state = json.loads(watch[1]["state_path"].read_text())
+    assert "stale_btc_bar" not in state["open_problems"]
+    # Throttle clears; the still-stale bar must be retried, not treated as already seen.
+    run(watch, NOW + timedelta(minutes=13), notifier=calls.append)
+    assert len(calls) == 2
+
+
+def test_notifier_returning_false_does_not_mark_delivered(watch):
+    add_trade(watch[0], 123, fee=0)
+    run(watch, notifier=lambda messages: False)
+    state = json.loads(watch[1]["state_path"].read_text())
+    assert state["last_notified"] is None
+    assert ["fee", 123] not in state["open_problems"]
+
+
 def test_old_state_file_without_last_notified_still_loads(watch):
     paths = watch[1]
     state = json.loads(paths["state_path"].read_text())
@@ -274,8 +326,9 @@ def test_old_state_file_without_last_notified_still_loads(watch):
 
 
 def test_send_phone_alert_swallows_connection_error(capsys):
-    trade_watch.send_phone_alert("secret-token", "123", ["hello"])
+    result = trade_watch.send_phone_alert("secret-token", "123", ["hello"])
     err = capsys.readouterr().err
+    assert result is False
     assert "telegram alert failed" in err
     assert "secret-token" not in err
 
@@ -349,7 +402,7 @@ def test_send_phone_alert_posts_form_body(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(trade_watch.urllib.request, "urlopen", fake_urlopen)
-    trade_watch.send_phone_alert("tok123", "chat456", ["line one", "line two"])
+    assert trade_watch.send_phone_alert("tok123", "chat456", ["line one", "line two"]) is True
     assert captured["url"] == "https://api.telegram.org/bottok123/sendMessage"
     assert captured["method"] == "POST"
     body = captured["body"].decode("utf-8")
