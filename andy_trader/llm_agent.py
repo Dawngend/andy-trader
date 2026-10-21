@@ -176,7 +176,8 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
 
 def ask_cli(context: str, provider: str) -> dict:
     commands = {
-        "agy": ["-p", "--model", "gemini-3.8-flash-high"],
+        # agy's -p takes the next word as the prompt, so the prompt must follow -p directly.
+        "agy": ["--model", "gemini-3.8-flash-high", "-p"],
         "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
         "claude": ["-p", "--model", "haiku"],
     }

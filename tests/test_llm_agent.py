@@ -439,7 +439,7 @@ def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
         assert {row["model"] for row in rows} == {"fallback/agy"}
         assert {row["request_count"] for row in rows} == {2}
     args, kwargs = seen[0]
-    assert args[:4] == ["/agy", "-p", "--model", "gemini-3.8-flash-high"]
+    assert args[:4] == ["/agy", "--model", "gemini-3.8-flash-high", "-p"]
     assert len(args) == 5 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
     assert kwargs["timeout"] == 90
 
