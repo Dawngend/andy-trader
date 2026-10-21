@@ -203,3 +203,52 @@ def test_idle_line_waits_ten_minutes(watch):
     assert len(paths["log_path"].read_text().splitlines()) == 1
     run(watch, NOW + timedelta(minutes=10))
     assert len(paths["log_path"].read_text().splitlines()) == 2
+
+
+def test_no_notifier_means_no_call(watch):
+    add_trade(watch[0], 123, fee=0)
+    run(watch)
+
+
+def test_notifier_called_once_for_new_problem(watch, monkeypatch):
+    calls = []
+    monkeypatch.setattr(trade_watch, "send_phone_alert", lambda url, messages: calls.append(messages))
+    add_trade(watch[0], 123, fee=0)
+    run(watch, notifier=lambda messages: calls.append(messages))
+    assert len(calls) == 1
+    assert "Trade fee is missing or zero" in calls[0][0]
+
+
+def test_notifier_not_called_for_same_problem(watch):
+    calls = []
+    add_trade(watch[0], 123, fee=0)
+    run(watch, notifier=calls.append)
+    run(watch, NOW + timedelta(minutes=1), notifier=calls.append)
+    assert len(calls) == 1
+
+
+def test_notifier_rate_limited_ten_minutes(watch):
+    calls = []
+    add_trade(watch[0], 123, fee=0)
+    run(watch, notifier=calls.append)
+    add_trade(watch[0], 124, fee=0)
+    run(watch, NOW + timedelta(minutes=2), notifier=calls.append)
+    assert len(calls) == 1
+    run(watch, NOW + timedelta(minutes=10), notifier=calls.append)
+    assert len(calls) == 2
+
+
+def test_old_state_file_without_last_notified_still_loads(watch):
+    paths = watch[1]
+    state = json.loads(paths["state_path"].read_text())
+    del state["last_notified"]
+    paths["state_path"].write_text(json.dumps(state))
+    add_trade(watch[0], 123, fee=0)
+    calls = []
+    run(watch, notifier=calls.append)
+    assert len(calls) == 1
+
+
+def test_send_phone_alert_swallows_connection_error(capsys):
+    trade_watch.send_phone_alert("http://127.0.0.1:1/closed", ["hello"])
+    assert "trade watch notifier failed" in capsys.readouterr().err

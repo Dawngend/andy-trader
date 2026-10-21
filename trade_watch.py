@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import urllib.request
 
 from andy_trader.store import default_database_path
 
@@ -168,8 +170,20 @@ def launch_fixer(command):
                      creationflags=flags)
 
 
+def send_phone_alert(url, messages):
+    body = "\n".join(messages)[:500].encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Title": "Andy Trader alert", "Priority": "high"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5).close()
+    except Exception as exc:
+        print(f"trade watch notifier failed: {exc}", file=sys.stderr)
+
+
 def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
-             fixer=None, now=None):
+             fixer=None, notifier=None, now=None):
     now = now or datetime.now(UTC)
     db_path = Path(db_path or default_database_path())
     state_path, log_path, alert_path = map(Path, (state_path, log_path, alert_path))
@@ -178,7 +192,7 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
         needs_baseline = state["last_trade_id"] is None
     except FileNotFoundError:
         state = {"last_trade_id": 0, "last_ai_id": 0, "last_risk_id": 0,
-                 "open_problems": [], "last_fixer_launch": None}
+                 "open_problems": [], "last_fixer_launch": None, "last_notified": None}
         needs_baseline = True
     reviewed, problems, notes = [], [], []
     try:
@@ -229,6 +243,14 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
                 state["last_fixer_launch"] = now.isoformat()
         except Exception as exc:
             print(f"trade watch fixer failed: {exc}", file=sys.stderr)
+    if notifier and new:
+        try:
+            previous = state.get("last_notified")
+            if previous is None or (now - datetime.fromisoformat(previous)).total_seconds() >= 600:
+                notifier([item["message"] for item in new])
+                state["last_notified"] = now.isoformat()
+        except Exception as exc:
+            print(f"trade watch notifier failed: {exc}", file=sys.stderr)
     try:
         save_state(state_path, state)
     except Exception as exc:
@@ -240,8 +262,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixer", help="Command to launch for a new problem")
     args = parser.parse_args()
+    notify_url = os.environ.get("ANDY_NOTIFY_URL")
+    notifier = (lambda messages: send_phone_alert(notify_url, messages)) if notify_url else None
     try:
-        run_pass(fixer=args.fixer)
+        run_pass(fixer=args.fixer, notifier=notifier)
     except Exception as exc:
         print(f"trade watch failed: {exc}", file=sys.stderr)
     return 0
