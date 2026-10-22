@@ -178,10 +178,28 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
 CLI_TIMEOUT_SECONDS = 40
 
 
+def _unwrap_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].strip() in ("```", "```json"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if not text.startswith("{"):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+    return text
+
+
 def ask_cli(context: str, provider: str) -> dict:
     commands = {
         # agy's -p takes the next word as the prompt, so the prompt must follow -p directly.
-        "agy": ["--model", "gemini-3.8-flash-high", "--sandbox", "--mode", "plan", "-p"],
+        # Do not add --mode plan: with a real batch prompt it silences agy entirely in
+        # headless mode (a tool needs the command permission that headless mode cannot prompt for).
+        "agy": ["--model", "gemini-3.8-flash-high", "--sandbox", "-p"],
         "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
         "claude": ["-p", "--model", "haiku"],
     }
@@ -194,7 +212,7 @@ def ask_cli(context: str, provider: str) -> dict:
     with tempfile.TemporaryDirectory() as cwd:
         result = subprocess.run([executable, *commands[provider], prompt], capture_output=True,
                                 text=True, timeout=CLI_TIMEOUT_SECONDS, check=True, cwd=cwd)
-    return {"choices": [{"message": {"content": result.stdout.strip()}}]}
+    return {"choices": [{"message": {"content": _unwrap_json(result.stdout)}}]}
 
 
 def _parse(response: dict, instruments: Sequence[str]) -> dict[str, tuple[float, str]]:
