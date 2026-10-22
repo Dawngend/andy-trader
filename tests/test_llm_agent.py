@@ -11,7 +11,7 @@ import pytest
 
 from andy_trader.ablation import run_ablation
 from andy_trader.baselines import PredictionContext, default_baselines
-from andy_trader.llm_agent import CLI_TIMEOUT_SECONDS, LlmPredictor, _ordered_prices, _parse, ask_model, build_predictors, render_context
+from andy_trader.llm_agent import CLI_TIMEOUT_SECONDS, LlmPredictor, _ordered_prices, _parse, ask_cli, ask_model, build_predictors, render_context
 from andy_trader.llm_ledger import fetch_decisions, initialize_ledger, latest_decision, record_decision
 from andy_trader.portfolio import execute_paper_trade
 from andy_trader.store import Candle, connect, record_observations
@@ -439,10 +439,24 @@ def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
         assert {row["model"] for row in rows} == {"fallback/agy"}
         assert {row["request_count"] for row in rows} == {2}
     args, kwargs = seen[0]
-    assert args[:7] == ["/agy", "--model", "gemini-3.8-flash-high", "--sandbox", "--mode", "plan", "-p"]
-    assert len(args) == 8 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
+    assert args[:5] == ["/agy", "--model", "gemini-3.8-flash-high", "--sandbox", "-p"]
+    assert len(args) == 6 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
     assert kwargs["timeout"] == CLI_TIMEOUT_SECONDS
     assert kwargs["cwd"] is not None and Path(kwargs["cwd"]) != Path.cwd()
+
+
+@pytest.mark.parametrize("stdout, expected", [
+    ('```json\n{"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}\n```', {"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}),
+    ('Here you go:\n{"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}\nHope that helps.',
+     {"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}),
+    ('{"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}', {"calls": [{"instrument": "BTC-USD", "p_up": 0.6}]}),
+])
+def test_ask_cli_unwraps_fenced_and_surrounded_json(monkeypatch, stdout, expected):
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run",
+                        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""))
+    response = ask_cli("context", "claude")
+    assert json.loads(response["choices"][0]["message"]["content"]) == expected
 
 
 def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
