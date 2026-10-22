@@ -199,10 +199,14 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
         if not isinstance(loaded, dict):
             raise ValueError("state file is not a JSON object")
         state = loaded
+        for key in ("last_trade_id", "last_ai_id", "last_risk_id", "open_problems", "last_fixer_launch"):
+            if key not in state:
+                raise KeyError(key)
         needs_baseline = state["last_trade_id"] is None
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError, KeyError):
         state = {"last_trade_id": 0, "last_ai_id": 0, "last_risk_id": 0,
-                 "open_problems": [], "last_fixer_launch": None, "last_notified": None}
+                 "open_problems": [], "last_fixer_launch": None, "last_notified": None,
+                 "pending_alerts": []}
         needs_baseline = True
     reviewed, problems, notes = [], [], []
     try:
@@ -228,6 +232,14 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
     old = {json.dumps(item, sort_keys=True) for item in state["open_problems"]}
     new = [item for item in problems if json.dumps(item["identity"], sort_keys=True) not in old]
     new_keys = {json.dumps(item["identity"], sort_keys=True) for item in new}
+
+    pending = list(state.get("pending_alerts", []))
+    pending_keys = {json.dumps(item["identity"], sort_keys=True) for item in pending}
+    for item in new:
+        key = json.dumps(item["identity"], sort_keys=True)
+        if key not in pending_keys:
+            pending.append(item)
+            pending_keys.add(key)
 
     def open_problems(notifier_handled):
         undelivered = new_keys if not (fixer_handled and notifier_handled) else set()
@@ -263,8 +275,9 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
         except Exception as exc:
             print(f"trade watch fixer failed: {exc}", file=sys.stderr)
 
-    notifier_pending = bool(notifier and new)
+    notifier_pending = bool(notifier and pending)
     state["open_problems"] = open_problems(notifier_handled=not notifier_pending)
+    state["pending_alerts"] = pending
     try:
         save_state(state_path, state)
         saved = True
@@ -276,10 +289,11 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
         try:
             previous = state.get("last_notified")
             if previous is None or (now - datetime.fromisoformat(previous)).total_seconds() >= 600:
-                result = notifier([item["message"] for item in new])
+                result = notifier([item["message"] for item in pending])
                 if result is not False:
                     state["last_notified"] = now.isoformat()
                     state["open_problems"] = open_problems(notifier_handled=True)
+                    state["pending_alerts"] = []
                     try:
                         save_state(state_path, state)
                     except Exception as exc:

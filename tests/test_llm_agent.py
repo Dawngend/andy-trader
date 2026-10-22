@@ -11,7 +11,7 @@ import pytest
 
 from andy_trader.ablation import run_ablation
 from andy_trader.baselines import PredictionContext, default_baselines
-from andy_trader.llm_agent import CLI_TIMEOUT_SECONDS, LlmPredictor, _ordered_prices, _parse, ask_cli, ask_model, build_predictors, render_context
+from andy_trader.llm_agent import CLI_TIMEOUT_SECONDS, LlmPredictor, _messages, _ordered_prices, _parse, ask_cli, ask_model, build_predictors, render_context
 from andy_trader.llm_ledger import fetch_decisions, initialize_ledger, latest_decision, record_decision
 from andy_trader.portfolio import execute_paper_trade
 from andy_trader.store import Candle, connect, record_observations
@@ -453,10 +453,16 @@ def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
 ])
 def test_ask_cli_unwraps_fenced_and_surrounded_json(monkeypatch, stdout, expected):
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
-    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run",
-                        lambda args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""))
+    seen = []
+    def run(args, **kwargs):
+        seen.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
     response = ask_cli("context", "claude")
     assert json.loads(response["choices"][0]["message"]["content"]) == expected
+    assert seen[0][:7] == ["/claude", "-p", "--model", "haiku", "--setting-sources", "project", "--strict-mcp-config"]
+    assert seen[0][7:9] == ["--disable-slash-commands", "--no-session-persistence"]
+    assert seen[0][-1] == json.dumps(_messages("context"), ensure_ascii=False)
 
 
 def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
@@ -495,6 +501,19 @@ def test_all_providers_fail_one_error_row(monkeypatch, tmp_path):
         assert rows[0]["status"] == "error" and rows[0]["p_up"] is None
         assert rows[0]["request_count"] == 4
         assert all(name in rows[0]["reason"] for name in ("gateway", "agy", "codex", "claude"))
+
+
+def test_gateway_http_error_reports_status_code(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_FALLBACKS", "")
+    def gateway(_):
+        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
+        rows = fetch_decisions(connection, 10)
+        assert rows[0]["reason"] == "gateway: HTTPError 429"
+        assert "https://example.invalid" not in rows[0]["reason"]
 
 
 def test_error_row_omits_prompt_and_cli_flags(monkeypatch, tmp_path):

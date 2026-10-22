@@ -196,6 +196,32 @@ def test_incomplete_state_file_starts_fresh_baseline(tmp_path, contents):
     assert json.loads(paths["state_path"].read_text())["last_trade_id"] == 12
 
 
+def test_old_schema_state_file_rebuilds_baseline(tmp_path):
+    db = sqlite3.connect(tmp_path / "trades.db")
+    db.executescript("""
+        CREATE TABLE paper_trades (id INTEGER PRIMARY KEY);
+        CREATE TABLE llm_decisions (id INTEGER PRIMARY KEY, status TEXT);
+        CREATE TABLE risk_events (id INTEGER PRIMARY KEY, event TEXT);
+        CREATE TABLE crypto_observations (instrument TEXT, interval TEXT, open_time TEXT,
+            degraded INTEGER);
+        INSERT INTO paper_trades VALUES (12);
+    """)
+    db.execute("INSERT INTO crypto_observations VALUES ('BTC-USD', '1m', ?, 0)",
+               ((NOW - timedelta(minutes=1)).isoformat(),))
+    db.commit()
+    db.close()
+    paths = {"db_path": tmp_path / "trades.db", "state_path": tmp_path / "state.json",
+             "log_path": tmp_path / "log.jsonl", "alert_path": tmp_path / "alert.md"}
+    # Old schema: has last_trade_id but is missing last_ai_id/last_risk_id/open_problems/
+    # last_fixer_launch, so the first run_pass call would otherwise KeyError inside review().
+    paths["state_path"].write_text(json.dumps({"last_trade_id": 5}), encoding="utf-8")
+    line = trade_watch.run_pass(**paths, now=NOW)
+    assert line["trades_reviewed"] == []
+    assert json.loads(paths["state_path"].read_text())["last_trade_id"] == 12
+    recovered = trade_watch.run_pass(**paths, now=NOW + timedelta(minutes=1))
+    assert recovered["trades_reviewed"] == [] and recovered["problems"] == []
+
+
 def test_unreadable_database_still_outputs(tmp_path):
     paths = {"db_path": tmp_path / "missing.db", "state_path": tmp_path / "state.json",
              "log_path": tmp_path / "log.jsonl", "alert_path": tmp_path / "alert.md"}
@@ -280,15 +306,31 @@ def test_notifier_not_called_for_same_problem(watch):
     assert len(calls) == 1
 
 
+def fresh_bar(db, at):
+    db.execute("INSERT INTO crypto_observations VALUES (?, ?, ?, ?, ?, ?)",
+               ("BTC-USD", "1m", (at - timedelta(seconds=30)).isoformat(), 100, 0, at.isoformat()))
+    db.commit()
+
+
 def test_notifier_rate_limited_ten_minutes(watch):
+    db, paths = watch
     calls = []
-    add_trade(watch[0], 123, fee=0)
+    add_trade(db, 123, fee=0)
     run(watch, notifier=calls.append)
-    add_trade(watch[0], 124, fee=0)
+    assert len(calls) == 1
+    # A second, one-off problem (an AI status row, never re-detected once past) arrives
+    # while still inside the throttle window.
+    db.execute("INSERT INTO llm_decisions VALUES (7, 'error')")
+    db.commit()
+    fresh_bar(db, NOW + timedelta(minutes=2))
     run(watch, NOW + timedelta(minutes=2), notifier=calls.append)
     assert len(calls) == 1
+    # Once the throttle clears, the queued one-off alert must still be delivered even
+    # though nothing new was detected on this pass.
+    fresh_bar(db, NOW + timedelta(minutes=10))
     run(watch, NOW + timedelta(minutes=10), notifier=calls.append)
     assert len(calls) == 2
+    assert calls[1] == ["AI decision 7 status: error"]
 
 
 def test_notifier_throttled_identity_is_retried_once_it_clears(watch):

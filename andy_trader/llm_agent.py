@@ -201,7 +201,10 @@ def ask_cli(context: str, provider: str) -> dict:
         # headless mode (a tool needs the command permission that headless mode cannot prompt for).
         "agy": ["--model", "gemini-3.8-flash-high", "--sandbox", "-p"],
         "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
-        "claude": ["-p", "--model", "haiku"],
+        # Without these flags `claude -p` starts a full session, so Dawn's SessionStart
+        # hooks (an omni_cli sync + brief) run on every fallback call.
+        "claude": ["-p", "--model", "haiku", "--setting-sources", "project", "--strict-mcp-config",
+                  "--disable-slash-commands", "--no-session-persistence"],
     }
     if provider not in commands:
         raise ValueError(f"Unknown fallback provider: {provider}")
@@ -341,7 +344,9 @@ class LlmPredictor:
                     provider = candidate
                     break
                 except Exception as exc:
-                    errors.append(f"{candidate}: {type(exc).__name__}")
+                    code = getattr(exc, "code", None)
+                    label = f"{type(exc).__name__} {code}" if code is not None else type(exc).__name__
+                    errors.append(f"{candidate}: {label}")
             if response is None:
                 status = "error"
                 error = "; ".join(errors)
