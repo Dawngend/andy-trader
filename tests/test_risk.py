@@ -392,9 +392,11 @@ def test_blocked_entry_is_distinguishable_from_an_ordinary_no_trade_decision() -
 
 
 @pytest.mark.parametrize("equity", [float("nan"), float("inf"), float("-inf")])
-def test_non_finite_equity_hard_trips_instead_of_being_allowed(equity: float) -> None:
+def test_non_finite_equity_refuses_this_pass_instead_of_being_allowed(equity: float) -> None:
     """Every limit below compares false against NaN, so an unguarded non-finite
-    equity used to come back allowed=True -- the one answer it must never be."""
+    equity used to come back allowed=True -- the one answer it must never be.
+    But a broken equity input is not a loss, so it refuses only this pass: no
+    trip, no kill-switch row, and the next finite pass is judged normally."""
     connection = _conn()
 
     decision = check_and_enforce(
@@ -403,16 +405,19 @@ def test_non_finite_equity_hard_trips_instead_of_being_allowed(equity: float) ->
     )
 
     assert decision.allowed is False
-    assert decision.tripped_now is True
-    assert decision.severity == "hard"
-    assert "finite" in decision.reason
+    assert decision.tripped_now is False
+    assert decision.reason == "equity is not a finite number; refusing this pass"
 
-    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
-    assert state["tripped"] == 1
-    assert state["severity"] == "hard"
+    assert fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD") is None
+
+    later = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T01:00:00+00:00", current_equity=10_000.0,
+    )
+    assert later.allowed is True
 
 
-def test_non_finite_recorded_equity_also_hard_trips() -> None:
+def test_non_finite_recorded_equity_also_only_refuses_the_pass() -> None:
     """Same hole reached through the stored curve rather than the live mark.
     (Infinity, not NaN: SQLite stores a NaN REAL as NULL.)"""
     connection = _conn()
@@ -430,4 +435,16 @@ def test_non_finite_recorded_equity_also_hard_trips() -> None:
     )
 
     assert decision.allowed is False
-    assert decision.severity == "hard"
+    assert decision.tripped_now is False
+    assert decision.reason == "equity is not a finite number; refusing this pass"
+    assert fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD") is None
+
+    # Once the curve holds a finite number again, the same pair is judged on
+    # its own merits -- the earlier non-finite reading left nothing behind.
+    connection.execute("UPDATE paper_equity_curve SET equity = 10000.0 WHERE predictor = 'p'")
+    connection.commit()
+    later = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T03:00:00+00:00",
+    )
+    assert later.allowed is True

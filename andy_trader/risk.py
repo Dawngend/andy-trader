@@ -228,9 +228,15 @@ def check_and_enforce(
     if not math.isfinite(latest_equity):
         # NaN/inf compares false against every limit below, so an unguarded
         # non-finite equity would sail through the whole gate as allowed.
-        reason = f"equity is not a finite number ({latest_equity!r}); cannot be judged against any limit"
-        _trip(connection, predictor=predictor, instrument=instrument, severity="hard", reason=reason, now_iso=now_iso)
-        return RiskDecision(allowed=False, reason=reason, tripped_now=True, severity="hard")
+        # Refuse *this pass only*: a non-finite number means the equity input
+        # is broken, not that the book has lost money, and the kill switch is
+        # for the latter. Nothing is tripped and no row is written, so a later
+        # pass with a finite equity is judged normally again.
+        return RiskDecision(
+            allowed=False,
+            reason="equity is not a finite number; refusing this pass",
+            tripped_now=False,
+        )
     historical_peak = max((float(row["equity"]) for row in curve), default=latest_equity)
     peak_equity = max(historical_peak, latest_equity)
     day_start = _day_start_iso(now_iso)

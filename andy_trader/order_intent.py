@@ -20,6 +20,14 @@ Side = Literal["long", "short"]
 
 DEFAULT_EXPIRY_SECONDS = 300
 
+# The one leverage every path agrees on: an intent built without an explicit
+# leverage asks for exactly what `bybit_sender.LEVERAGE` sends with and what
+# `dry_run_executor.REQUIRED_LEVERAGE` requires, so a default-built intent is
+# never refused over leverage. Kept as a literal to avoid importing the sender
+# module here (same pattern as the executor); a test asserts the three stay
+# equal. Rows already stored keep whatever leverage they were written with.
+DEFAULT_INTENT_LEVERAGE = 10.0
+
 
 class OrderIntentError(ValueError):
     """Raised when an order intent is not internally consistent."""
@@ -36,7 +44,7 @@ class OrderIntent:
     source_decision_id: int
     created_at: str
     expires_at: str
-    leverage: float = 1.0
+    leverage: float = DEFAULT_INTENT_LEVERAGE
     gate_eligible: bool = False
     gate_reason: str = ""
 
@@ -64,7 +72,7 @@ def new_intent(
     source_decision_id: int,
     now_iso: str,
     expiry_seconds: int = DEFAULT_EXPIRY_SECONDS,
-    leverage: float = 1.0,
+    leverage: float = DEFAULT_INTENT_LEVERAGE,
     gate_eligible: bool = False,
     gate_reason: str = "",
 ) -> OrderIntent:
@@ -90,7 +98,7 @@ def new_intent(
 
 def initialize_order_intents(connection: sqlite3.Connection) -> None:
     connection.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS order_intents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instrument TEXT NOT NULL,
@@ -99,7 +107,7 @@ def initialize_order_intents(connection: sqlite3.Connection) -> None:
             size REAL NOT NULL,
             stop REAL NOT NULL,
             target REAL NOT NULL,
-            leverage REAL NOT NULL DEFAULT 1.0,
+            leverage REAL NOT NULL DEFAULT {DEFAULT_INTENT_LEVERAGE},
             source_decision_id INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
