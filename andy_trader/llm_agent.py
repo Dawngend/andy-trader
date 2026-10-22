@@ -175,7 +175,9 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
     return response
 
 
-CLI_TIMEOUT_SECONDS = 40
+# 40 s was too tight: agy sometimes needs 40 to 60 s and the batch was lost (about 5% of batches).
+# Budget: 25 s gateway + two CLI fallbacks at 70 s = 165 s, still under the 180 s stale-lock rule.
+CLI_TIMEOUT_SECONDS = 70
 
 
 def _unwrap_json(text: str) -> str:
