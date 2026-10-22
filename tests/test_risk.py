@@ -221,6 +221,132 @@ def test_rearming_a_switch_that_was_never_tripped_returns_false() -> None:
     assert rearmed is False
 
 
+def _trip_switch(connection: sqlite3.Connection, *, severity: str, reason: str, at: str) -> None:
+    connection.execute(
+        "INSERT INTO risk_kill_switch (predictor, instrument, tripped, severity, tripped_at, tripped_reason) "
+        "VALUES ('p', 'BTC-USD', 1, ?, ?, ?)",
+        (severity, at, reason),
+    )
+    connection.commit()
+
+
+def _seed_flat_equity(connection: sqlite3.Connection) -> None:
+    """A calm book: opened today at 10000 and still there -- within every limit."""
+    connection.execute(
+        "INSERT INTO paper_equity_curve (predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+        "VALUES ('p', 'BTC-USD', 10000.0, 0.0, 100.0, 0.0, 10000.0, '2026-09-05T00:05:00+00:00')"
+    )
+    connection.commit()
+
+
+def test_yesterdays_daily_loss_trip_expires_at_the_new_utc_day() -> None:
+    """A daily limit stops trading for the rest of THAT day, not forever."""
+    connection = _conn()
+    _seed_flat_equity(connection)
+    _trip_switch(connection, severity="soft", reason="daily loss 6.00% >= limit 5.00%",
+                 at="2026-09-04T18:00:00+00:00")
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "within all configured limits"
+    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert state["tripped"] == 0
+    assert state["rearm_note"] == "daily loss trip expired at the new UTC day"
+    events = connection.execute(
+        "SELECT event, reason FROM risk_events WHERE event = 'auto_rearmed'"
+    ).fetchall()
+    assert len(events) == 1
+    assert events[0]["reason"] == "daily loss trip expired at the new UTC day"
+
+
+def test_todays_daily_loss_trip_stays_tripped() -> None:
+    connection = _conn()
+    _seed_flat_equity(connection)
+    _trip_switch(connection, severity="soft", reason="daily loss 6.00% >= limit 5.00%",
+                 at="2026-09-05T02:00:00+00:00")
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T03:00:00+00:00",
+    )
+
+    assert decision.allowed is False
+    assert "daily loss 6.00%" in decision.reason
+    assert fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")["tripped"] == 1
+
+
+def test_yesterdays_drawdown_trip_still_needs_a_human() -> None:
+    connection = _conn()
+    _seed_flat_equity(connection)
+    _trip_switch(connection, severity="soft", reason="drawdown from peak 27.50% >= limit 25.00%",
+                 at="2026-09-04T18:00:00+00:00")
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert decision.allowed is False
+    assert "drawdown from peak" in decision.reason
+    assert fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")["tripped"] == 1
+
+
+def test_yesterdays_hard_halt_never_expires() -> None:
+    connection = _conn()
+    _seed_flat_equity(connection)
+    _trip_switch(connection, severity="hard", reason="total loss 45.00% >= permanent halt limit 40.00%",
+                 at="2026-09-04T18:00:00+00:00")
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert decision.allowed is False
+    assert decision.severity == "hard"
+    assert fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")["tripped"] == 1
+
+
+def test_expired_daily_trip_retrips_in_the_same_call_when_still_over_a_limit() -> None:
+    """Clearing is not a free pass: the normal checks run in the same call, so a
+    book that is still in trouble trips again immediately -- here on drawdown."""
+    connection = _conn()
+    # Peak 12000 back on 09-01, now 8700 -- a 27.5% drawdown, over the 25% limit.
+    connection.execute(
+        "INSERT INTO paper_equity_curve (predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+        "VALUES ('p', 'BTC-USD', 12000.0, 0.0, 120.0, 0.0, 12000.0, '2026-09-01T00:00:00+00:00')"
+    )
+    connection.execute(
+        "INSERT INTO paper_equity_curve (predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+        "VALUES ('p', 'BTC-USD', 8700.0, 0.0, 87.0, 0.0, 8700.0, '2026-09-05T00:05:00+00:00')"
+    )
+    connection.commit()
+    _trip_switch(connection, severity="soft", reason="daily loss 6.00% >= limit 5.00%",
+                 at="2026-09-04T18:00:00+00:00")
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T01:00:00+00:00",
+    )
+
+    assert decision.allowed is False
+    assert decision.tripped_now is True
+    assert decision.severity == "soft"
+    assert "drawdown from peak" in decision.reason
+
+    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert state["tripped"] == 1
+    assert state["tripped_reason"].startswith("drawdown from peak")
+    assert state["rearm_note"] is None  # the fresh trip cleared the auto-rearm bookkeeping
+    assert connection.execute(
+        "SELECT COUNT(*) FROM risk_events WHERE event = 'auto_rearmed'"
+    ).fetchone()[0] == 1
+
+
 def _seed_two_percent_daily_loss(connection: sqlite3.Connection) -> None:
     connection.execute(
         "INSERT INTO paper_portfolio_state (predictor, instrument, starting_cash, cash, position_qty, updated_at) "
