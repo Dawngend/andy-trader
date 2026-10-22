@@ -10,7 +10,9 @@ drawdown, 40% total loss (permanent), and a rate cap.
 
 - `soft` trip (daily loss or drawdown breached): recoverable. A human can
   review what happened and `rearm_kill_switch` to resume. This is meant to
-  catch a bad day, not end the experiment.
+  catch a bad day, not end the experiment -- so a daily-loss trip expires on
+  its own at the next UTC day, and the book is judged again from scratch. A
+  drawdown trip is not about one day and still needs a human to clear it.
 - `hard` halt (total loss vs starting capital breached): NOT rearmable
   through this module at all. `rearm_kill_switch` refuses and says so. The
   realistic failure mode this project has cared about from the start is a
@@ -36,6 +38,9 @@ from typing import Literal
 
 Severity = Literal["soft", "hard"]
 _ONE_HOUR = timedelta(hours=1)
+# The prefix every daily-loss trip reason is written with, and the marker
+# check_and_enforce recognises one by when deciding it has expired.
+_DAILY_LOSS_REASON_PREFIX = "daily loss "
 
 DEFAULT_MAX_DAILY_LOSS_PCT = 5.0
 DEFAULT_MAX_DRAWDOWN_PCT = 25.0
@@ -180,6 +185,37 @@ def _day_start_iso(now_iso: str) -> str:
     return parsed.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
+_AUTO_REARM_NOTE = "daily loss trip expired at the new UTC day"
+
+
+def _daily_loss_trip_has_expired(state: dict[str, object], *, day_start: str) -> bool:
+    """True only for a soft daily-loss trip taken on an earlier UTC day.
+
+    Deliberately narrow: a drawdown soft trip is not about a single day, a
+    hard halt is never clearable here, and a daily trip from today still has
+    the rest of today to run.
+    """
+
+    return (
+        state["severity"] == "soft"
+        and str(state["tripped_reason"] or "").startswith(_DAILY_LOSS_REASON_PREFIX)
+        and str(state["tripped_at"] or "") < day_start
+    )
+
+
+def _auto_rearm(connection: sqlite3.Connection, *, predictor: str, instrument: str, now_iso: str) -> None:
+    connection.execute(
+        "UPDATE risk_kill_switch SET tripped = 0, rearmed_at = ?, rearm_note = ? "
+        "WHERE predictor = ? AND instrument = ?",
+        (now_iso, _AUTO_REARM_NOTE, predictor, instrument),
+    )
+    connection.commit()
+    _record_event(
+        connection, predictor=predictor, instrument=instrument,
+        event="auto_rearmed", reason=_AUTO_REARM_NOTE, now_iso=now_iso,
+    )
+
+
 def check_and_enforce(
     connection: sqlite3.Connection,
     *,
@@ -207,13 +243,21 @@ def check_and_enforce(
 
     initialize_risk(connection)
 
+    day_start = _day_start_iso(now_iso)
+
     existing = fetch_kill_switch_state(connection, predictor=predictor, instrument=instrument)
     if existing is not None and existing["tripped"]:
-        return RiskDecision(
-            allowed=False,
-            reason=f"kill switch already tripped ({existing['severity']}): {existing['tripped_reason']}",
-            severity=existing["severity"],
-        )
+        if _daily_loss_trip_has_expired(existing, day_start=day_start):
+            # A daily limit stops trading for the rest of THAT day, not
+            # forever. Clear it and fall through to the normal checks in this
+            # same call, so a book still over a limit simply trips again now.
+            _auto_rearm(connection, predictor=predictor, instrument=instrument, now_iso=now_iso)
+        else:
+            return RiskDecision(
+                allowed=False,
+                reason=f"kill switch already tripped ({existing['severity']}): {existing['tripped_reason']}",
+                severity=existing["severity"],
+            )
 
     curve = connection.execute(
         "SELECT equity, recorded_at FROM paper_equity_curve WHERE predictor = ? AND instrument = ? "
@@ -239,7 +283,6 @@ def check_and_enforce(
         )
     historical_peak = max((float(row["equity"]) for row in curve), default=latest_equity)
     peak_equity = max(historical_peak, latest_equity)
-    day_start = _day_start_iso(now_iso)
     todays_points = [row for row in curve if row["recorded_at"] >= day_start]
     day_open_equity = float(todays_points[0]["equity"]) if todays_points else latest_equity
 
@@ -267,7 +310,7 @@ def check_and_enforce(
         return RiskDecision(allowed=False, reason=reason, tripped_now=True, severity="soft", **common)
 
     if daily_loss_pct >= limits.max_daily_loss_pct:
-        reason = f"daily loss {daily_loss_pct:.2f}% >= limit {limits.max_daily_loss_pct:.2f}%"
+        reason = f"{_DAILY_LOSS_REASON_PREFIX}{daily_loss_pct:.2f}% >= limit {limits.max_daily_loss_pct:.2f}%"
         _trip(connection, predictor=predictor, instrument=instrument, severity="soft", reason=reason, now_iso=now_iso)
         return RiskDecision(allowed=False, reason=reason, tripped_now=True, severity="soft", **common)
 
