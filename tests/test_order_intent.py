@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from andy_trader.order_intent import (
+    DEFAULT_INTENT_LEVERAGE,
     OrderIntentError,
     fetch_unexpired_intents,
     initialize_order_intents,
@@ -55,7 +56,7 @@ def test_rejects_invalid_fields(overrides):
 
 def test_record_intent_round_trips_every_field():
     db = connection()
-    intent = build(leverage=1.0, gate_eligible=True, gate_reason="cleared the gate")
+    intent = build(leverage=10.0, gate_eligible=True, gate_reason="cleared the gate")
     intent_id = record_intent(db, intent)
     row = db.execute("SELECT * FROM order_intents WHERE id = ?", (intent_id,)).fetchone()
     assert row["instrument"] == "BTC-USD"
@@ -64,10 +65,42 @@ def test_record_intent_round_trips_every_field():
     assert row["size"] == 100.0
     assert row["stop"] == 95.0
     assert row["target"] == 110.0
-    assert row["leverage"] == 1.0
+    assert row["leverage"] == 10.0
     assert row["source_decision_id"] == 1
     assert row["gate_eligible"] == 1
     assert row["gate_reason"] == "cleared the gate"
+
+
+def test_default_intent_leverage_cannot_drift_from_either_execution_path():
+    """One leverage, three places. An intent built without an explicit leverage
+    must ask for exactly what the sender sends with and what the dry-run
+    executor requires, or a default-built intent gets refused downstream."""
+    from andy_trader import bybit_sender, dry_run_executor
+
+    assert DEFAULT_INTENT_LEVERAGE == bybit_sender.LEVERAGE
+    assert DEFAULT_INTENT_LEVERAGE == dry_run_executor.REQUIRED_LEVERAGE
+
+
+def test_leverage_defaults_to_the_constant_in_the_dataclass_builder_and_schema():
+    db = connection()
+    intent = build()
+    assert intent.leverage == DEFAULT_INTENT_LEVERAGE
+
+    row = db.execute(
+        "SELECT * FROM order_intents WHERE id = ?", (record_intent(db, intent),)
+    ).fetchone()
+    assert row["leverage"] == DEFAULT_INTENT_LEVERAGE
+
+    # The column default stands on its own, for any writer that omits it.
+    db.execute(
+        "INSERT INTO order_intents (instrument, predictor, side, size, stop, target, "
+        "source_decision_id, created_at, expires_at, gate_eligible, gate_reason) "
+        "VALUES ('BTC-USD', 'p', 'long', 1.0, 95.0, 110.0, 1, ?, ?, 0, '')",
+        (NOW, "2026-10-17T12:05:00+00:00"),
+    )
+    assert db.execute(
+        "SELECT leverage FROM order_intents ORDER BY id DESC LIMIT 1"
+    ).fetchone()["leverage"] == DEFAULT_INTENT_LEVERAGE
 
 
 def test_fetch_unexpired_intents_excludes_expired_and_orders_by_id():
