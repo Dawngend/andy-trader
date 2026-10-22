@@ -11,6 +11,7 @@ import random
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import sqlite3
 import statistics
@@ -174,10 +175,13 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
     return response
 
 
+CLI_TIMEOUT_SECONDS = 40
+
+
 def ask_cli(context: str, provider: str) -> dict:
     commands = {
         # agy's -p takes the next word as the prompt, so the prompt must follow -p directly.
-        "agy": ["--model", "gemini-3.8-flash-high", "-p"],
+        "agy": ["--model", "gemini-3.8-flash-high", "--sandbox", "--mode", "plan", "-p"],
         "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
         "claude": ["-p", "--model", "haiku"],
     }
@@ -187,8 +191,9 @@ def ask_cli(context: str, provider: str) -> dict:
     if not executable:
         raise FileNotFoundError(f"{provider} CLI not found")
     prompt = json.dumps(_messages(context), ensure_ascii=False)
-    result = subprocess.run([executable, *commands[provider], prompt], capture_output=True,
-                            text=True, timeout=90, check=True)
+    with tempfile.TemporaryDirectory() as cwd:
+        result = subprocess.run([executable, *commands[provider], prompt], capture_output=True,
+                                text=True, timeout=CLI_TIMEOUT_SECONDS, check=True, cwd=cwd)
     return {"choices": [{"message": {"content": result.stdout.strip()}}]}
 
 
@@ -318,7 +323,7 @@ class LlmPredictor:
                     provider = candidate
                     break
                 except Exception as exc:
-                    errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+                    errors.append(f"{candidate}: {type(exc).__name__}")
             if response is None:
                 status = "error"
                 error = "; ".join(errors)

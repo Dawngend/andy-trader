@@ -11,7 +11,7 @@ import pytest
 
 from andy_trader.ablation import run_ablation
 from andy_trader.baselines import PredictionContext, default_baselines
-from andy_trader.llm_agent import LlmPredictor, _ordered_prices, _parse, ask_model, build_predictors, render_context
+from andy_trader.llm_agent import CLI_TIMEOUT_SECONDS, LlmPredictor, _ordered_prices, _parse, ask_model, build_predictors, render_context
 from andy_trader.llm_ledger import fetch_decisions, initialize_ledger, latest_decision, record_decision
 from andy_trader.portfolio import execute_paper_trade
 from andy_trader.store import Candle, connect, record_observations
@@ -439,9 +439,10 @@ def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
         assert {row["model"] for row in rows} == {"fallback/agy"}
         assert {row["request_count"] for row in rows} == {2}
     args, kwargs = seen[0]
-    assert args[:4] == ["/agy", "--model", "gemini-3.8-flash-high", "-p"]
-    assert len(args) == 5 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
-    assert kwargs["timeout"] == 90
+    assert args[:7] == ["/agy", "--model", "gemini-3.8-flash-high", "--sandbox", "--mode", "plan", "-p"]
+    assert len(args) == 8 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
+    assert kwargs["timeout"] == CLI_TIMEOUT_SECONDS
+    assert kwargs["cwd"] is not None and Path(kwargs["cwd"]) != Path.cwd()
 
 
 def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
@@ -480,6 +481,22 @@ def test_all_providers_fail_one_error_row(monkeypatch, tmp_path):
         assert rows[0]["status"] == "error" and rows[0]["p_up"] is None
         assert rows[0]["request_count"] == 4
         assert all(name in rows[0]["reason"] for name in ("gateway", "agy", "codex", "claude"))
+
+
+def test_error_row_omits_prompt_and_cli_flags(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.delenv("LLM_FALLBACKS")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        raise subprocess.CalledProcessError(1, args)
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
+        rows = fetch_decisions(connection, 10)
+        reason = rows[0]["reason"]
+        assert "## SECTION: prices" not in reason
+        assert "-p" not in reason
 
 
 @pytest.mark.parametrize("provider", ["codex", "claude"])
