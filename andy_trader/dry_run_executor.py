@@ -1,8 +1,8 @@
 """Dry-run executor with an explicit --live sender seam.
 
 For every unexpired, not-yet-decided intent, re-checks against the world as
-it stands right now -- a fresh price, a fresh skill-gate read, a 1x leverage
-cap, a max size per coin, and a trade-rate limit -- and writes a
+it stands right now -- a fresh price, a fresh skill-gate read, the one
+leverage the sender uses, a max size per coin, and a trade-rate limit -- and writes a
 `would_send` or `rejected` row with the reason. The legacy send_order stub
 is never called. Live sending requires --live and the sender's process env gate.
 """
@@ -17,7 +17,11 @@ import sqlite3
 from andy_trader.order_intent import fetch_unexpired_intents, utc_now_iso
 from andy_trader.paper_gate import evaluate_paper_eligibility
 
-MAX_LEVERAGE = 1.0
+# One leverage rule for both paths: an intent must ask for exactly the leverage
+# bybit_sender.LEVERAGE sends with, so a would_send here cannot be refused there
+# (and vice versa) over leverage. Kept as a literal to avoid importing the
+# sender module into the dry-run path; a test asserts the two stay equal.
+REQUIRED_LEVERAGE = 10.0
 DEFAULT_MAX_SIZE_PER_COIN = 500.0
 DEFAULT_MAX_TRADES_PER_HOUR = 4
 
@@ -110,10 +114,11 @@ def evaluate_intent(
     if price is None:
         return Decision(intent["id"], "rejected", "no live price available", None)
 
-    if float(intent["leverage"]) > MAX_LEVERAGE:
+    if float(intent["leverage"]) != REQUIRED_LEVERAGE:
         return Decision(
             intent["id"], "rejected",
-            f"leverage {intent['leverage']:.2f}x exceeds the {MAX_LEVERAGE:.2f}x cap", price,
+            f"leverage {intent['leverage']:.2f}x is not the required "
+            f"{REQUIRED_LEVERAGE:.2f}x", price,
         )
 
     if float(intent["size"]) > max_size_per_coin:

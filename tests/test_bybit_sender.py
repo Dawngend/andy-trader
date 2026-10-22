@@ -46,7 +46,8 @@ def armed(monkeypatch):
 
 def intent(db, **changes):
     defaults = dict(instrument='SOL-USD', predictor='p', side='long', size=500,
-                    stop=98, target=104, source_decision_id=1, now_iso=NOW.isoformat(), expiry_seconds=300)
+                    stop=98, target=104, source_decision_id=1, now_iso=NOW.isoformat(),
+                    expiry_seconds=300, leverage=sender.LEVERAGE)
     defaults.update(changes)
     ident = record_intent(db, new_intent(**defaults))
     db.execute('''INSERT OR IGNORE INTO crypto_observations
@@ -203,7 +204,7 @@ def test_network_and_happy_order(db, armed, monkeypatch, network, host):
     assert order['positionIdx'] == 0 and float(order['stopLoss']) == 98
     saved = db.execute('SELECT * FROM live_orders').fetchone()
     assert saved['notional'] == saved['margin'] * 10 == 160
-    assert row['leverage'] == 1
+    assert row['leverage'] == sender.LEVERAGE  # the one leverage both paths agree on
 
 
 def test_env_file_ignores_sender_keys(tmp_path):
@@ -596,3 +597,72 @@ def test_rounded_target_cannot_disable_protection(db, armed):
     api = Exchange(db)
     assert send(db, row, api)['status'] == 'refused'
     assert count(db) == 0 and not api.entries()
+
+
+class NoWrites(Exchange):
+    """Read-only preflight is allowed; nothing may be *sent* once refused.
+
+    Every mutating Bybit call in the sender is a POST -- set-leverage and
+    order/create -- so a POST arriving here is the bug this guards.
+    """
+
+    def __call__(self, method, url, headers, body):
+        if method != 'GET':
+            pytest.fail(f'refused intent still sent {method} {urlsplit(url).path}')
+        return super().__call__(method, url, headers, body)
+
+
+@pytest.mark.parametrize('block,reason', [('kill_switch', 'kill switch'), ('hourly', 'rolling hour'),
+                                          ('daily', 'daily'), ('expired', 'expired')])
+def test_early_gate_refuses_before_the_leverage_change(db, armed, block, reason):
+    """set-leverage changes exchange state, so the database gate runs first."""
+    row = intent(db)
+    if block == 'kill_switch':
+        risk.initialize_risk(db)
+        db.execute("INSERT INTO risk_kill_switch(predictor,instrument,tripped,severity) "
+                   "VALUES ('p','SOL-USD',1,'soft')")
+        db.commit()
+    elif block == 'hourly':
+        for i in range(sender.MAX_ORDERS_PER_HOUR):
+            seed(db, 100 + i)
+    elif block == 'daily':
+        seed(db, 100, age=90, qty=2.5, stop=98)  # 5 + 3.2 > 8
+    else:
+        row = dict(row, expires_at=NOW.isoformat())
+    api = NoWrites(db)
+    result = send(db, row, api)
+    assert result['status'] == 'refused' and reason in result['reason']
+    assert not [u for _, u, _ in api.calls if u.endswith('/set-leverage')]
+    assert not api.entries()
+
+
+def test_gate_runs_before_set_leverage_and_again_in_the_transaction(db, armed, monkeypatch):
+    """The early gate is an addition, not a replacement: both still run, and
+    the first one lands before the leverage change reaches the exchange."""
+    row = intent(db)
+    original = sender.database_gate
+    api = Exchange(db)
+    gate_order = []
+    def gate(*args):
+        gate_order.append((len(api.calls), db.in_transaction))
+        original(*args)
+    monkeypatch.setattr(sender, 'database_gate', gate)
+    assert send(db, row, api)['status'] == 'filled'
+    leverage_at = [i for i, (_, u, _) in enumerate(api.calls) if u.endswith('/set-leverage')]
+    assert len(leverage_at) == 1
+    assert [in_tx for _, in_tx in gate_order] == [False, True]
+    assert gate_order[0][0] <= leverage_at[0]  # gated before the leverage POST
+
+
+@pytest.mark.parametrize('leverage', [1, 2, 9.5, 11, 20])
+def test_refuses_any_intent_leverage_but_the_constant(db, armed, leverage):
+    row = dict(intent(db), leverage=leverage)
+    api = NoWrites(db)
+    result = send(db, row, api)
+    assert result['status'] == 'refused' and 'leverage' in result['reason']
+    assert count(db) == 0 and not api.calls  # refused before any request at all
+
+
+def test_accepts_exactly_the_constant_leverage(db, armed):
+    assert send(db, intent(db, leverage=sender.LEVERAGE), Exchange(db))['status'] == 'filled'
+    assert sender.LEVERAGE == executor.REQUIRED_LEVERAGE

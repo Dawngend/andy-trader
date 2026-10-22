@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import math
 import sqlite3
 from typing import Literal
 
@@ -224,6 +225,12 @@ def check_and_enforce(
         return RiskDecision(allowed=True, reason="no equity history yet; nothing to enforce against")
 
     latest_equity = current_equity if current_equity is not None else float(curve[-1]["equity"])
+    if not math.isfinite(latest_equity):
+        # NaN/inf compares false against every limit below, so an unguarded
+        # non-finite equity would sail through the whole gate as allowed.
+        reason = f"equity is not a finite number ({latest_equity!r}); cannot be judged against any limit"
+        _trip(connection, predictor=predictor, instrument=instrument, severity="hard", reason=reason, now_iso=now_iso)
+        return RiskDecision(allowed=False, reason=reason, tripped_now=True, severity="hard")
     historical_peak = max((float(row["equity"]) for row in curve), default=latest_equity)
     peak_equity = max(historical_peak, latest_equity)
     day_start = _day_start_iso(now_iso)

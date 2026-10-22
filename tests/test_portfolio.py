@@ -553,34 +553,30 @@ def test_liquidation_price_is_entry_moved_by_ninety_percent_of_the_margin() -> N
     assert liquidation_price(100.0, "short", 2.0) == pytest.approx(145.0)
 
 
-def test_a_bar_through_the_liquidation_price_closes_there_and_says_so(
+def test_a_stop_at_or_past_the_liquidation_distance_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """At the default 2% stop a 10x book is always stopped out before its 9%
-    liquidation level, so this widens the stop past it -- otherwise the branch
-    could never be reached and the formula would be untested decoration."""
-    connection = _conn()
-    initialize_database(connection)
+    """A 15% stop on a 10x book sits below that book's 9% liquidation level, so
+    it could never fill -- the venue force-closes first. Storing it would be
+    recording a protection that does not exist, so the bracket refuses it. The
+    same 15% is fine at 2x, where liquidation is 45% away.
+
+    (A bar moving *through* the liquidation level therefore cannot happen; the
+    gap-open case below is what still exercises the liquidation fill.)"""
     monkeypatch.setenv("CRYPTO_STOP_PCT", "15")
     opened = "2026-09-05T00:00:00+00:00"
-    later = "2026-09-05T00:01:00+00:00"
-    execute_paper_trade(
-        connection, predictor="p", instrument="BTC-USD", target_side="long",
-        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+
+    with pytest.raises(PortfolioError, match="CRYPTO_STOP_PCT"):
+        execute_paper_trade(
+            _conn(), predictor="p", instrument="BTC-USD", target_side="long",
+            price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
+        )
+
+    allowed = execute_paper_trade(
+        _conn(), predictor="p", instrument="BTC-USD", target_side="long",
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=2.0,
     )
-    state = get_or_create_state(connection, predictor="p", instrument="BTC-USD", now_iso=later)
-    assert state.stop_price == pytest.approx(85.0)  # deliberately below the 91.0 liquidation
-    _bar(connection, at=later, high=100.0, low=90.0)
-
-    result = run_paper_cycle(connection, predictor="p", instrument="BTC-USD",
-                             probability_up=0.9, price=90.0, now_iso=later,
-                             starting_cash=1_000.0, leverage=10.0)
-
-    assert result.trade is not None
-    assert result.trade.price == pytest.approx(91.0)
-    assert result.trade.reason == "liquidated"
-    assert result.equity > 0.0  # liquidated with the last tenth of the margin left
-    assert result.equity < 1_000.0 * 0.15
+    assert allowed is not None
 
 
 @pytest.mark.parametrize("side,bar_open,high,low,liquidation", [
@@ -646,14 +642,14 @@ def test_configured_leverage_does_not_change_under_an_open_position() -> None:
 
 def test_leveraged_equity_never_goes_below_zero() -> None:
     """A leveraged book may lose its whole stake; it may never report owing
-    money. 100x here because at that size the costs alone exceed what the
-    liquidation leaves behind."""
+    money. A 20% adverse move at the 10x cap is twice the stake, so the raw
+    arithmetic goes negative and the floor is what is being tested."""
     connection = _conn()
     opened = "2026-09-05T00:00:00+00:00"
     later = "2026-09-05T00:01:00+00:00"
     execute_paper_trade(
         connection, predictor="p", instrument="BTC-USD", target_side="long",
-        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=100.0,
+        price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0, leverage=10.0,
     )
     assert mark_to_market(
         connection, predictor="p", instrument="BTC-USD", price=80.0, now_iso=later,
@@ -952,3 +948,50 @@ def test_paper_trade_once_reuses_the_same_staleness_rule_the_cli_uses(tmp_path: 
 
     assert attempt.trade is None
     assert "refusing to trade a stale decision" in attempt.skipped_reason
+
+
+@pytest.mark.parametrize("leverage", [10.5, 11.0, 100.0, 1_000.0])
+def test_leverage_above_the_cap_is_rejected(leverage: float) -> None:
+    """10x is the most the sender will ever ask an exchange for, so a book may
+    not be configured past it either."""
+    with pytest.raises(PortfolioError, match="at most 10"):
+        get_or_create_state(
+            _conn(), predictor="p", instrument="BTC-USD",
+            now_iso="2026-09-05T00:00:00+00:00", leverage=leverage,
+        )
+
+
+@pytest.mark.parametrize("leverage", [1.0, 2.0, 10.0])
+def test_leverage_up_to_the_cap_is_still_accepted(leverage: float) -> None:
+    state = get_or_create_state(
+        _conn(), predictor="p", instrument="BTC-USD",
+        now_iso="2026-09-05T00:00:00+00:00", leverage=leverage,
+    )
+    assert state.leverage == pytest.approx(leverage)
+
+
+@pytest.mark.parametrize("leverage,stop_pct,allowed", [
+    (1.0, 89.9, True), (1.0, 90.0, False),
+    (10.0, 8.9, True), (10.0, 9.0, False), (10.0, 9.1, False),
+])
+def test_stop_percent_must_stay_inside_the_liquidation_distance(
+    monkeypatch: pytest.MonkeyPatch, leverage: float, stop_pct: float, allowed: bool,
+) -> None:
+    """The limit is 90 / leverage: the same 90% of posted margin the
+    liquidation price is derived from."""
+    monkeypatch.setenv("CRYPTO_STOP_PCT", str(stop_pct))
+    monkeypatch.setenv("CRYPTO_TARGET_PCT", "4")
+    opened = "2026-09-05T00:00:00+00:00"
+
+    def open_it():
+        return execute_paper_trade(
+            _conn(), predictor="p", instrument="BTC-USD", target_side="long",
+            price=100.0, now_iso=opened, reason="open", starting_cash=1_000.0,
+            leverage=leverage,
+        )
+
+    if allowed:
+        assert open_it() is not None
+    else:
+        with pytest.raises(PortfolioError, match="CRYPTO_STOP_PCT"):
+            open_it()

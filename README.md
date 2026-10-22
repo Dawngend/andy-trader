@@ -687,7 +687,8 @@ side, size, stop, target, the source decision id, a creation time, a short expir
 skill gate's verdict at that moment. It is stored in `order_intents` and never mutated.
 
 `andy_trader/dry_run_executor.py` reads unexpired intents and re-checks each one against the
-world as it stands *now* -- a fresh price, a fresh skill-gate read, the 1x leverage cap, a max
+world as it stands *now* -- a fresh price, a fresh skill-gate read, the single leverage the
+sender uses (`REQUIRED_LEVERAGE`, equal to `bybit_sender.LEVERAGE`; anything else is rejected), a max
 size per coin, and a max-trades-per-hour limit -- then writes a `would_send` or `rejected` row
 to `order_decisions` with the reason. By default it sends nothing. The legacy `send_order`
 stub still raises `SendNotImplemented` and is never called. `ALLOW_LIVE_SEND` stays False
@@ -724,7 +725,8 @@ Testnet (`https://api-testnet.bybit.com`) is the default. Only the exact process
 
 The sender supports USDT linear perpetuals in one-way mode, with **10x leverage and isolated
 margin**. Dawn must switch the account to isolated margin herself; the sender never changes
-margin mode. The paper intent's leverage remains 1. Its absolute paper size scales margin as
+margin mode. An intent must ask for exactly that 10x or the sender refuses it, which is the
+same rule the dry-run executor applies. Its absolute paper size scales margin as
 `16 * clamp(size / 500, 0.1, 1.0)` USDT, with a **16 USDT margin cap** (about PHP 1,000).
 Notional is margin times 10 before quantity rounding. Quantity, stop and target round down
 to the exchange steps. Minimum-quantity or minimum-notional failures are refused, never
@@ -737,6 +739,9 @@ The sender's own limits apply in addition to the unchanged dry-run checks:
   `qty * abs(entry_price - rounded_stop)`. Every saved attempt counts regardless of status,
   including rejected, cancelled and manually cleared orders. This is a risk reservation,
   not a realized-P&L calculation or a guarantee against slippage.
+- Those database limits (kill switch, four per hour, daily cap, intent expiry) are checked
+  *before* the exchange leverage change is signed, and again inside the write transaction, so
+  a refused intent never alters the account's leverage.
 - Any tripped kill switch for the intent's predictor/instrument blocks entry. Stored prices
   older than 90 minutes, ticker divergence above 3%, and stops wider than 5% are refused.
   At 10x, a stop wider than that can approach liquidation before it can protect the trade.

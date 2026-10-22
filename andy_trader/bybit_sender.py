@@ -290,6 +290,10 @@ def _send_locked(connection, intent_row, *, http, sleep, clock):
             raise Refused('unsupported instrument or side; flat cannot be sent')
         if parsed_time(intent['expires_at']) <= clock():
             raise Refused('intent expired')
+        # One leverage rule for both paths: an intent must ask for exactly the
+        # leverage this sender uses. dry_run_executor accepts the same value.
+        if number(intent['leverage']) != LEVERAGE:
+            raise Refused(f'intent leverage must be exactly {LEVERAGE}x')
         size, stop, target = positive(intent['size']), positive(intent['stop']), positive(intent['target'])
         initialize_live_orders(connection)
         # https://bybit-exchange.github.io/docs/v5/account/account-info
@@ -336,10 +340,12 @@ def _send_locked(connection, intent_row, *, http, sleep, clock):
         positions = call('GET', '/v5/position/list', query)['result']['list']
         if any(number(p['size']) != 0 for p in positions):
             raise Refused('existing position on symbol')
+        # Gate before set-leverage: that call changes exchange state, so a
+        # tripped, rate-limited or expired intent must never reach it.
+        database_gate(connection, intent, qty, price, stop, clock())
         # https://bybit-exchange.github.io/docs/v5/position/leverage
         call('POST', '/v5/position/set-leverage', {**query, 'buyLeverage': str(LEVERAGE),
              'sellLeverage': str(LEVERAGE)}, allowed=(LEVERAGE_NOT_MODIFIED,))
-        database_gate(connection, intent, qty, price, stop, clock())
         link = f'andy-{intent_id}'
         side = 'Buy' if intent['side'] == 'long' else 'Sell'
         # https://bybit-exchange.github.io/docs/v5/order/create-order

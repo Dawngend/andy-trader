@@ -37,6 +37,7 @@ def add_intent(db, **overrides):
     defaults = dict(
         instrument="BTC-USD", predictor="p", side="long", size=100.0,
         stop=95.0, target=110.0, source_decision_id=1, now_iso=NOW, expiry_seconds=300,
+        leverage=executor.REQUIRED_LEVERAGE,
     )
     defaults.update(overrides)
     return record_intent(db, new_intent(**defaults))
@@ -89,15 +90,23 @@ def test_rejects_when_gate_blocks_the_pair(monkeypatch):
     assert "skill gate" in row["reason"]
 
 
-def test_rejects_leverage_above_1x(monkeypatch):
+@pytest.mark.parametrize("leverage", [1.0, 2.0, 9.0, 11.0])
+def test_rejects_any_leverage_but_the_senders_own(monkeypatch, leverage):
+    """One rule, both paths: only bybit_sender.LEVERAGE is accepted here."""
     db = connection()
     monkeypatch.setattr(executor, "evaluate_paper_eligibility", lambda *a, **k: eligible_verdict("p", "BTC-USD"))
     add_price(db, "BTC-USD", 100.0)
-    add_intent(db, leverage=2.0)
+    add_intent(db, leverage=leverage)
     report = executor.run_dry_run(db, now_iso=NOW)
     assert report["rejected"] == 1
     row = db.execute("SELECT * FROM order_decisions").fetchone()
     assert "leverage" in row["reason"]
+
+
+def test_required_leverage_is_the_senders_leverage():
+    from andy_trader import bybit_sender
+
+    assert executor.REQUIRED_LEVERAGE == bybit_sender.LEVERAGE
 
 
 def test_rejects_size_above_max_per_coin(monkeypatch):

@@ -389,3 +389,45 @@ def test_blocked_entry_is_distinguishable_from_an_ordinary_no_trade_decision() -
     assert result.risk_allowed is False
     assert "earlier daily loss" in result.risk_reason
     assert result.forced_exit is False  # blocked from entering is not the same as forced out
+
+
+@pytest.mark.parametrize("equity", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_equity_hard_trips_instead_of_being_allowed(equity: float) -> None:
+    """Every limit below compares false against NaN, so an unguarded non-finite
+    equity used to come back allowed=True -- the one answer it must never be."""
+    connection = _conn()
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T00:00:00+00:00", current_equity=equity,
+    )
+
+    assert decision.allowed is False
+    assert decision.tripped_now is True
+    assert decision.severity == "hard"
+    assert "finite" in decision.reason
+
+    state = fetch_kill_switch_state(connection, predictor="p", instrument="BTC-USD")
+    assert state["tripped"] == 1
+    assert state["severity"] == "hard"
+
+
+def test_non_finite_recorded_equity_also_hard_trips() -> None:
+    """Same hole reached through the stored curve rather than the live mark.
+    (Infinity, not NaN: SQLite stores a NaN REAL as NULL.)"""
+    connection = _conn()
+    connection.execute(
+        "INSERT INTO paper_equity_curve (predictor, instrument, cash, position_qty, mark_price, "
+        "position_value, equity, recorded_at) "
+        "VALUES ('p', 'BTC-USD', 0.0, 0.0, 100.0, 0.0, ?, '2026-09-05T01:00:00+00:00')",
+        (float("inf"),),
+    )
+    connection.commit()
+
+    decision = check_and_enforce(
+        connection, predictor="p", instrument="BTC-USD", starting_cash=10_000.0,
+        now_iso="2026-09-05T02:00:00+00:00",
+    )
+
+    assert decision.allowed is False
+    assert decision.severity == "hard"

@@ -105,8 +105,17 @@ def _bracket_percent(name: str, default: float) -> float:
     return value
 
 
-def _bracket_prices(entry: float, side: Side) -> tuple[float, float]:
-    stop = _bracket_percent("CRYPTO_STOP_PCT", DEFAULT_STOP_PCT) / 100
+def _bracket_prices(entry: float, side: Side, leverage: float) -> tuple[float, float]:
+    stop_pct = _bracket_percent("CRYPTO_STOP_PCT", DEFAULT_STOP_PCT)
+    # A stop at or past the liquidation distance could never fill: the venue
+    # force-closes the position first, so such a bracket is not a stop at all.
+    liquidation_pct = LIQUIDATION_MARGIN_FRACTION * 100 / _validate_leverage(leverage)
+    if stop_pct >= liquidation_pct:
+        raise PortfolioError(
+            f"CRYPTO_STOP_PCT must be below {liquidation_pct:g} at {leverage:g}x "
+            f"leverage, got {stop_pct!r}"
+        )
+    stop = stop_pct / 100
     target = _bracket_percent("CRYPTO_TARGET_PCT", DEFAULT_TARGET_PCT) / 100
     if side == "long":
         return entry * (1 - stop), entry * (1 + target)
@@ -121,9 +130,14 @@ DEFAULT_LEVERAGE = 1.0
 LIQUIDATION_MARGIN_FRACTION = 0.9
 
 
+MAX_LEVERAGE = 10.0
+
+
 def _validate_leverage(leverage: float) -> float:
     if not math.isfinite(leverage) or leverage < 1:
         raise PortfolioError(f"leverage must be at least 1, got {leverage!r}")
+    if leverage > MAX_LEVERAGE:
+        raise PortfolioError(f"leverage must be at most {MAX_LEVERAGE:g}, got {leverage!r}")
     return float(leverage)
 
 
@@ -501,7 +515,7 @@ def execute_paper_trade(
         qty = deployable / price
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
-        stop_price, target_price = _bracket_prices(price, "long")
+        stop_price, target_price = _bracket_prices(price, "long", book_leverage)
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -543,7 +557,7 @@ def execute_paper_trade(
         fee_cost = notional * (fee_bps / 10_000.0)
         slippage_cost = notional * (slippage_bps / 10_000.0)
         new_cash = state.cash + proceeds
-        stop_price, target_price = _bracket_prices(price, "short")
+        stop_price, target_price = _bracket_prices(price, "short", book_leverage)
         new_state = PortfolioState(
             predictor=predictor,
             instrument=instrument,
@@ -707,7 +721,7 @@ def check_bracket(
         return None
     if state.stop_price is None or state.target_price is None or state.entry_at is None:
         side: Side = "long" if state.position_qty > 0 else "short"
-        stop_price, target_price = _bracket_prices(state.avg_entry_price, side)
+        stop_price, target_price = _bracket_prices(state.avg_entry_price, side, state.leverage)
         state = replace(
             state, stop_price=stop_price, target_price=target_price,
             entry_at=state.updated_at,
