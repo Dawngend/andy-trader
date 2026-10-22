@@ -214,7 +214,9 @@ def ask_cli(context: str, provider: str) -> dict:
     if not executable:
         raise FileNotFoundError(f"{provider} CLI not found")
     prompt = json.dumps(_messages(context), ensure_ascii=False)
-    with tempfile.TemporaryDirectory() as cwd:
+    # On Windows the CLI (or a helper it starts) can still hold a file in the folder when it
+    # returns; a failed cleanup must not throw away an answer that already arrived.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as cwd:
         result = subprocess.run([executable, *commands[provider], prompt], capture_output=True,
                                 text=True, timeout=CLI_TIMEOUT_SECONDS, check=True, cwd=cwd)
     return {"choices": [{"message": {"content": _unwrap_json(result.stdout)}}]}
@@ -346,7 +348,11 @@ class LlmPredictor:
                     provider = candidate
                     break
                 except Exception as exc:
+                    # HTTP status for gateway errors; Windows error number for OS errors
+                    # (32 = file in use, 5 = access denied).
                     code = getattr(exc, "code", None)
+                    if code is None:
+                        code = getattr(exc, "winerror", None)
                     label = f"{type(exc).__name__} {code}" if code is not None else type(exc).__name__
                     errors.append(f"{candidate}: {label}")
             if response is None:
