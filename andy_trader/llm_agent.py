@@ -179,6 +179,11 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
 # Budget: 25 s gateway + two CLI fallbacks at 70 s = 165 s, still under the 180 s stale-lock rule.
 CLI_TIMEOUT_SECONDS = 70
 
+# A 429 means the gateway is rate-limiting us; hammering it again next batch just burns
+# requests, so skip it for a while and go straight to the fallbacks.
+GATEWAY_COOLDOWN_MINUTES = 60
+_gateway_retry_after: datetime | None = None
+
 
 def _unwrap_json(text: str) -> str:
     text = text.strip()
@@ -323,6 +328,7 @@ class LlmPredictor:
                 GROUP BY batch_id
             )
         """, (day,)).fetchone()[0]
+        global _gateway_retry_after
         response = None
         raw = None
         error = None
@@ -330,11 +336,15 @@ class LlmPredictor:
         provider = "gateway"
         request_count = 0
         fallbacks = [name.strip().lower() for name in os.environ.get("LLM_FALLBACKS", "agy,codex,claude").split(",") if name.strip()]
+        now_dt = datetime.fromisoformat(now_iso).astimezone(UTC)
+        candidates = ("gateway", *fallbacks)
+        if _gateway_retry_after is not None and now_dt < _gateway_retry_after:
+            candidates = tuple(fallbacks)
         if used >= daily_calls:
             status = "capped"
         else:
             errors = []
-            for candidate in ("gateway", *fallbacks):
+            for candidate in candidates:
                 if used + request_count >= daily_calls:
                     errors.append("daily call cap reached")
                     break
@@ -353,6 +363,8 @@ class LlmPredictor:
                     code = getattr(exc, "code", None)
                     if code is None:
                         code = getattr(exc, "winerror", None)
+                    if candidate == "gateway" and code == 429:
+                        _gateway_retry_after = now_dt + timedelta(minutes=GATEWAY_COOLDOWN_MINUTES)
                     label = f"{type(exc).__name__} {code}" if code is not None else type(exc).__name__
                     errors.append(f"{candidate}: {label}")
             if response is None:

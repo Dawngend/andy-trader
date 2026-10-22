@@ -516,6 +516,80 @@ def test_gateway_http_error_reports_status_code(monkeypatch, tmp_path):
         assert "https://example.invalid" not in rows[0]["reason"]
 
 
+def test_gateway_429_skips_gateway_for_sixty_minutes(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    monkeypatch.setenv("LLM_FALLBACKS", "agy")
+    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
+    gateway_calls = 0
+    def gateway(_):
+        nonlocal gateway_calls
+        gateway_calls += 1
+        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        assert gateway_calls == 1
+        assert {row["request_count"] for row in fetch_decisions(connection, 2)} == {2}
+
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=30))
+        assert gateway_calls == 1
+        assert {row["request_count"] for row in fetch_decisions(connection, 2)} == {1}
+
+
+def test_gateway_retried_after_sixty_minutes(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    monkeypatch.setenv("LLM_FALLBACKS", "agy")
+    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
+    gateway_calls = 0
+    def gateway(_):
+        nonlocal gateway_calls
+        gateway_calls += 1
+        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        assert gateway_calls == 1
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=30))
+        assert gateway_calls == 1
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=60))
+        assert gateway_calls == 2
+
+
+def test_non_429_gateway_error_does_not_skip_gateway(monkeypatch, tmp_path):
+    _configured(monkeypatch)
+    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
+    monkeypatch.setenv("LLM_FALLBACKS", "agy")
+    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
+    gateway_calls = 0
+    def gateway(_):
+        nonlocal gateway_calls
+        gateway_calls += 1
+        raise HTTPError("https://example.invalid", 500, "server error", {}, None)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
+            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
+    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
+    with _db(tmp_path) as connection:
+        _predict(LlmPredictor(INSTRUMENTS), connection)
+        assert gateway_calls == 1
+        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=1))
+        assert gateway_calls == 2
+
+
 def test_error_row_omits_prompt_and_cli_flags(monkeypatch, tmp_path):
     _configured(monkeypatch)
     monkeypatch.delenv("LLM_FALLBACKS")
