@@ -520,7 +520,6 @@ def test_gateway_429_skips_gateway_for_sixty_minutes(monkeypatch, tmp_path):
     _configured(monkeypatch)
     monkeypatch.setenv("LLM_MIN_MINUTES", "0")
     monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
     gateway_calls = 0
     def gateway(_):
         nonlocal gateway_calls
@@ -546,7 +545,6 @@ def test_gateway_retried_after_sixty_minutes(monkeypatch, tmp_path):
     _configured(monkeypatch)
     monkeypatch.setenv("LLM_MIN_MINUTES", "0")
     monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
     gateway_calls = 0
     def gateway(_):
         nonlocal gateway_calls
@@ -571,7 +569,6 @@ def test_non_429_gateway_error_does_not_skip_gateway(monkeypatch, tmp_path):
     _configured(monkeypatch)
     monkeypatch.setenv("LLM_MIN_MINUTES", "0")
     monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    monkeypatch.setattr("andy_trader.llm_agent._gateway_retry_after", None)
     gateway_calls = 0
     def gateway(_):
         nonlocal gateway_calls

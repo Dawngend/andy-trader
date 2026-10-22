@@ -180,9 +180,9 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
 CLI_TIMEOUT_SECONDS = 70
 
 # A 429 means the gateway is rate-limiting us; hammering it again next batch just burns
-# requests, so skip it for a while and go straight to the fallbacks.
+# requests, so skip it for a while and go straight to the fallbacks. Each probe run is a
+# new process, so the 429 is remembered in the ledger (gateway_status), not in memory.
 GATEWAY_COOLDOWN_MINUTES = 60
-_gateway_retry_after: datetime | None = None
 
 
 def _unwrap_json(text: str) -> str:
@@ -328,18 +328,19 @@ class LlmPredictor:
                 GROUP BY batch_id
             )
         """, (day,)).fetchone()[0]
-        global _gateway_retry_after
         response = None
         raw = None
         error = None
         status = "ok"
         provider = "gateway"
         request_count = 0
+        gateway_status = None
         fallbacks = [name.strip().lower() for name in os.environ.get("LLM_FALLBACKS", "agy,codex,claude").split(",") if name.strip()]
-        now_dt = datetime.fromisoformat(now_iso).astimezone(UTC)
-        candidates = ("gateway", *fallbacks)
-        if _gateway_retry_after is not None and now_dt < _gateway_retry_after:
-            candidates = tuple(fallbacks)
+        cooldown_since = (datetime.fromisoformat(now_iso) - timedelta(minutes=GATEWAY_COOLDOWN_MINUTES)).isoformat()
+        gateway_cooling = connection.execute("""
+            SELECT 1 FROM llm_decisions WHERE gateway_status = 429 AND created_at > ? AND created_at <= ? LIMIT 1
+        """, (cooldown_since, now_iso)).fetchone()
+        candidates = tuple(fallbacks) if gateway_cooling else ("gateway", *fallbacks)
         if used >= daily_calls:
             status = "capped"
         else:
@@ -364,7 +365,7 @@ class LlmPredictor:
                     if code is None:
                         code = getattr(exc, "winerror", None)
                     if candidate == "gateway" and code == 429:
-                        _gateway_retry_after = now_dt + timedelta(minutes=GATEWAY_COOLDOWN_MINUTES)
+                        gateway_status = 429
                     label = f"{type(exc).__name__} {code}" if code is not None else type(exc).__name__
                     errors.append(f"{candidate}: {label}")
             if response is None:
@@ -377,7 +378,8 @@ class LlmPredictor:
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=None,
                             model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
                             list_arm=list_arm, list_seed=list_seed, rendered_context=rendered,
-                            p_up=None, reason=error, status="error", request_count=request_count)
+                            p_up=None, reason=error, status="error", request_count=request_count,
+                            gateway_status=gateway_status)
             return {}
         retry_response = None
         retry_raw = None
@@ -410,7 +412,8 @@ class LlmPredictor:
                             raw_response=retry_raw if retried else raw,
                             p_up=probability, reason=error or reason, status=row_status,
                             prompt_tokens=row_usage.get("prompt_tokens"), completion_tokens=row_usage.get("completion_tokens"),
-                            cost=row_usage.get("cost"), request_count=request_count)
+                            cost=row_usage.get("cost"), request_count=request_count,
+                            gateway_status=gateway_status)
         return probabilities
 
 
