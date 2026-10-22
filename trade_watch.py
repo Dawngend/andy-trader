@@ -112,10 +112,17 @@ def check_ai(db, after_id):
                 "AND (status IS NULL OR status != 'ok') ORDER BY id", (after_id,))]
 
 
+# Routine interlock bookkeeping, not problems: the hourly trade-rate throttle and re-arms
+# (the daily-loss trip now re-arms itself each UTC day). Trips and refusals still alert.
+QUIET_RISK_EVENTS = ("throttled", "auto_rearmed", "rearmed")
+
+
 def check_risk(db, after_id):
+    quiet = ", ".join("?" for _ in QUIET_RISK_EVENTS)
     return [problem("risk_event", row["id"], f"Risk event {row['id']}: {row['event']}")
             for row in db.execute(
-                "SELECT id, event FROM risk_events WHERE id > ? ORDER BY id", (after_id,))]
+                f"SELECT id, event FROM risk_events WHERE id > ? AND event NOT IN ({quiet}) ORDER BY id",
+                (after_id, *QUIET_RISK_EVENTS))]
 
 
 def review(db, state, now):

@@ -105,6 +105,15 @@ def test_new_ai_and_risk_rows(watch):
     assert identities(run(watch)) == [["ai_status", 7], ["risk_event", 8]]
 
 
+def test_routine_risk_events_do_not_alert(watch):
+    db = watch[0]
+    db.execute("INSERT INTO risk_events VALUES (8, 'throttled')")
+    db.execute("INSERT INTO risk_events VALUES (9, 'auto_rearmed')")
+    db.execute("INSERT INTO risk_events VALUES (10, 'tripped:soft')")
+    db.commit()
+    assert identities(run(watch)) == [["risk_event", 10]]
+
+
 def test_trade_ids_are_distinct(watch):
     db = watch[0]
     add_trade(db, 123, fee=0)
