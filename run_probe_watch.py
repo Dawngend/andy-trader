@@ -24,6 +24,9 @@ from andy_trader.store import connect, default_database_path, record_observation
 
 INSTRUMENTS = tuple(f"{coin}-USD" for coin in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"))
 BOOKS = (("probe", 1, probe_trade_once), ("probe_x10", 10, probe_x10_trade_once))
+# The 10x book lost $1,180 in 29 round trips with no edge, so it opens nothing new (all its positions were flat
+# on 2026-10-23). It still runs the risk and mark steps. Empty this set to bring it back.
+PAUSED_BOOKS = {"probe_x10"}
 LOCK_PATH = REPO_ROOT / ".probe-watch.lock"
 JOURNAL_PATH = REPO_ROOT / ".probe-watch.jsonl"
 
@@ -140,6 +143,8 @@ def run_pass(connection, *, now=None):
         if model.batch_id is None:
             return
         for book, _, trade in BOOKS:
+            if book in PAUSED_BOOKS:
+                continue
             claimed = connection.execute("INSERT OR IGNORE INTO probe_batch_claims VALUES (?, ?, ?)",
                                          (book, model.batch_id, moment.isoformat())).rowcount
             connection.commit()

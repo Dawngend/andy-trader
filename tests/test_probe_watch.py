@@ -94,8 +94,8 @@ def test_stale_price_skips_exit_and_mark(setup, monkeypatch):
 
 def test_batch_once_each_book_and_risk_without_new_batch(setup, monkeypatch):
     watch.run_pass(setup, now=NOW)
-    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 2
-    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 4
+    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 1
+    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 2
     calls = []
     original = watch.check_and_enforce
     def risk(*args, **kwargs):
@@ -104,7 +104,7 @@ def test_batch_once_each_book_and_risk_without_new_batch(setup, monkeypatch):
     monkeypatch.setattr(watch, 'check_and_enforce', risk)
     watch.run_pass(setup, now=NOW + timedelta(minutes=1))
     assert calls == ['probe', 'probe', 'probe_x10', 'probe_x10']
-    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 4
+    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 2
 
 
 def test_locks(setup, monkeypatch):
@@ -201,7 +201,7 @@ def test_fetches_parallel_with_eight_second_timeout(setup, monkeypatch):
         return [bar(instrument)]
     monkeypatch.setattr(watch, 'fetch_binance', fetch)
     watch.run_pass(setup, now=NOW)
-    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 4
+    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 2
 
 
 def test_stop_on_later_pass_does_not_reopen_old_batch(setup, monkeypatch):
@@ -213,7 +213,7 @@ def test_stop_on_later_pass_does_not_reopen_old_batch(setup, monkeypatch):
     count = setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0]
     watch.run_pass(setup, now=NOW + timedelta(minutes=3))
     assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == count
-    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 2
+    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 1
 
 
 def test_existing_claim_blocks_repeated_batch(setup, monkeypatch):
@@ -226,4 +226,10 @@ def test_existing_claim_blocks_repeated_batch(setup, monkeypatch):
     monkeypatch.setattr(llm_agent.LlmPredictor, '_load_batch', same_batch)
     monkeypatch.setattr(watch, 'BOOKS', tuple((book, lev, lambda *a, **k: pytest.fail('claimed batch')) for book, lev, _ in watch.BOOKS))
     watch.run_pass(setup, now=NOW + timedelta(minutes=1))
-    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 2
+    assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 1
+
+
+def test_paused_x10_book_opens_nothing_new(setup):
+    watch.run_pass(setup, now=NOW)
+    assert 'probe_x10' in watch.PAUSED_BOOKS
+    assert setup.execute("SELECT count(*) FROM paper_trades WHERE predictor = 'probe_x10'").fetchone()[0] == 0

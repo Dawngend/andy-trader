@@ -57,14 +57,17 @@ PROBE_X10_BOOK = "probe_x10"
 PROBE_X10_LEVERAGE = 10.0
 REASON_TAG_X10 = "ungated x10"
 MIN_HOLD_ENV = "PROBE_MIN_HOLD_MINUTES"
+# 2026-10-23: of 140 closed 1x round trips, those held under 90 minutes lost $435 net and those held
+# longer made $102, so signal exits wait 90 minutes (was 15). A forward test, not a proven fix.
+DEFAULT_MIN_HOLD_MINUTES = 90.0
 
 
 def configured_min_hold_minutes() -> float:
     try:
-        minutes = float(os.environ.get(MIN_HOLD_ENV, "15"))
+        minutes = float(os.environ.get(MIN_HOLD_ENV, str(DEFAULT_MIN_HOLD_MINUTES)))
     except ValueError:
-        return 15.0
-    return minutes if math.isfinite(minutes) and minutes >= 0 else 15.0
+        return DEFAULT_MIN_HOLD_MINUTES
+    return minutes if math.isfinite(minutes) and minutes >= 0 else DEFAULT_MIN_HOLD_MINUTES
 
 
 def probe_trade_once(

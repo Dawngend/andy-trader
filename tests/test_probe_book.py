@@ -12,11 +12,25 @@ from andy_trader.probe_book import (
     PROBE_X10_LEVERAGE,
     SOURCE_PREDICTOR,
     STARTING_CASH_PHP,
+    configured_min_hold_minutes,
     probe_trade_once,
     probe_x10_trade_once,
 )
 from andy_trader.risk import check_and_enforce, rearm_kill_switch
 from andy_trader.store import Candle, Prediction, connect, record_observations, record_prediction
+
+
+@pytest.fixture(autouse=True)
+def _short_hold(monkeypatch) -> None:
+    """These tests were written around a 15 minute hold; the live default is longer."""
+    monkeypatch.setenv("PROBE_MIN_HOLD_MINUTES", "15")
+
+
+def test_default_hold_is_ninety_minutes(monkeypatch) -> None:
+    monkeypatch.delenv("PROBE_MIN_HOLD_MINUTES", raising=False)
+    assert configured_min_hold_minutes() == 90.0
+    monkeypatch.setenv("PROBE_MIN_HOLD_MINUTES", "bad")
+    assert configured_min_hold_minutes() == 90.0
 
 
 def _seed_cycle(
@@ -170,7 +184,7 @@ def test_probe_hold_setting(tmp_path: Path, monkeypatch, value, flip_minute, exp
         attempt = probe_trade_once(connection, instrument="BTC-USD", now=flip)
         assert (attempt.trade.side if attempt.trade else None) == expected
         if expected is None:
-            later = now + timedelta(minutes=16)
+            later = now + timedelta(minutes=configured_min_hold_minutes() + 1)
             _seed_cycle(connection, now=later, probability_up=0.1)
             assert probe_trade_once(connection, instrument="BTC-USD", now=later).trade.side == "flat"
 
