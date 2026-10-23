@@ -459,3 +459,174 @@ def test_send_phone_alert_posts_form_body(monkeypatch):
     body = captured["body"].decode("utf-8")
     assert "chat_id=chat456" in body
     assert "line+one" in body and "line+two" in body
+    assert "disable_notification" not in body
+
+
+def test_send_phone_alert_can_be_silent(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(trade_watch.urllib.request, "urlopen",
+                        lambda request, timeout=None: captured.update(body=request.data) or FakeResponse())
+    assert trade_watch.send_phone_alert("tok", "chat", ["quiet"], silent=True) is True
+    assert "disable_notification=true" in captured["body"].decode("utf-8")
+
+
+@pytest.fixture
+def notices(tmp_path):
+    """Real paper_trades columns, a baseline pass done, and a recording trade notifier."""
+    db_path = tmp_path / "trades.db"
+    db = sqlite3.connect(db_path)
+    db.executescript("""
+        CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, predictor TEXT, instrument TEXT, side TEXT,
+            qty REAL, price REAL, fee_cost REAL, slippage_cost REAL, cash_after REAL, executed_at TEXT, reason TEXT);
+        CREATE TABLE paper_portfolio_state (predictor TEXT, instrument TEXT, starting_cash REAL,
+            position_qty REAL, entry_at TEXT, stop_price REAL, target_price REAL, leverage REAL);
+        CREATE TABLE crypto_observations (instrument TEXT, interval TEXT, open_time TEXT,
+            close REAL, degraded INTEGER, first_seen_at TEXT);
+        CREATE TABLE llm_decisions (id INTEGER PRIMARY KEY, status TEXT);
+        CREATE TABLE risk_events (id INTEGER PRIMARY KEY, event TEXT);
+    """)
+    db.executemany("INSERT INTO paper_portfolio_state VALUES (?, ?, 1000, 0, NULL, NULL, NULL, 10)",
+                   [("probe_x10", coin) for coin in ("ADA-USD", "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
+                                                    "DOGE-USD", "LINK-USD")])
+    db.commit()
+    paths = {"db_path": db_path, "state_path": tmp_path / "state.json",
+             "log_path": tmp_path / "watch.jsonl", "alert_path": tmp_path / "alert.md"}
+    sent = []
+    trade_notifier = lambda text, silent: sent.append((text, silent))
+    trade_watch.run_pass(**paths, now=NOW, trade_notifier=trade_notifier)
+    yield db, paths, sent, trade_notifier
+    db.close()
+
+
+def add_row(db, trade_id, side, qty, price, fee, slip, cash, reason="", coin="ADA-USD"):
+    db.execute("INSERT INTO paper_trades VALUES (?, 'probe_x10', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (trade_id, coin, side, qty, price, fee, slip, cash, NOW.isoformat(), reason))
+    db.commit()
+
+
+def notice_pass(notices, mode="all"):
+    db, paths, sent, trade_notifier = notices
+    trade_watch.run_pass(**paths, now=NOW, trade_notifier=trade_notifier, trade_mode=mode)
+
+
+def test_open_lines_are_silent_and_name_side_size_and_costs(notices):
+    add_row(notices[0], 1, "long", 39571.59, 0.2165, 8.58, 4.29, -7722.1)
+    add_row(notices[0], 2, "short", 0.0105, 81974.0, 0.9, 0.4, 1500, coin="BTC-USD")
+    notice_pass(notices)
+    assert notices[2] == [
+        ("OPEN LONG ADA-USD [probe_x10] 39,572 @ 0.2165, notional $8,567, costs $12.9", True),
+        ("OPEN SHORT BTC-USD [probe_x10] 0.0105 @ 81,974.00, notional $861, costs $1.3", True)]
+
+
+def test_close_line_shows_profit_or_loss_after_costs(notices):
+    db = notices[0]
+    add_row(db, 427, "flat", 21290.3, 0.2164, 4.61, 2.3, 897.4)
+    add_row(db, 433, "short", 41547.1, 0.216, 8.97, 4.49, 9858.1)
+    add_row(db, 434, "flat", 41547.1, 0.2163, 8.99, 4.49, 858.0,
+            reason="ungated RISK INTERLOCK forced exit: daily loss 5.25% >= limit 5.00%")
+    notice_pass(notices)
+    assert notices[2][-1] == ("CLOSE ADA-USD [probe_x10] exit 0.2163, P&L -$39.4 (-3.9% of $1,000 start), costs $13.5, "
+                              "reason: ungated RISK INTERLOCK forced exit: daily loss 5.25% >= limit 5.00%", False)
+
+
+def test_first_close_is_measured_from_starting_cash(notices):
+    add_row(notices[0], 1, "long", 4000, 0.25, 1, 0.5, 0)
+    add_row(notices[0], 2, "flat", 4000, 0.26, 1, 0.5, 1038)
+    notice_pass(notices)
+    assert "P&L +$38.0 (+3.8% of $1,000 start)" in notices[2][-1][0]
+
+
+def test_direct_flip_is_named(notices):
+    add_row(notices[0], 1, "long", 4000, 0.25, 1, 0.5, 0)
+    add_row(notices[0], 2, "short", 4000, 0.26, 1, 0.5, 0)
+    notice_pass(notices)
+    assert notices[2][-1][0].endswith("flipped from LONG")
+
+
+def test_more_than_ten_trades_give_one_digest(notices):
+    db = notices[0]
+    for number, coin in enumerate(("ADA-USD", "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD")):
+        add_row(db, 2 * number + 1, "long", 100, 10, 1, 0.5, 1500, coin=coin)
+        add_row(db, 2 * number + 2, "flat", 100, 10, 1, 0.5, 990, coin=coin)
+    notice_pass(notices)
+    assert notices[2] == [("12 new trades: 6 closes, net P&L -$60.0", False)]
+
+
+def test_baseline_pass_sends_nothing(tmp_path):
+    db_path = tmp_path / "old.db"
+    db = sqlite3.connect(db_path)
+    db.executescript("""
+        CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, predictor TEXT, instrument TEXT, side TEXT,
+            qty REAL, price REAL, fee_cost REAL, slippage_cost REAL, cash_after REAL, executed_at TEXT, reason TEXT);
+        CREATE TABLE paper_portfolio_state (predictor TEXT, instrument TEXT, starting_cash REAL);
+        CREATE TABLE crypto_observations (instrument TEXT, interval TEXT, open_time TEXT,
+            close REAL, degraded INTEGER, first_seen_at TEXT);
+        CREATE TABLE llm_decisions (id INTEGER PRIMARY KEY, status TEXT);
+        CREATE TABLE risk_events (id INTEGER PRIMARY KEY, event TEXT);
+        INSERT INTO paper_trades VALUES (7, 'probe', 'ADA-USD', 'long', 1, 1, 0, 0, 0, '', '');
+    """)
+    db.commit()
+    db.close()
+    sent = []
+    trade_watch.run_pass(db_path=db_path, state_path=tmp_path / "s.json", log_path=tmp_path / "l.jsonl",
+                         alert_path=tmp_path / "a.md", now=NOW, trade_notifier=lambda *args: sent.append(args))
+    assert sent == []
+
+
+def test_closes_mode_skips_opens_and_off_sends_nothing(notices):
+    db = notices[0]
+    add_row(db, 1, "long", 4000, 0.25, 1, 0.5, 0)
+    add_row(db, 2, "flat", 4000, 0.26, 1, 0.5, 1038)
+    notice_pass(notices, mode="closes")
+    assert [text.split()[0] for text, _ in notices[2]] == ["CLOSE"]
+    notices[2].clear()
+    add_row(db, 3, "long", 4000, 0.25, 1, 0.5, 0)
+    notice_pass(notices, mode="off")
+    assert notices[2] == []
+
+
+def test_failed_state_save_sends_no_trade_lines(notices, monkeypatch):
+    add_row(notices[0], 1, "long", 4000, 0.25, 1, 0.5, 0)
+    monkeypatch.setattr(trade_watch, "save_state", lambda *args: (_ for _ in ()).throw(OSError("disk")))
+    notice_pass(notices)
+    assert notices[2] == []
+
+
+def test_crashing_trade_notifier_does_not_stop_the_watch(notices):
+    add_row(notices[0], 1, "long", 4000, 0.25, 1, 0.5, 0)
+    db, paths, sent, _ = notices
+
+    def broken(text, silent):
+        raise RuntimeError("telegram down")
+
+    line = trade_watch.run_pass(**paths, now=NOW, trade_notifier=broken)
+    assert line["trades_reviewed"] == [1]
+
+
+@pytest.mark.parametrize("setting, expect_notifier", [("all", True), ("closes", True), ("off", False)])
+def test_main_trade_notices_follow_the_setting(monkeypatch, setting, expect_notifier):
+    monkeypatch.setattr(sys, "argv", ["trade_watch.py"])
+    monkeypatch.setenv("ANDY_TELEGRAM_TOKEN", "tok")
+    monkeypatch.setenv("ANDY_TELEGRAM_CHAT_ID", "chat")
+    monkeypatch.setenv("ANDY_TRADE_NOTIFY", setting)
+    captured = {}
+    monkeypatch.setattr(trade_watch, "run_pass", lambda **kwargs: captured.update(kwargs))
+    trade_watch.main()
+    assert (captured["trade_notifier"] is not None) is expect_notifier
+    assert captured["trade_mode"] == setting
+
+
+def test_main_without_telegram_settings_has_no_trade_notifier(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["trade_watch.py"])
+    for key in ("ANDY_TELEGRAM_TOKEN", "ANDY_TELEGRAM_CHAT_ID", "ANDY_TRADE_NOTIFY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(trade_watch, "default_registry_reader", lambda name: None)
+    captured = {}
+    monkeypatch.setattr(trade_watch, "run_pass", lambda **kwargs: captured.update(kwargs))
+    trade_watch.main()
+    assert captured["trade_notifier"] is None

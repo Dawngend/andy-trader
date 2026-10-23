@@ -183,9 +183,12 @@ def launch_fixer(command):
                      creationflags=flags)
 
 
-def send_phone_alert(token, chat_id, messages):
+def send_phone_alert(token, chat_id, messages, silent=False):
     text = "\n".join(messages)[:500]
-    body = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    fields = {"chat_id": chat_id, "text": text}
+    if silent:
+        fields["disable_notification"] = "true"
+    body = urllib.parse.urlencode(fields).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     request = urllib.request.Request(url, data=body, method="POST")
     try:
@@ -196,8 +199,52 @@ def send_phone_alert(token, chat_id, messages):
         return False
 
 
+def money(value, signed=False):
+    sign = ("-" if value < 0 else "+") if signed else ""
+    return f"{sign}${abs(value):,.0f}" if abs(value) >= 100 else f"{sign}${abs(value):,.1f}"
+
+
+def trade_notice(db, trade):
+    """(text, silent, pnl) for one paper trade; a close carries its profit or loss after costs."""
+    book, coin = trade["predictor"], trade["instrument"]
+    price = f"{trade['price']:,.2f}" if trade["price"] >= 100 else f"{trade['price']:.4f}"
+    costs = trade["fee_cost"] + trade["slippage_cost"]
+    if trade["side"] != "flat":
+        qty = f"{trade['qty']:,.0f}" if trade["qty"] >= 100 else f"{trade['qty']:.4g}"
+        previous = db.execute("SELECT side FROM paper_trades WHERE predictor = ? AND instrument = ? AND id < ? "
+                              "ORDER BY id DESC LIMIT 1", (book, coin, trade["id"])).fetchone()
+        flip = f", flipped from {previous['side'].upper()}" if previous and previous["side"] != "flat" else ""
+        return (f"OPEN {trade['side'].upper()} {coin} [{book}] {qty} @ {price}, "
+                f"notional {money(trade['qty'] * trade['price'])}, costs {money(costs)}{flip}", True, None)
+    start = db.execute("SELECT starting_cash FROM paper_portfolio_state WHERE predictor = ? AND instrument = ?",
+                       (book, coin)).fetchone()
+    start = start["starting_cash"] if start else None
+    flat = db.execute("SELECT cash_after FROM paper_trades WHERE predictor = ? AND instrument = ? AND id < ? "
+                      "AND side = 'flat' ORDER BY id DESC LIMIT 1", (book, coin, trade["id"])).fetchone()
+    before = flat["cash_after"] if flat else start
+    pnl = None if before is None else trade["cash_after"] - before
+    result = "P&L unknown" if pnl is None else f"P&L {money(pnl, signed=True)}"
+    if pnl is not None and start:
+        result += f" ({pnl / start:+.1%} of {money(start)} start)"
+    return (f"CLOSE {coin} [{book}] exit {price}, {result}, costs {money(costs)}, "
+            f"reason: {(trade['reason'] or '')[:80]}", False, pnl)
+
+
+def trade_notices(db, trade_ids, mode):
+    """Lines to send for the newly reviewed trades. mode: all, closes or off (anything else means all)."""
+    if mode == "off" or not trade_ids:
+        return []
+    notices = [trade_notice(db, db.execute("SELECT * FROM paper_trades WHERE id = ?", (trade_id,)).fetchone())
+               for trade_id in trade_ids]
+    if len(notices) > 10:
+        closes = [pnl for _, silent, pnl in notices if not silent]
+        return [(f"{len(notices)} new trades: {len(closes)} closes, net P&L "
+                 f"{money(sum(pnl for pnl in closes if pnl is not None), signed=True)}", False, None)]
+    return [notice for notice in notices if mode != "closes" or not notice[1]]
+
+
 def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
-             fixer=None, notifier=None, now=None):
+             fixer=None, notifier=None, now=None, trade_notifier=None, trade_mode="all"):
     now = now or datetime.now(UTC)
     db_path = Path(db_path or default_database_path())
     state_path, log_path, alert_path = map(Path, (state_path, log_path, alert_path))
@@ -215,7 +262,7 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
                  "open_problems": [], "last_fixer_launch": None, "last_notified": None,
                  "pending_alerts": []}
         needs_baseline = True
-    reviewed, problems, notes = [], [], []
+    reviewed, problems, notes, notices = [], [], [], []
     try:
         db = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
@@ -227,6 +274,11 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
                                    ("last_risk_id", "risk_events")):
                     state[key] = latest_id(db, table)
             reviewed, problems, notes = review(db, state, now)
+            if trade_notifier:
+                try:
+                    notices = trade_notices(db, reviewed, trade_mode)
+                except Exception as exc:
+                    print(f"trade notices failed: {exc}", file=sys.stderr)
         finally:
             db.close()
     except Exception as exc:
@@ -307,6 +359,12 @@ def run_pass(db_path=None, state_path=STATE, log_path=LOG, alert_path=ALERT,
                         print(f"trade watch state save failed: {exc}", file=sys.stderr)
         except Exception as exc:
             print(f"trade watch notifier failed: {exc}", file=sys.stderr)
+    if trade_notifier and saved:
+        for text, silent, _ in notices:
+            try:
+                trade_notifier(text, silent)
+            except Exception as exc:
+                print(f"trade notice failed: {exc}", file=sys.stderr)
     return line
 
 
@@ -344,8 +402,11 @@ def main():
     args = parser.parse_args()
     token, chat_id = telegram_settings()
     notifier = (lambda messages: send_phone_alert(token, chat_id, messages)) if token and chat_id else None
+    mode = os.environ.get("ANDY_TRADE_NOTIFY", "all").strip().lower()
+    trade_notifier = ((lambda text, silent: send_phone_alert(token, chat_id, [text], silent=silent))
+                      if token and chat_id and mode != "off" else None)
     try:
-        run_pass(fixer=args.fixer, notifier=notifier)
+        run_pass(fixer=args.fixer, notifier=notifier, trade_notifier=trade_notifier, trade_mode=mode)
     except Exception as exc:
         print(f"trade watch failed: {exc}", file=sys.stderr)
     return 0
