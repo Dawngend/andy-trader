@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 import uuid
 
-from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.env import REPO_ROOT
 from andy_trader.store import connect, default_database_path
 from andy_trader.trend_book import run_once
 
@@ -46,7 +46,6 @@ def main(argv=None):
     if token is None:
         return 0
     try:
-        load_env_file(REPO_ROOT / ".env")
         with connect(Path(args.database) if args.database else default_database_path()) as connection:
             run_once(connection)
         return 0
