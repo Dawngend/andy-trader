@@ -8,6 +8,8 @@ To get a phone notification for new problems, talk to [@BotFather](https://t.me/
 
 `trade_watch.py` reads those settings from the process environment or, on Windows, from the current user's registry, so an already-running watch picks up a value `telegram_setup.py` just saved without signing out and back in.
 
+The same bot also sends one line for every new paper trade: opens arrive silently, closes with a sound and the profit or loss after fees and slippage. `ANDY_TRADE_NOTIFY` controls it: `all` (default), `closes` (close lines only) or `off`. More than 10 new trades in one pass are sent as a single summary line. Nothing is sent on the first pass of a fresh state file.
+
 A calibrated-forecast harness for short-horizon crypto directional prediction.
 
 The point of this project is not the model. It is the measurement.
