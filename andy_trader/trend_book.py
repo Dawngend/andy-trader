@@ -119,6 +119,14 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
                 current_side = ("long" if state.position_qty > 0
                                  else "short" if state.position_qty < 0 else "flat")
                 if side != current_side:
+                    if current_side != "flat":
+                        # A position can't jump straight from long to short or
+                        # back; execute_paper_trade requires passing through flat.
+                        execute_paper_trade(
+                            connection, predictor=TREND_BOOK, instrument=instrument,
+                            target_side="flat", price=price, now_iso=moment_iso,
+                            reason=f"trend40: {LOOKBACK_DAYS}d return {change * 100:+.1f}% -> {side}",
+                        )
                     execute_paper_trade(
                         connection, predictor=TREND_BOOK, instrument=instrument,
                         target_side=side, price=price, now_iso=moment_iso,
