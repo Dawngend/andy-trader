@@ -2,18 +2,23 @@
 
 Paper research only: read-only logger of public funding rates across Binance,
 Bybit and OKX. No keys, no orders, no risk code.
+
+Note on Binance intervals: Binance's premiumIndex endpoint does not include
+a fundingIntervalHours field, so intervals default to 8 hours per spec.
+If Binance uses shorter intervals (e.g. 4h or 1h) on certain contracts,
+annualized rates will be understated until per-symbol interval endpoints
+(like /fapi/v1/fundingInfo) are queried.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
-from pathlib import Path
 import sqlite3
-from typing import Callable, Mapping, Sequence
-import urllib.error
+from typing import Callable, Mapping
 import urllib.request
 
+# The 8 instruments tracked by run_probe_watch.INSTRUMENTS
 INSTRUMENTS = (
     "BTC-USD",
     "ETH-USD",
@@ -105,13 +110,9 @@ def parse_okx(payload: object) -> tuple[float, float]:
     next_ft = item.get("nextFundingTime")
     if ft is not None and next_ft is not None:
         try:
-            diff = float(next_ft) - float(ft)
-            if diff > 100_000:
-                interval = diff / 3_600_000.0
-            elif diff > 100:
-                interval = diff / 3600.0
-            elif diff > 0:
-                interval = diff
+            diff_ms = float(next_ft) - float(ft)
+            if diff_ms > 0:
+                interval = diff_ms / 3_600_000.0
         except (ValueError, TypeError):
             interval = 8.0
     if interval <= 0:
@@ -144,10 +145,11 @@ def _to_json(payload: object) -> object:
 def run_once(
     connection: sqlite3.Connection,
     *,
-    fetch: Callable[[str], object] = default_fetch,
+    fetch: Callable[[str], object] | None = None,
     now: datetime | str | None = None,
 ) -> tuple[int, int]:
     """Perform one collection pass over all instruments and venues."""
+    fetcher = fetch or default_fetch
     initialize_database(connection)
     if now is None:
         observed_at = datetime.now(UTC).isoformat()
@@ -168,7 +170,7 @@ def run_once(
         )
         for venue, url, parser in venues:
             try:
-                raw = _to_json(fetch(url))
+                raw = _to_json(fetcher(url))
                 rate, interval = parser(raw)
                 annualized = rate * (HOURS_PER_YEAR / interval)
                 connection.execute(
@@ -208,7 +210,7 @@ def compute_instrument_report(
         return {
             "instrument": instrument,
             "latest_venues": {},
-            "latest_gap": 0.0,
+            "latest_gap": None,
             "snapshots_above_15": 0,
             "longest_consecutive_above_15": 0,
         }
@@ -241,17 +243,10 @@ def compute_instrument_report(
 
     latest_obs_at = list(snapshots.keys())[-1]
     latest_venues = dict(snapshots[latest_obs_at])
-    if len(latest_venues) < 2:
-        # Fill missing venues from their most recent observation
-        for row in reversed(rows):
-            v, a = row[1], float(row[2])
-            if v not in latest_venues:
-                latest_venues[v] = a
-
     if len(latest_venues) >= 2:
-        latest_gap = max(latest_venues.values()) - min(latest_venues.values())
+        latest_gap: float | None = max(latest_venues.values()) - min(latest_venues.values())
     else:
-        latest_gap = 0.0
+        latest_gap = None
 
     return {
         "instrument": instrument,
@@ -293,10 +288,13 @@ def format_report(connection: sqlite3.Connection, threshold: float = 0.15) -> st
                 rate = latest_venues[venue]
                 lines.append(f"  {venue}: {rate:+.4f} ({rate * 100:+.2f}% annualized)")
             latest_gap = rep["latest_gap"]
-            lines.append(f"  Latest gap: {latest_gap:.4f} ({latest_gap * 100:.2f}% annualized)")
+            if latest_gap is not None:
+                lines.append(f"  Latest gap: {latest_gap:.4f} ({latest_gap * 100:.2f}% annualized)")
+            else:
+                lines.append("  Latest gap: not available")
         else:
             lines.append("  No observations recorded")
-            lines.append("  Latest gap: 0.0000 (0.00% annualized)")
+            lines.append("  Latest gap: not available")
         lines.append(f"  Snapshots above 15%: {rep['snapshots_above_15']}")
         lines.append(f"  Longest run above 15%: {rep['longest_consecutive_above_15']}")
 

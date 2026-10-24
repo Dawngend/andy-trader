@@ -167,7 +167,7 @@ def test_report_gap_equals_highest_minus_lowest(db):
     assert report["latest_gap"] == pytest.approx(0.10)
 
     text = funding_gap.format_report(db)
-    assert "0.1000" in text or "10.00%" in text
+    assert "Latest gap: 0.1000 (10.00% annualized)" in text
 
 
 def test_report_counts_snapshots_and_longest_run_above_15_percent(db):
@@ -257,6 +257,8 @@ def test_okx_interval_read_from_funding_times():
 def test_run_funding_gap_cli(tmp_path, capsys, monkeypatch):
     """Test CLI runs with --database and prints output."""
     monkeypatch.setattr(funding_gap, "INSTRUMENTS", ("BTC-USD",))
+    fake_lock = tmp_path / ".funding-gap.lock"
+    monkeypatch.setattr(run_funding_gap, "LOCK_PATH", fake_lock)
 
     def fake_fetch(url: str):
         if "binance" in url:
@@ -286,6 +288,19 @@ def test_run_funding_gap_cli(tmp_path, capsys, monkeypatch):
     assert "Latest gap:" in report_out
 
 
+def test_run_funding_gap_cli_lock_held(tmp_path, capsys, monkeypatch):
+    """Test CLI prints one line when another run holds the lock."""
+    fake_lock = tmp_path / ".funding-gap.lock"
+    fake_lock.write_text("existing-token")
+    monkeypatch.setattr(run_funding_gap, "LOCK_PATH", fake_lock)
+
+    ret = run_funding_gap.main(["--database", str(tmp_path / "dummy.db")])
+    assert ret == 0
+
+    out = capsys.readouterr().out
+    assert out.strip() == "Skipped: another run holds the lock"
+
+
 def test_lock_file_acquisition_and_contention(tmp_path, monkeypatch):
     """Test lock file prevents concurrent runs and handles stale locks."""
     fake_lock = tmp_path / ".funding-gap.lock"
@@ -308,17 +323,37 @@ def test_lock_file_acquisition_and_contention(tmp_path, monkeypatch):
 
 def test_all_eight_instruments_mapped():
     """Verify all 8 instruments from run_probe_watch are present and map to expected symbols."""
-    expected_instruments = (
-        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
-        "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD"
-    )
-    assert funding_gap.INSTRUMENTS == expected_instruments
-    for inst in expected_instruments:
+    import run_probe_watch
+
+    assert funding_gap.INSTRUMENTS == run_probe_watch.INSTRUMENTS
+    for inst in funding_gap.INSTRUMENTS:
         binance_sym, bybit_sym, okx_sym = funding_gap.instrument_to_symbols(inst)
         coin = inst.split("-")[0]
         assert binance_sym == f"{coin}USDT"
         assert bybit_sym == f"{coin}USDT"
         assert okx_sym == f"{coin}-USDT-SWAP"
+
+
+def test_fewer_than_two_venues_latest_gap_not_available(db):
+    """Verify latest gap is reported as not available when latest snapshot has only 1 venue."""
+    funding_gap.initialize_database(db)
+    now_iso = "2026-10-25T12:00:00+00:00"
+
+    db.execute(
+        """
+        INSERT INTO funding_gap_observations
+        (observed_at, instrument, venue, funding_rate, interval_hours, annualized)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (now_iso, "BTC-USD", "bybit", 0.0001, 8.0, 0.1095),
+    )
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["latest_gap"] is None
+
+    text = funding_gap.format_report(db)
+    assert "Latest gap: not available" in text
 
 
 def test_empty_database_report(db):

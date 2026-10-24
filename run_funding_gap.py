@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 import sys
 import time
+from typing import Callable
 import uuid
 
 from andy_trader.env import REPO_ROOT
@@ -31,7 +32,7 @@ def acquire_lock() -> str | None:
     return token
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, fetch: Callable[[str], object] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Path to SQLite database.")
     parser.add_argument("--report", action="store_true", help="Print gap report.")
@@ -46,10 +47,11 @@ def main(argv: list[str] | None = None) -> int:
 
     token = acquire_lock()
     if token is None:
+        print("Skipped: another run holds the lock")
         return 0
     try:
         with connect(db_path) as connection:
-            written, failed = run_once(connection)
+            written, failed = run_once(connection, fetch=fetch)
         print(f"Rows written: {written}, venues failed: {failed}")
         return 0
     except Exception as exc:
