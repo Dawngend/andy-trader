@@ -384,3 +384,9 @@ def test_fetch_settled_filters_by_predictor(tmp_path: Path) -> None:
         rows = fetch_settled(connection, predictor="baseline:base_rate")
         assert len(rows) == 1
         assert rows[0]["predictor"] == "baseline:base_rate"
+
+
+def test_connect_sets_busy_timeout(tmp_path: Path) -> None:
+    with connect(tmp_path / "x.db") as connection:
+        row = connection.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == 30000
