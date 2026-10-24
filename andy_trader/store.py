@@ -13,6 +13,7 @@ from typing import Collection, Iterable, Mapping, Sequence
 from andy_trader.env import REPO_ROOT
 
 DEFAULT_DB_FILENAME = "crypto_observations.db"
+BUSY_TIMEOUT_SECONDS = 30
 
 # Horizons the settlement job knows how to resolve. Adding one here without
 # adding it to _HORIZON_DELTAS makes every prediction at that horizon
@@ -148,7 +149,7 @@ def default_database_path(environ: Mapping[str, str] | None = None) -> Path:
 
 def connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, timeout=BUSY_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
     initialize_database(connection)
     return connection
