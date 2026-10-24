@@ -56,8 +56,12 @@ def round_id_from_round_start(round_start_val: str | int | float | datetime) -> 
         dt = round_start_val if round_start_val.tzinfo is not None else round_start_val.replace(tzinfo=UTC)
         epoch_seconds = int(dt.timestamp())
     else:
-        dt = _parse_iso(round_start_val)
-        epoch_seconds = int(dt.timestamp())
+        val_str = str(round_start_val).strip()
+        try:
+            epoch_seconds = int(float(val_str))
+        except ValueError:
+            dt = _parse_iso(val_str)
+            epoch_seconds = int(dt.timestamp())
     return f"btc-updown-5m-{epoch_seconds}"
 
 
@@ -100,7 +104,7 @@ def compute_bootstrap_interval(
     n = len(profits)
     boot_means = [sum(rng.choices(profits, k=n)) / n for _ in range(resamples)]
     boot_means.sort()
-    low = boot_means[int(0.025 * resamples)]
+    low = boot_means[int(0.025 * resamples) - 1]
     high = boot_means[int(0.975 * resamples) - 1]
     return low, high
 
@@ -123,7 +127,10 @@ def _find_matching_observation(
     ).fetchall()
     valid_obs: list[tuple[datetime, sqlite3.Row]] = []
     for row in rows:
-        obs_dt = _parse_iso(row["observed_at"])
+        try:
+            obs_dt = _parse_iso(row["observed_at"])
+        except Exception:
+            continue
         if created_at_dt <= obs_dt <= max_observed_at:
             valid_obs.append((obs_dt, row))
     if valid_obs:
@@ -173,7 +180,10 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
     ).fetchall()
 
     for row in candidate_rows:
-        created_dt = _parse_iso(row["created_at"])
+        try:
+            created_dt = _parse_iso(row["created_at"])
+        except Exception:
+            continue
         if created_dt < cutoff:
             continue
 
@@ -181,14 +191,35 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
             features = json.loads(row["features_json"]) if row["features_json"] else {}
         except Exception:
             features = {}
-        round_start = features.get("round_start")
-        round_id = round_id_from_round_start(round_start) if round_start else None
+        round_start = features.get("round_start") if isinstance(features, dict) else None
+        round_id = None
+        if round_start is not None:
+            try:
+                round_id = round_id_from_round_start(round_start)
+            except Exception:
+                round_id = None
 
-        side = "up" if row["probability_up"] > 0.5 else "down"
+        prob_up = row["probability_up"]
+        if prob_up is None:
+            side = None
+        else:
+            try:
+                side = "up" if float(prob_up) > 0.5 else "down"
+            except (ValueError, TypeError):
+                side = None
 
-        obs = _find_matching_observation(connection, round_id, created_dt) if round_id else None
+        if side is None or round_id is None:
+            obs = None
+        else:
+            obs = _find_matching_observation(connection, round_id, created_dt)
 
         if obs is None:
+            if (
+                side is not None
+                and round_id is not None
+                and moment < created_dt + timedelta(seconds=MAX_BOOK_DELAY_SECONDS)
+            ):
+                continue
             ask = None
             depth = None
             decision = "no_book"

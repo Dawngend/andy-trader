@@ -12,7 +12,7 @@ import time
 import uuid
 
 from andy_trader.cheap_ask_book import format_report, run_once
-from andy_trader.env import REPO_ROOT, load_env_file
+from andy_trader.env import REPO_ROOT
 from andy_trader.store import connect, default_database_path
 
 LOCK_PATH = REPO_ROOT / ".cheap-ask-book.lock"
@@ -41,7 +41,6 @@ def acquire_lock() -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_env_file(REPO_ROOT / ".env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Path to database file")
     parser.add_argument("--report", action="store_true", help="Print summary report")
@@ -49,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
 
     token = acquire_lock()
     if token is None:
+        if args.report:
+            print("Book is busy, try again.")
         return 0
 
     try:

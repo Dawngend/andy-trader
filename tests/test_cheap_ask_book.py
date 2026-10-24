@@ -321,3 +321,145 @@ def test_cli_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pyt
     captured = capsys.readouterr()
     assert "Cheap Ask Paper Book Report" in captured.out
     assert "Bets so far: 1 of 100 needed for a first verdict" in captured.out
+
+
+def test_candidate_skipped_while_within_book_window_then_decided(db: sqlite3.Connection) -> None:
+    """A prediction created recently is not prematurely marked no_book while its 20s window is open."""
+    insert_prediction(db, prediction_id=1, probability_up=0.8, created_at=PRED_CREATED.isoformat())
+
+    # Run at now = 5s after created_at with no book yet: should not write any decision
+    run_once(db, now=PRED_CREATED + timedelta(seconds=5))
+    assert db.execute("SELECT COUNT(*) FROM cheap_ask_decisions").fetchone()[0] == 0
+
+    # Observation arrives 8 seconds after created_at
+    insert_observation(
+        db,
+        observed_at=(PRED_CREATED + timedelta(seconds=8)).isoformat(),
+        up_best_ask=0.40,
+        up_depth=50.0,
+    )
+
+    # Run again at now = 10s: observation is picked up and decision is bet
+    run_once(db, now=PRED_CREATED + timedelta(seconds=10))
+    row = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 1").fetchone()
+    assert row is not None
+    assert row["decision"] == "bet"
+
+
+def test_candidate_marked_no_book_after_window_closes(db: sqlite3.Connection) -> None:
+    """A prediction with no book is marked no_book once the 20s window has expired."""
+    insert_prediction(db, prediction_id=1, probability_up=0.8, created_at=PRED_CREATED.isoformat())
+
+    # Run at now = 21s after created_at with no book: window has closed
+    run_once(db, now=PRED_CREATED + timedelta(seconds=21))
+    row = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 1").fetchone()
+    assert row is not None
+    assert row["decision"] == "no_book"
+
+
+def test_bad_prediction_rows_handled_gracefully(db: sqlite3.Connection) -> None:
+    """Corrupted round_start, numeric string round_start, and null probability_up do not crash run_once."""
+    # Recreate crypto_predictions with nullable probability_up to test missing probability_up
+    db.execute("DROP TABLE crypto_predictions")
+    db.execute(
+        """
+        CREATE TABLE crypto_predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            predictor TEXT NOT NULL,
+            instrument TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            probability_up REAL,
+            reference_price REAL NOT NULL,
+            mode TEXT NOT NULL,
+            features_json TEXT,
+            created_at TEXT NOT NULL,
+            resolves_at TEXT NOT NULL,
+            settled_at TEXT,
+            settle_price REAL,
+            outcome_up INTEGER,
+            settle_note TEXT
+        )
+        """
+    )
+
+    # Row 1: numeric string round_start (e.g. "1761393900")
+    insert_prediction(
+        db,
+        prediction_id=1,
+        probability_up=0.8,
+        round_start="1761393900",
+        created_at=PRED_CREATED.isoformat(),
+    )
+    insert_observation(
+        db,
+        round_id="btc-updown-5m-1761393900",
+        observed_at=(PRED_CREATED + timedelta(seconds=5)).isoformat(),
+        up_best_ask=0.40,
+        up_depth=50.0,
+    )
+
+    # Row 2: probability_up is NULL
+    db.execute(
+        """
+        INSERT INTO crypto_predictions (
+            id, predictor, instrument, horizon, probability_up, reference_price,
+            mode, features_json, created_at, resolves_at, settled_at, outcome_up
+        ) VALUES (2, 'fast:continuation', 'BTC-USD', '2m', NULL, 100000.0, 'advisory',
+                 '{"round_start": "1761393900"}', ?, ?, NULL, NULL)
+        """,
+        (PRED_CREATED.isoformat(), (PRED_CREATED + timedelta(minutes=5)).isoformat()),
+    )
+
+    # Row 3: corrupted round_start string that cannot be parsed
+    insert_prediction(
+        db,
+        prediction_id=3,
+        probability_up=0.8,
+        round_start="not-a-timestamp",
+        created_at=PRED_CREATED.isoformat(),
+    )
+
+    # Run once well after window closes
+    run_once(db, now=NOW)
+
+    row1 = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 1").fetchone()
+    assert row1 is not None
+    assert row1["round_id"] == "btc-updown-5m-1761393900"
+    assert row1["decision"] == "bet"
+
+    row2 = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 2").fetchone()
+    assert row2 is not None
+    assert row2["decision"] == "no_book"
+
+    row3 = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 3").fetchone()
+    assert row3 is not None
+    assert row3["decision"] == "no_book"
+
+
+def test_cli_report_when_lock_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lock_file = tmp_path / ".test.lock"
+    lock_file.write_text("existing-token")
+
+    monkeypatch.setattr(run_cheap_ask_book, "LOCK_PATH", lock_file)
+    monkeypatch.setattr(run_cheap_ask_book, "JOURNAL_PATH", tmp_path / ".test.jsonl")
+
+    exit_code = run_cheap_ask_book.main(["--report"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Book is busy, try again." in captured.out
+
+
+def test_bootstrap_interval_indices() -> None:
+    from andy_trader.cheap_ask_book import compute_bootstrap_interval
+    profits = list(range(100))
+    low, high = compute_bootstrap_interval(profits, resamples=2000, seed=42)
+    assert low < high
+
+
+def test_no_load_env_file() -> None:
+    import inspect
+    import run_cheap_ask_book
+    source = inspect.getsource(run_cheap_ask_book)
+    assert "load_env_file" not in source
