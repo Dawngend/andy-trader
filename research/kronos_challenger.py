@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime, timedelta
-import json
 import math
 from pathlib import Path
 import sqlite3
@@ -34,12 +33,13 @@ PREDICTOR_NAME = "kronos:small"
 LOOKBACK_CANDLES = 512
 HORIZONS = ("4h", "1d")
 LOCK_PATH = REPO_ROOT / ".kronos-challenger.lock"
+LOCK_STALE_SECONDS = 7200  # 2 hours
 
 
 def acquire_lock() -> str | None:
     token = uuid.uuid4().hex
     try:
-        if time.time() - LOCK_PATH.stat().st_mtime < 180:
+        if time.time() - LOCK_PATH.stat().st_mtime < LOCK_STALE_SECONDS:
             return None
         LOCK_PATH.unlink()
     except FileNotFoundError:
@@ -94,28 +94,31 @@ def read_completed_candles(
         SELECT open_time, open, high, low, close, volume, degraded, degraded_reason
         FROM crypto_observations
         WHERE instrument = ? AND venue = 'bybit' AND interval = '1h' AND degraded = 0 AND close IS NOT NULL
-        ORDER BY open_time ASC, last_seen_at ASC
+        ORDER BY open_time DESC, last_seen_at DESC
+        LIMIT ?
         """,
-        (instrument,),
+        (instrument, max(limit * 4, 1000)),
     ).fetchall()
     by_open_time: dict[str, Candle] = {}
     for row in rows:
         open_time = row["open_time"]
         if is_hour_completed(open_time, now):
             open_dt = _as_utc(open_time)
-            by_open_time[open_dt.isoformat()] = Candle(
-                instrument=instrument,
-                venue="bybit",
-                interval="1h",
-                open_time=open_time,
-                open=float(row["open"]) if row["open"] is not None else None,
-                high=float(row["high"]) if row["high"] is not None else None,
-                low=float(row["low"]) if row["low"] is not None else None,
-                close=float(row["close"]),
-                volume=float(row["volume"]) if row["volume"] is not None else None,
-                degraded=bool(row["degraded"]),
-                degraded_reason=row["degraded_reason"],
-            )
+            key = open_dt.isoformat()
+            if key not in by_open_time:
+                by_open_time[key] = Candle(
+                    instrument=instrument,
+                    venue="bybit",
+                    interval="1h",
+                    open_time=open_time,
+                    open=float(row["open"]) if row["open"] is not None else None,
+                    high=float(row["high"]) if row["high"] is not None else None,
+                    low=float(row["low"]) if row["low"] is not None else None,
+                    close=float(row["close"]),
+                    volume=float(row["volume"]) if row["volume"] is not None else None,
+                    degraded=bool(row["degraded"]),
+                    degraded_reason=row["degraded_reason"],
+                )
     ordered = [by_open_time[key] for key in sorted(by_open_time)]
     if len(ordered) < limit:
         return []
@@ -180,6 +183,28 @@ def compute_prediction_stats(
     return prob_4h, prob_1d, pred_vol_bps, median_close_4h, median_close_1d
 
 
+def candles_to_kronos_inputs(candles: Sequence[Candle]):
+    """Convert candles into (df, x_timestamp, y_timestamp) for Kronos predictor."""
+    import pandas as pd
+
+    records = [
+        {
+            "open": float(c.open if c.open is not None else c.close),
+            "high": float(c.high if c.high is not None else c.close),
+            "low": float(c.low if c.low is not None else c.close),
+            "close": float(c.close),
+            "volume": float(c.volume or 0.0),
+        }
+        for c in candles
+    ]
+    df = pd.DataFrame(records)
+    open_times = [c.open_time for c in candles]
+    x_timestamp = pd.Series(pd.to_datetime(open_times))
+    last_dt = x_timestamp.iloc[-1]
+    y_timestamp = pd.Series(pd.date_range(start=last_dt + pd.Timedelta(1, "h"), periods=24, freq="1h"))
+    return df, x_timestamp, y_timestamp
+
+
 def run_once(
     connection: sqlite3.Connection,
     *,
@@ -202,56 +227,59 @@ def run_once(
             continue
 
         reference_price = float(candles[-1].close)
-        paths = forecast(candles)
-        prob_4h, prob_1d, pred_vol_bps, median_4h, median_1d = compute_prediction_stats(paths, reference_price)
+        try:
+            paths = forecast(candles)
+            prob_4h, prob_1d, pred_vol_bps, median_4h, median_1d = compute_prediction_stats(paths, reference_price)
 
-        created_at_iso = moment.isoformat()
-        resolves_at_4h = (moment + timedelta(hours=4)).isoformat()
-        resolves_at_1d = (moment + timedelta(hours=24)).isoformat()
+            created_at_iso = moment.isoformat()
+            resolves_at_4h = (moment + timedelta(hours=4)).isoformat()
+            resolves_at_1d = (moment + timedelta(hours=24)).isoformat()
 
-        features_4h = {
-            "paths": len(paths),
-            "pred_vol_bps": pred_vol_bps,
-            "median_close": median_4h,
-        }
-        features_1d = {
-            "paths": len(paths),
-            "pred_vol_bps": pred_vol_bps,
-            "median_close": median_1d,
-        }
+            features_4h = {
+                "paths": len(paths),
+                "pred_vol_bps": pred_vol_bps,
+                "median_close": median_4h,
+            }
+            features_1d = {
+                "paths": len(paths),
+                "pred_vol_bps": pred_vol_bps,
+                "median_close": median_1d,
+            }
 
-        pred_4h = Prediction(
-            predictor=PREDICTOR_NAME,
-            instrument=instrument,
-            horizon="4h",
-            probability_up=prob_4h,
-            reference_price=reference_price,
-            mode="advisory",
-            features=features_4h,
-            created_at=created_at_iso,
-            resolves_at=resolves_at_4h,
-        )
-        pred_1d = Prediction(
-            predictor=PREDICTOR_NAME,
-            instrument=instrument,
-            horizon="1d",
-            probability_up=prob_1d,
-            reference_price=reference_price,
-            mode="advisory",
-            features=features_1d,
-            created_at=created_at_iso,
-            resolves_at=resolves_at_1d,
-        )
+            pred_4h = Prediction(
+                predictor=PREDICTOR_NAME,
+                instrument=instrument,
+                horizon="4h",
+                probability_up=prob_4h,
+                reference_price=reference_price,
+                mode="advisory",
+                features=features_4h,
+                created_at=created_at_iso,
+                resolves_at=resolves_at_4h,
+            )
+            pred_1d = Prediction(
+                predictor=PREDICTOR_NAME,
+                instrument=instrument,
+                horizon="1d",
+                probability_up=prob_1d,
+                reference_price=reference_price,
+                mode="advisory",
+                features=features_1d,
+                created_at=created_at_iso,
+                resolves_at=resolves_at_1d,
+            )
 
-        record_prediction(connection, pred_4h)
-        record_prediction(connection, pred_1d)
+            record_prediction(connection, pred_4h)
+            record_prediction(connection, pred_1d)
 
-        results.append({
-            "instrument": instrument,
-            "status": "recorded",
-            "p_4h": prob_4h,
-            "p_1d": prob_1d,
-        })
+            results.append({
+                "instrument": instrument,
+                "status": "recorded",
+                "p_4h": prob_4h,
+                "p_1d": prob_1d,
+            })
+        except Exception as exc:
+            results.append({"instrument": instrument, "status": "error", "reason": str(exc)})
 
     return results
 
@@ -268,10 +296,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         kronos_dir = Path(r"D:\Verify_Posts\src_kronos")
         if str(kronos_dir) not in sys.path:
-            sys.path.insert(0, str(kronos_dir))
+            sys.path.append(str(kronos_dir))
 
         import torch
-        import pandas as pd
         from model import Kronos, KronosTokenizer, KronosPredictor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -280,20 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
 
         def kronos_forecast(candles: list[Candle]) -> list[list[float]]:
-            df = pd.DataFrame([
-                {
-                    "open": float(getattr(c, "open", c["open"])),
-                    "high": float(getattr(c, "high", c["high"])),
-                    "low": float(getattr(c, "low", c["low"])),
-                    "close": float(getattr(c, "close", c["close"])),
-                    "volume": float(getattr(c, "volume", c["volume"]) or 0.0),
-                }
-                for c in candles
-            ])
-            open_times = [getattr(c, "open_time", c["open_time"]) for c in candles]
-            x_timestamp = pd.Series(pd.to_datetime(open_times))
-            last_dt = x_timestamp.iloc[-1]
-            y_timestamp = pd.Series(pd.date_range(start=last_dt + pd.Timedelta(hours=1), periods=24, freq="1h"))
+            df, x_timestamp, y_timestamp = candles_to_kronos_inputs(candles)
 
             df_list = [df.copy() for _ in range(20)]
             x_list = [x_timestamp for _ in range(20)]
@@ -315,12 +329,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         with connect(db_path) as connection:
             results = run_once(connection, forecast=kronos_forecast)
 
+        has_error = False
         for item in results:
             if item["status"] == "recorded":
                 print(f"{item['instrument']}: 4h={item['p_4h']:.2f} 1d={item['p_1d']:.2f}")
-            else:
+            elif item["status"] == "skipped":
                 print(f"{item['instrument']}: skipped ({item['reason']})")
-        return 0
+            else:
+                print(f"{item['instrument']}: error ({item['reason']})")
+                has_error = True
+        return 1 if has_error else 0
     except Exception as exc:
         print(f"kronos_challenger failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

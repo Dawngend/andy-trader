@@ -260,3 +260,41 @@ def test_importing_module_does_not_import_torch():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, f"Import verification failed:\n{result.stderr}"
+
+
+def test_candles_to_kronos_inputs_with_candle_objects():
+    """Verify DataFrame and timestamp creation succeeds on real Candle objects."""
+    candles = make_candles(10, end_time=NOW, close=100.0)
+    df, x_timestamp, y_timestamp = kronos_challenger.candles_to_kronos_inputs(candles)
+    assert len(df) == 10
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+    assert df["close"].iloc[-1] == 100.0
+    assert len(x_timestamp) == 10
+    assert len(y_timestamp) == 24
+
+
+def test_forecast_error_is_isolated_per_instrument(db, monkeypatch):
+    """If forecast raises for one instrument, run_once records an error and continues."""
+    monkeypatch.setattr(kronos_challenger, "INSTRUMENTS", ("BTC-USD", "ETH-USD"))
+    end_time = NOW.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    record_observations(db, make_candles(512, end_time=end_time, close=100.0, instrument="BTC-USD"))
+    record_observations(db, make_candles(512, end_time=end_time, close=200.0, instrument="ETH-USD"))
+
+    def failing_forecast(candles):
+        if candles[0].instrument == "BTC-USD":
+            raise RuntimeError("Model execution failed for BTC")
+        return [[205.0] * 24 for _ in range(20)]
+
+    results = kronos_challenger.run_once(db, forecast=failing_forecast, now=NOW)
+    assert len(results) == 2
+    btc_result = next(r for r in results if r["instrument"] == "BTC-USD")
+    eth_result = next(r for r in results if r["instrument"] == "ETH-USD")
+
+    assert btc_result["status"] == "error"
+    assert "Model execution failed for BTC" in btc_result["reason"]
+    assert eth_result["status"] == "recorded"
+
+    # Only ETH predictions recorded in DB
+    rows = db.execute("SELECT instrument FROM crypto_predictions WHERE predictor = 'kronos:small'").fetchall()
+    assert len(rows) == 2
+    assert all(row["instrument"] == "ETH-USD" for row in rows)
