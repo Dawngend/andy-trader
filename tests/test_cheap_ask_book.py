@@ -279,6 +279,15 @@ def test_report_profit_calculation(db: sqlite3.Connection) -> None:
     assert "Bets so far: 1 of 100 needed for a first verdict" in report_text
 
 
+def test_report_ignores_settled_rows_with_no_ask(db: sqlite3.Connection) -> None:
+    """A settled ask_too_high row whose ask is missing must not crash the report."""
+    insert_prediction(db, prediction_id=1, probability_up=0.8, outcome_up=1)
+    insert_observation(db, up_best_ask=None, up_depth=None)
+    run_once(db, now=NOW)
+
+    assert "ask_too_high: 1" in format_report(db)
+
+
 def test_running_twice_in_a_row_changes_nothing(db: sqlite3.Connection) -> None:
     """(i) Running twice in a row changes nothing."""
     insert_prediction(db, prediction_id=1, probability_up=0.8, created_at=PRED_CREATED.isoformat(), outcome_up=1)
@@ -434,6 +443,12 @@ def test_bad_prediction_rows_handled_gracefully(db: sqlite3.Connection) -> None:
     row3 = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 3").fetchone()
     assert row3 is not None
     assert row3["decision"] == "no_book"
+
+    # A prediction with no side must never be scored as a win or a loss.
+    db.execute("UPDATE crypto_predictions SET outcome_up = 0 WHERE id = 2")
+    run_once(db, now=NOW)
+    row2 = db.execute("SELECT * FROM cheap_ask_decisions WHERE prediction_id = 2").fetchone()
+    assert row2["win"] is None
 
 
 def test_cli_report_when_lock_held(

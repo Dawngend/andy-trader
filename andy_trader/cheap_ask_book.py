@@ -145,7 +145,7 @@ def settle_decisions(connection: sqlite3.Connection, now_iso: str) -> None:
         SELECT cad.prediction_id, cad.side, cp.outcome_up
         FROM cheap_ask_decisions cad
         JOIN crypto_predictions cp ON cad.prediction_id = cp.id
-        WHERE cad.settled_at IS NULL AND cp.outcome_up IS NOT NULL
+        WHERE cad.settled_at IS NULL AND cad.side IS NOT NULL AND cp.outcome_up IS NOT NULL
         """
     ).fetchall()
     for row in rows:
@@ -274,7 +274,7 @@ def format_report(connection: sqlite3.Connection) -> str:
         """
         SELECT ask, win
         FROM cheap_ask_decisions
-        WHERE decision = 'ask_too_high' AND settled_at IS NOT NULL AND win IS NOT NULL
+        WHERE decision = 'ask_too_high' AND ask IS NOT NULL AND settled_at IS NOT NULL AND win IS NOT NULL
         ORDER BY decided_at ASC, prediction_id ASC
         """
     ).fetchall()
