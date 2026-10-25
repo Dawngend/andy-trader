@@ -1,15 +1,5 @@
 # Andy Trader
 
-### Paper Trade Watch
-
-Run `python trade_watch.py` every two minutes. It reads the database without changing it and never places trades. It checks new paper trades for price, fee, size, and open-position brackets, then checks the latest 1m BTC bar, new AI decision statuses, and new risk events. Results go to `.trade-watch.jsonl`; new problems also appear in `research/watch_alert.md`. To launch a repair command for new problems, use `python trade_watch.py --fixer "your command"`. The command is limited to one launch per ten minutes.
-
-To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts; it will ask you to confirm it found the right chat before saving anything. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
-
-`trade_watch.py` reads those settings from the process environment or, on Windows, from the current user's registry, so an already-running watch picks up a value `telegram_setup.py` just saved without signing out and back in.
-
-The same bot also sends one line for every new paper trade: opens arrive silently, closes with a sound and the profit or loss after fees and slippage. `ANDY_TRADE_NOTIFY` controls it: `all` (default), `closes` (close lines only) or `off`. More than 10 new trades in one pass are sent as a single summary line. Nothing is sent on the first pass of a fresh state file.
-
 A calibrated-forecast harness for short-horizon crypto directional prediction.
 
 The point of this project is not the model. It is the measurement.
@@ -772,6 +762,33 @@ python -m andy_trader.bybit_sender clear 123 --reason "Checked Bybit: no remaini
 `cleared_by_dawn` are terminal. Clearing records the reason and UTC time; it does not cancel
 anything at Bybit, remove daily/hourly usage, or permit the same intent to be sent again.
 
+## October follow-ups: one lead, one dead end, one logger
+
+Three questions came out of the October losses, each answered with the same rule as everywhere
+else here: score it against the real price, and count costs.
+
+**The fast continuation signal against the real order book.** Scored against the actual best ask
+(`research/fast_book_vs_asks.ipynb`), `fast:continuation` loses: 1,128 matched bets, 85.1% won,
+average ask 0.878, average profit -0.027 per contract. Its edge only exists when the favourite is
+cheap. Where the ask was under 0.70 there were 137 bets, 59.1% won, +0.129 per contract (95%
+bootstrap interval +0.039 to +0.213, positive in both halves, median 264 shares at the ask). The 0.70
+cut was chosen after looking at that data, so it is a hypothesis, not a result.
+`andy_trader/cheap_ask_book.py` is the forward test: it records, for every new fast call, whether
+the book would have allowed a bet, and settles the outcome later. It places no orders. It reports
+"Bets so far: N of 100 needed for a first verdict" and gives no verdict before 100.
+
+**A time-series foundation model.** Kronos (a published pretrained candlestick model) was replayed
+on 488 past windows over eight coins (`research/kronos_backtest.ipynb`). Direction hit rate was 0.51
+at four hours and 0.49 at one day, and its Brier skill against the base rate was -0.25 and -0.33: it
+was confident (said 0.9 when 0.41 happened) and wrong. Only about eight days of unbroken hourly
+candles were available, so this is a rough read, not proof. The live `kronos:small` predictor stays
+as a free advisory challenger that the normal settle job scores; it is not promoted.
+
+**Funding-rate gaps between exchanges.** A first look found Binance, Bybit and OKX BTC funding rates
+differing by about 5.9% a year before costs, which at 15 bps per leg over four legs takes about 37
+days to earn back. `andy_trader/funding_gap.py` logs public funding rates from the three venues so
+the size and persistence of real gaps can be measured before anyone builds on them.
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
@@ -802,3 +819,13 @@ Run the paper-only probe watcher with:
 Use --database PATH to override the database. The scheduled task AndyTrader-ProbeWatch runs it every minute. Each pass fetches Binance minute bars, runs risk and bracket exits for probe and probe_x10, marks equity, then requests AI only when LLM_MIN_MINUTES and LLM_DAILY_CALLS allow. Model requests time out after 25 seconds. Prices older than 2.5 minutes are skipped. Each batch can trade once per book. Closed trades (including entry costs) and stale-price skips are recorded in .probe-watch.jsonl. run_cycle.py no longer requests AI batches or trades these books.
 `PROBE_MIN_HOLD_MINUTES` defaults to 15; probe and probe_x10 ignore signal exits until this age, while stops, targets, liquidation, and the risk interlock still close immediately. Set it to 0 to disable the hold.
 Hourly trade-limit `throttled` risk events are recorded once per book and instrument per clock hour.
+
+## Paper Trade Watch
+
+Run `python trade_watch.py` every two minutes. It reads the database without changing it and never places trades. It checks new paper trades for price, fee, size, and open-position brackets, then checks the latest 1m BTC bar, new AI decision statuses, and new risk events. Results go to `.trade-watch.jsonl`; new problems also appear in `research/watch_alert.md`. To launch a repair command for new problems, use `python trade_watch.py --fixer "your command"`. The command is limited to one launch per ten minutes.
+
+To get a phone notification for new problems, talk to [@BotFather](https://t.me/BotFather) on Telegram and run `/newbot`, then copy the token it gives you. Send your new bot any message so it can find your chat. Then run `python telegram_setup.py` and follow the prompts; it will ask you to confirm it found the right chat before saving anything. Nothing is sent unless both `ANDY_TELEGRAM_TOKEN` and `ANDY_TELEGRAM_CHAT_ID` are set.
+
+`trade_watch.py` reads those settings from the process environment or, on Windows, from the current user's registry, so an already-running watch picks up a value `telegram_setup.py` just saved without signing out and back in.
+
+The same bot also sends one line for every new paper trade: opens arrive silently, closes with a sound and the profit or loss after fees and slippage. `ANDY_TRADE_NOTIFY` controls it: `all` (default), `closes` (close lines only) or `off`. More than 10 new trades in one pass are sent as a single summary line. Nothing is sent on the first pass of a fresh state file.
