@@ -1,5 +1,7 @@
 # Polymarket Strategy Scout Report (2026-10-27)
 
+> **Review note (Claude, 2026-10-28).** This report was written by a Gemini agent and rejected by the automated reviewer three times, so it is a draft. What I re-checked: the sharky6999 statistics match my own independent pull of the same 10,000 closed positions (win rate, price bands, market types, worst loss). Errors found and fixed: the worst-loss date, and a miscalculated "held to resolution" figure for THEHIGHLIFE. What is NOT verified: (1) "win rate" for THEHIGHLIFE and flawfence counts any position with positive realized pnl, including partial exits, so it is not a hold-to-resolution win rate; the claim that their losses were "mitigated early" is an inference from small loss sizes, not shown by data. (2) Every entry, filter, sizing and exit rule in the Top 3 candidates is a proposal that was never tested against pulled data. (3) Candidate 3 needs an external odds source we do not have, and its accounts are top-of-leaderboard picks, so survivorship bias applies. (4) The "Could not verify" claims come from search leads that were not shown to be opened, and two sources (a subreddit front page and a GitHub organization root) cannot support any specific claim. (5) The closed-positions API stops at 10,000 rows, so each account's sample is only its latest positions.
+
 ## Executive Summary
 
 This report evaluates trading strategies deployed by consistently profitable Polymarket accounts, cross-referencing on-chain data pulled directly from the public Polymarket Data API and the local scout database (`scout_wide.db`) against industry documentation, developer repositories, and published analytical literature.
@@ -11,7 +13,7 @@ The primary objective is to separate genuine, replicable structural edges from u
 1. **The 99¢ "Bonding" Trap (Catastrophic Skew)**: Naively buying contracts priced at 99¢ and above (`0.99_and_above`) to pick up the final 1¢ payout creates severe negative skew. In the complete 10,000 closed-position dataset for `sharky6999` (`0x751a2b86cab503496efd325c8344e10159349ea1`), 7,355 positions (73.55% of markets and 94.69% of total capital: $90.41M of $95.48M) were deployed at 99¢+, winning 99.39% of trades but yielding a negligible **+$31,865.00 PnL (+0.035% return on cost)**. A single -$73,966.70 loss on a 99.06¢ Bitcoin contract erased over 1,163 average wins ($63.56 average win vs. -$1,810.37 average loss; loss-to-win ratio: 28.48). In account `THEHIGHLIFE` (`0x8c0b024c17831a0dde038547b7e791ae6a0d7aa5`), 115 positions at 99¢+ resulted in **-$25,446.12 net PnL (-1.78% RoC)** despite an 86.96% win rate.
 2. **Consensus Bonding (80¢ to 95¢) Reality Check (Held vs. Mitigated Positions)**: While accounts entering high-probability outcomes in the 80¢ to 95¢ band show positive aggregate returns, position-level analysis reveals that this edge **cannot be captured by naively holding positions to binary resolution** unless win rates exceed 97%:
    - `sharky6999`: 502 positions in 0.80–0.95 (wtd avg entry $0.916), **+$51,516.00 PnL, 96.81% win rate, +5.97% RoC** (7-month window). Win rate exceeded entry price, generating positive hold-to-resolution yield.
-   - `THEHIGHLIFE`: 67 positions in 0.80–0.95 (wtd avg entry $0.8894), **+$71,067.92 PnL, 83.58% win rate, +8.15% RoC** (6-month window). If held to binary resolution ($0 payout on loss), an 83.58% win rate at an 0.8894 entry is mathematically losing (-5.42% RoC, -$47,272 PnL). Data shows all 11 losing positions were mitigated early (average loss -7.8%, worst loss -12.4%), avoiding full wipeout.
+   - `THEHIGHLIFE`: 67 positions in 0.80–0.95 (wtd avg entry $0.8894), **+$71,067.92 PnL, 83.58% win rate, +8.15% RoC** (6-month window). If every position were held to binary resolution ($0 payout on loss), an 83.58% win rate at an 0.8894 entry would be losing (the exact held-to-zero figure was not computed: it is about -$41.8K plus the small realized losses already booked, so still negative). Data shows all 11 losing positions were mitigated early (average loss -7.8%, worst loss -12.4%), avoiding full wipeout.
    - `flawfence`: 67 positions in 0.80–0.95 (wtd avg entry $0.8963), **+$70,874.03 PnL, 80.60% win rate, +5.86% RoC** (6-month window). Similarly, losing positions were exited or sold early (-0.7% to -44.6% drawdown), never held to total wipeout.
 3. **Buying NO on Far Price Targets ("Reach" or "Dip" Markets)**: Retail participants systematically overpay for out-of-the-money milestone lottery tickets ("Will Bitcoin dip to $60k?", "Will ETH reach $5,000?"). In `sharky6999`'s 10,000 closed positions, fading price milestones on the NO side delivered **+$71,147.55 PnL on 1,448 positions (91.16% win rate, +3.64% RoC)**. Entries on NO between 80¢ and 98¢ achieved a **97.80% win rate and +3.35% RoC on 772 positions**. However, chronological split analysis demonstrates decay: first-half performance was 93.92% win rate (+6.23% RoC), declining in the second half to 88.40% win rate (+2.69% RoC), with the latest 1,000-position sample experiencing overall negative PnL (-$30,683.78) due to tail losses.
 4. **Scout Wide Report Account Composition**: The wide report (`scout_wide.db`, 30 accounts) contains **0 non-market-maker, non-bot, non-thin accounts**. Of the 30 accounts:
@@ -42,7 +44,7 @@ The primary objective is to separate genuine, replicable structural edges from u
 ### 1. `sharky6999` (`0x751a2b86cab503496efd325c8344e10159349ea1`)
 - **Sample Window**: 2026-03-16 07:11:00 UTC to 2026-10-27 10:11:00 UTC (10,000 closed positions pulled).
 - **Aggregate Performance**: Total Cost: $95,481,322.69 | Realized PnL: +$208,842.54 | Win Rate: 97.52% (9,752 wins, 227 losses, 21 flat) | Return on Cost: +0.219%.
-- **Win/Loss Metrics**: Average Win: $63.56 | Average Loss: -$1,810.37 | Loss-to-Win Ratio: 28.48 | Worst Loss: -$73,966.70 (on Bitcoin Up or Down - May 10, 2026, entry 0.9906).
+- **Win/Loss Metrics**: Average Win: $63.56 | Average Loss: -$1,810.37 | Loss-to-Win Ratio: 28.48 | Worst Loss: -$73,966.70 (on "Bitcoin Up or Down on October 5?", entry 0.9906, position closed 2026-10-14).
 - **Position Sizing**: Median Sizing: $228.40 | P90 Sizing: $10,480.00.
 - **Sample Stability & Period Splits**:
   - *Full 10,000 Positions Chronological Split (Count Midpoint)*:
@@ -114,7 +116,7 @@ The primary objective is to separate genuine, replicable structural edges from u
   - *Sum across price bands*: 1,085 + 669 + 67 + 64 + 115 = **2,000 positions**.
 - **Held vs. Mitigated Analysis in 0.80–0.95 Band**:
   - In the 0.80–0.95 band, winning positions averaged $13,563.74 in cost (total $759,569.51), while losing positions averaged $10,264.05 in cost (total $112,904.53 across 11 losses).
-  - All 11 losses suffered modest percentage losses (-0.3% to -12.4% drawdown) due to early exits or non-total settlement. If all 11 losses had been held to binary resolution ($0 payout), the gross loss would have totaled -$112,904.53, turning the band's net PnL from +$71,067.92 into **-$47,272.23 (-5.42% RoC)**.
+  - All 11 losses suffered modest percentage losses (-0.3% to -12.4% drawdown) due to early exits or non-total settlement. If all 11 losses had been held to binary resolution ($0 payout), the gross loss would have totaled -$112,904.53, the band would turn negative: the winners' pnl minus $112,904.53 is about -$41.8K plus the small realized losses already booked (the exact figure was not computed). The earlier figure of -$47,272.23 (-5.42%) was a miscalculation and should not be used.
 - **Market Type Breakdown (2,000 Positions)**:
   - `sports`: 1,877 positions | Cost: $12,134,756.35 | PnL: +$4,643,676.75 | WR: 76.19% | RoC: +38.27%
   - `price_target`: 8 positions | Cost: $9,854.11 | PnL: +$9,353.86 | WR: 100.0% | RoC: +94.92%
@@ -217,6 +219,8 @@ The primary objective is to separate genuine, replicable structural edges from u
 
 ## Top 3 candidates
 
+**All entry, filter, sizing and exit rules below are proposals. None was backtested against pulled data. Only the account statistics are measured, and those come from top-of-leaderboard accounts (survivorship bias).**
+
 ### Candidate 1: Far Price Target NO Buying (Negative Skew Harvesting)
 
 - **Thesis**: Retail participants systematically overpay for extreme out-of-the-money price milestones on crypto assets ("Will Bitcoin reach $150k this month?", "Will ETH dip to $1,800?"). Buying the NO contract extracts steady yield from this retail lottery bias.
@@ -249,7 +253,7 @@ The primary objective is to separate genuine, replicable structural edges from u
 ### Candidate 2: High-Probability Consensus Convergence (80¢ to 94¢ Window) with Active Stop-Loss
 
 - **Thesis**: Purchasing consensus outcomes in markets approaching finality captures the remaining 6¢ to 18¢ discount.
-- **Critical Risk Finding (Downgraded Evidence Level)**: Holding high-entry positions blindly to resolution is mathematically unviable when win rates are in the 80–84% range. If an account buys at an average price of $0.89 and experiences an 83.58% win rate (like `THEHIGHLIFE`), holding losing positions to 0 results in a net return of **-5.42%**. `THEHIGHLIFE` (+8.15% RoC) and `flawfence` (+5.86% RoC) only made profit because their losing trades were closed early at partial drawdowns (-0.7% to -44%), rather than held to zero.
+- **Critical Risk Finding (Downgraded Evidence Level)**: Holding high-entry positions blindly to resolution is mathematically unviable when win rates are in the 80–84% range. If an account buys at an average price of $0.89 and experiences an 83.58% win rate (like `THEHIGHLIFE`), holding losing positions to 0 would produce a net loss (exact figure not computed; see the correction above). `THEHIGHLIFE` (+8.15% RoC) and `flawfence` (+5.86% RoC) only made profit because their losing trades were closed early at partial drawdowns (-0.7% to -44%), rather than held to zero.
 - **Empirical Evidence**:
   - `sharky6999`: 502 positions, +$51,516.00 PnL, 96.81% win rate, +5.97% RoC (high win rate enabled positive yield).
   - `THEHIGHLIFE`: 67 positions, +$71,067.92 PnL, 83.58% win rate, +8.15% RoC (all 11 losses mitigated early; wtd avg entry $0.8894).
@@ -297,7 +301,7 @@ The primary objective is to separate genuine, replicable structural edges from u
 
 ## Could not verify
 
-The following claims encountered in analyst commentary, social media, or forum discussions could not be verified against public on-chain data or primary sources:
+The following claims are leads from the agent's searches. No link to an opened post or article was kept for the "community forums", "industry commentary" and "social media" origins, so treat each claim as a rumor that could not be sourced, not as something found. Generic pages such as a subreddit front page or a GitHub organization root do not support any specific claim.
 
 1. **Sharky6999 Dedicated Polygon RPC / Node Setup**:
    - *Claim*: Reports on community forums and tracking sites claim account `sharky6999` operates a private Polygon validator/RPC node to execute trades without latency delays.
