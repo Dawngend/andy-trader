@@ -789,6 +789,34 @@ differing by about 5.9% a year before costs, which at 15 bps per leg over four l
 days to earn back. `andy_trader/funding_gap.py` logs public funding rates from the three venues so
 the size and persistence of real gaps can be measured before anyone builds on them.
 
+## Bond Book (Paper Only)
+
+Run `python run_bond_book.py --report` for one public-data pass and a report;
+`--database PATH` selects a different local database. Errors are recorded in
+`.bond-book.jsonl`. No orders are placed and no schedule is installed.
+
+The book buys 100 paper shares of either side of an active binary crypto price
+market ending within three days (reach, dip, above, below, or Up or Down).
+The full ask fill must average 0.80 through 0.98 and leave at least 0.015 per share
+after entry fees. Fees use `taker_fee` at each filled level with the 0.07 crypto rate.
+It holds at most 30 positions, with at most two per event. A unique market-side
+key prevents repeat purchases, including after settlement; database transactions
+enforce the limits during overlapping runs. No lock file is used.
+
+Closed markets settle only when Gamma reports one outcome at least 0.99 and the
+other at most 0.01. Winners pay 1 per share with no exit fee; unclear results stay
+open. Gamma's event `crypto` tag (id 21), market `endDate`, and JSON-encoded
+`outcomes`, `clobTokenIds`, and `outcomePrices` were checked with public reads on
+2026-10-27.
+
+The report groups settled results into [0.80, 0.90), [0.90, 0.95), and [0.95, 0.98].
+The win-rate gap above average entry price measures the edge before fees; profit
+per share includes fees. Dollar wins, losses, and the loss-to-win ratio show how
+many wins a loss erases. Skip counts are daily side checks, so repeat checks count
+again. A verdict waits for 100 settlements, states the loss count, and shows
+positive edge only if the entire bootstrap 95 percent interval for average profit
+per position is above zero. Otherwise it says "no edge shown".
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
