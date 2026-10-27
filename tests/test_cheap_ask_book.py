@@ -318,8 +318,18 @@ def test_cli_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pyt
     with sqlite3.connect(db_file) as connection:
         connection.row_factory = sqlite3.Row
         initialize_database(connection)
-        insert_prediction(connection, prediction_id=1, probability_up=0.8, outcome_up=1)
-        insert_observation(connection, up_best_ask=0.40, up_depth=50.0)
+        # main() uses the real clock with a short lookback, so the data must be recent
+        created = datetime.now(UTC) - timedelta(minutes=2)
+        round_start = created - timedelta(minutes=3)
+        insert_prediction(
+            connection, prediction_id=1, probability_up=0.8, outcome_up=1,
+            created_at=created.isoformat(), round_start=round_start.isoformat(),
+            resolves_at=(round_start + timedelta(minutes=5)).isoformat(),
+        )
+        insert_observation(
+            connection, round_id=round_id_from_round_start(round_start),
+            observed_at=(created + timedelta(seconds=2)).isoformat(), up_best_ask=0.40, up_depth=50.0,
+        )
         connection.commit()
 
     monkeypatch.setattr(run_cheap_ask_book, "LOCK_PATH", tmp_path / ".test.lock")
