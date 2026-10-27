@@ -25,6 +25,16 @@ WINDOW_HOURS = 6
 PREFILTER_BELOW = 0.70
 CRYPTO_TAG_ID = 21
 PRICE_WORDS = r"\b(reach|dip|above|below|up or down)\b"
+PRICE_TARGET_WORDS = r"\b(reach|dip|hit)\b"
+ABOVE_BELOW_WORDS = r"\b(above|below)\b"
+PRICE_TARGET_NO = "price_target_no"
+PRICE_TARGET_YES = "price_target_yes"
+UP_DOWN = "up_down"
+ABOVE_BELOW = "above_below"
+OTHER = "other"
+SLICES = (PRICE_TARGET_NO, PRICE_TARGET_YES, UP_DOWN, ABOVE_BELOW, OTHER)
+SLICE_HEADER = ("Slice | Settled | Wins | Average entry price | Win rate | "
+                "Gap before fees | Average pnl/share after fees | Average win | Average loss")
 ENTRY_BANDS = ((0.90, "0.80 to 0.90"), (0.95, "0.90 to 0.95"), (1.0, "0.95 to 0.98"))
 VERDICT_THRESHOLD = 100
 PAGE_SIZE = 100
@@ -266,6 +276,19 @@ def average(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def strategy_slice(title: str, side: str) -> str:
+    price_target = re.search(PRICE_TARGET_WORDS, title, re.IGNORECASE)
+    if price_target and side == "No":
+        return PRICE_TARGET_NO
+    if price_target and side == "Yes":
+        return PRICE_TARGET_YES
+    if "up or down" in title.lower():
+        return UP_DOWN
+    if re.search(ABOVE_BELOW_WORDS, title, re.IGNORECASE):
+        return ABOVE_BELOW
+    return OTHER
+
+
 def report_row(label: str, rows: list) -> str:
     wins = sum(row["win"] for row in rows)
     price = average([row["fill_price"] for row in rows])
@@ -283,9 +306,10 @@ def format_report(connection: sqlite3.Connection) -> str:
     rows = connection.execute(
         "SELECT * FROM bond_book_positions WHERE settled_at IS NOT NULL ORDER BY opened_at, market_id, side"
     ).fetchall()
-    open_count = connection.execute(
-        "SELECT COUNT(*) FROM bond_book_positions WHERE settled_at IS NULL"
-    ).fetchone()[0]
+    open_rows = connection.execute(
+        "SELECT title, side FROM bond_book_positions WHERE settled_at IS NULL"
+    ).fetchall()
+    open_count = len(open_rows)
     skips = dict(connection.execute("SELECT reason, SUM(count) FROM bond_book_skips GROUP BY reason"))
     lines = ["Bond Book (paper only)", f"Open positions: {open_count}", f"Settled positions: {len(rows)}",
              "Skipped counts (side checks, including repeat checks):"]
@@ -307,4 +331,24 @@ def format_report(connection: sqlite3.Connection) -> str:
     else:
         verdict = "positive edge shown" if low > 0 else "no edge shown"
         lines.append(f"Verdict: {verdict} ({len(rows)} settled, including {len(losses)} losses)")
+    by_slice = {}
+    for row in rows:
+        by_slice.setdefault(strategy_slice(row["title"], row["side"]), []).append(row)
+    open_by_slice = {}
+    for row in open_rows:
+        name = strategy_slice(row["title"], row["side"])
+        open_by_slice[name] = open_by_slice.get(name, 0) + 1
+    lines.extend(["", "By strategy slice",
+                  "A slice needs 100 settled positions before it counts; "
+                  "the slice with the most settled positions so far is shown first.",
+                  SLICE_HEADER])
+    for name in sorted(by_slice, key=lambda n: (-len(by_slice[n]), SLICES.index(n))):
+        slice_rows = by_slice[name]
+        lines.append(report_row(name, slice_rows))
+        slice_losses = [r["pnl"] for r in slice_rows if not r["win"]]
+        lines.append(f"  worst loss: ${min(slice_losses, default=0):.2f}")
+    shown = [name for name in SLICES if name in by_slice or name in open_by_slice]
+    if shown:
+        open_counts = ", ".join(f"{name} {open_by_slice.get(name, 0)}" for name in shown)
+        lines.append(f"Open positions by slice: {open_counts}")
     return "\n".join(lines)

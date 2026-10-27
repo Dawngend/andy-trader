@@ -292,6 +292,47 @@ def test_report(db):
     assert "Verdict:" not in report
 
 
+@pytest.mark.parametrize("title,side,expected", [
+    ("Will Bitcoin reach 150,000?", "No", "price_target_no"),
+    ("Will Bitcoin reach 150,000?", "Yes", "price_target_yes"),
+    ("Bitcoin Up or Down on October 5?", "No", "up_down"),
+    ("Bitcoin above 100,000?", "Yes", "above_below"),
+    ("Will a crypto company IPO?", "Yes", "other"),
+])
+def test_strategy_slice(title, side, expected):
+    assert bond.strategy_slice(title, side) == expected
+
+
+def test_report_strategy_slices(db):
+    reach = "Will Bitcoin reach 150,000?"
+    up_down = "Bitcoin Up or Down on October 5?"
+    bond.open_position(db, "e1", market("m1", question=reach), "No", 0.9, 0.63, NOW)
+    bond.open_position(db, "e2", market("m2", question=reach), "No", 0.9, 0.63, NOW)
+    bond.open_position(db, "e3", market("m3", question=up_down), "No", 0.9, 0.63, NOW)
+    bond.open_position(db, "e4", market("m4"), "Yes", 0.9, 0.63, NOW)
+    for market_id, win in (("m1", 1), ("m2", 0), ("m3", 1)):
+        with db:
+            db.execute(
+                "UPDATE bond_book_positions SET win=?, pnl=?, settled_at=? WHERE market_id=?",
+                (win, 100 * (win - 0.9) - 0.63, NOW.isoformat(), market_id),
+            )
+    report = bond.format_report(db)
+    assert "By strategy slice" in report
+    assert ("A slice needs 100 settled positions before it counts; "
+            "the slice with the most settled positions so far is shown first.") in report
+    assert ("price_target_no | 2 | 1 | 0.9000 | 50.00% | -40.00% | "
+            "$-0.4063 | $+9.37 | $-90.63") in report
+    assert ("up_down | 1 | 1 | 0.9000 | 100.00% | +10.00% | "
+            "$+0.0937 | $+9.37 | $+0.00") in report
+    assert report.index("price_target_no |") < report.index("up_down |")
+    assert "above_below |" not in report
+    assert "Open positions by slice: price_target_no 0, up_down 0, above_below 1" in report
+    assert ("Entry band | Settled | Wins | Average entry price | Win rate | Gap before fees | "
+            "Average pnl/share after fees | Average win | Average loss") in report
+    assert "0.90 to 0.95 | 3 | 2 | 0.9000 | 66.67% | -23.33%" in report
+    assert "Overall | 3 | 2 | 0.9000 | 66.67% | -23.33%" in report
+
+
 @pytest.mark.parametrize("losses,verdict", [(0, "positive edge shown"), (10, "no edge shown")])
 def test_verdict_and_loss_statistics(db, losses, verdict):
     for i in range(100):
