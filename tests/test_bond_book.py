@@ -40,12 +40,13 @@ def db(tmp_path):
 
 @pytest.fixture(autouse=True)
 def network(monkeypatch):
-    state = {"events": [event()], "books": {}, "closed": {}}
+    state = {"events": [event()], "books": {}, "closed": {}, "book_calls": []}
 
     def http(url, timeout):
         params = parse_qs(urlparse(url).query)
         if url.startswith(bond.CLOB_BOOK_URL):
             token = params["token_id"][0]
+            state["book_calls"].append(token)
             result = state["books"].get(token, book(0.9 if token.endswith("y") else 0.1))
             if isinstance(result, Exception):
                 raise result
@@ -96,6 +97,46 @@ def test_entry_boundaries(db, network, price, band):
     network["books"]["m1y"] = book(price)
     bond.run_once(db, now=NOW)
     assert positions(db)[0]["entry_band"] == band
+
+
+def test_gamma_price_below_prefilter_skips_book(db, network):
+    network["events"] = [event(markets=[market(outcomePrices='["0.40", "0.85"]')])]
+    bond.run_once(db, now=NOW)
+    assert "m1y" not in network["book_calls"]
+    assert "m1n" in network["book_calls"]
+    assert dict(db.execute("SELECT reason, count FROM bond_book_skips")) == {"ask_too_low": 2}
+
+
+def test_gamma_price_above_prefilter_still_reads_book(db, network):
+    network["events"] = [event(markets=[market(outcomePrices='["0.85", "0.15"]')])]
+    bond.run_once(db, now=NOW)
+    assert "m1y" in network["book_calls"]
+    row, = positions(db)
+    assert row["side"] == "Yes"
+    assert row["fill_price"] == 0.9
+
+
+@pytest.mark.parametrize("changes", [
+    {},
+    {"outcomePrices": "invalid"},
+    {"outcomePrices": '["bad", "bad"]'},
+])
+def test_missing_or_invalid_gamma_price_reads_book(db, network, changes):
+    network["events"] = [event(markets=[market(**changes)])]
+    bond.run_once(db, now=NOW)
+    assert "m1y" in network["book_calls"]
+    row, = positions(db)
+    assert row["side"] == "Yes"
+
+
+def test_pass_journal_has_seconds_and_book_reads(db, network, tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "JOURNAL_PATH", tmp_path / ".bond-book.jsonl")
+    path = db.execute("PRAGMA database_list").fetchone()[2]
+    assert runner.main(["--database", path]) == 0
+    entries = [json.loads(line) for line in runner.JOURNAL_PATH.read_text().splitlines()]
+    pass_line = next(entry for entry in entries if entry["event"] == "pass")
+    assert "seconds" in pass_line
+    assert pass_line["book_reads"] == 2
 
 
 def test_walks_depth_and_fees_per_level(db, network):

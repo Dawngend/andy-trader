@@ -21,6 +21,7 @@ MIN_MARGIN = 0.015
 MAX_OPEN = 30
 MAX_OPEN_PER_EVENT = 2
 MAX_DAYS = 3
+PREFILTER_BELOW = 0.70
 CRYPTO_TAG_ID = 21
 PRICE_WORDS = r"\b(reach|dip|above|below|up or down)\b"
 ENTRY_BANDS = ((0.90, "0.80 to 0.90"), (0.95, "0.90 to 0.95"), (1.0, "0.95 to 0.98"))
@@ -29,6 +30,7 @@ PAGE_SIZE = 100
 TIMEOUT_SECONDS = 10
 SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "margin_too_small")
 DATA_ERRORS = (CompleteSetError, OSError, ValueError, TypeError, KeyError)
+BOOK_READS = 0
 
 
 def initialize_bond_book(connection: sqlite3.Connection) -> None:
@@ -55,6 +57,17 @@ def list_field(value: object) -> list:
     if not isinstance(values, list):
         raise ValueError("Expected a Gamma list field")
     return values
+
+
+def gamma_price(market: dict, side: str) -> float | None:
+    if market.get("outcomePrices") is None:
+        return None
+    try:
+        prices = [float(price) for price in list_field(market["outcomePrices"])]
+        price = prices[list_field(market["outcomes"]).index(side)]
+    except (ValueError, TypeError, KeyError, IndexError):
+        return None
+    return price if math.isfinite(price) else None
 
 
 def fetch_events(**params: object) -> list:
@@ -119,11 +132,17 @@ def open_position(connection, event_id, market, side, price, fee, now) -> None:
 
 
 def consider_side(connection, event_id, market, side, token, now) -> None:
+    global BOOK_READS
     if connection.execute(
         "SELECT 1 FROM bond_book_positions WHERE market_id = ? AND side = ?",
         (str(market["id"]), side),
     ).fetchone():
         return
+    gamma = gamma_price(market, side)
+    if gamma is not None and gamma < PREFILTER_BELOW:
+        record_skip(connection, now, "ask_too_low")
+        return
+    BOOK_READS += 1
     book = _http_json(f"{CLOB_BOOK_URL}?{urlencode({'token_id': token})}", TIMEOUT_SECONDS)
     # walk_ask_book calls taker_fee for each filled level.
     fill = walk_ask_book(book, SHARES, fee_rate=CRYPTO_TAKER_FEE_RATE)
@@ -192,6 +211,8 @@ def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list
 
 
 def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> list[dict]:
+    global BOOK_READS
+    BOOK_READS = 0
     initialize_bond_book(connection)
     now = now or datetime.now(UTC)
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)

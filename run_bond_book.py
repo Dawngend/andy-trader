@@ -5,7 +5,9 @@ import argparse
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import time
 
+from andy_trader import bond_book
 from andy_trader.bond_book import format_report, run_once
 from andy_trader.env import REPO_ROOT
 from andy_trader.store import connect, default_database_path
@@ -24,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", action="store_true", help="Print summary after the pass")
     args = parser.parse_args(argv)
     try:
+        started = time.monotonic()
         path = Path(args.database) if args.database else default_database_path()
         with connect(path) as connection:
             errors = run_once(connection)
@@ -31,7 +34,8 @@ def main(argv: list[str] | None = None) -> int:
                 journal("error", **error)
             if args.report:
                 print(format_report(connection))
-        journal("pass", errors=len(errors))
+        journal("pass", errors=len(errors), seconds=round(time.monotonic() - started, 3),
+                book_reads=bond_book.BOOK_READS)
         return 1 if errors else 0
     except Exception as exc:
         journal("error", error=f"{type(exc).__name__}: {exc}")
