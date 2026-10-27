@@ -168,6 +168,65 @@ def test_universe_market_filters(db, network, changes):
     assert positions(db) == []
 
 
+def test_active_events_walks_consecutive_windows(monkeypatch):
+    calls = []
+
+    def fake_fetch(**params):
+        calls.append(params)
+        return []
+
+    monkeypatch.setattr(bond, "fetch_events", fake_fetch)
+    assert list(bond.active_events(NOW)) == []
+    starts = [datetime.fromisoformat(call["end_date_min"]) for call in calls]
+    ends = [datetime.fromisoformat(call["end_date_max"]) for call in calls]
+    assert starts[0] == NOW
+    assert ends[-1] == NOW + timedelta(days=bond.MAX_DAYS)
+    assert all(end == next_start for end, next_start in zip(ends, starts[1:]))
+    assert all(end - start == timedelta(hours=bond.WINDOW_HOURS)
+               for start, end in zip(starts, ends))
+
+
+def test_event_in_two_adjacent_windows_yielded_once(monkeypatch):
+    same = event()
+    first_two = {NOW.isoformat(), (NOW + timedelta(hours=bond.WINDOW_HOURS)).isoformat()}
+
+    def fake_fetch(**params):
+        return [same] if params["end_date_min"] in first_two else []
+
+    monkeypatch.setattr(bond, "fetch_events", fake_fetch)
+    assert [e["id"] for e in bond.active_events(NOW)] == ["e1"]
+
+
+def test_paging_inside_a_window_follows_offset(monkeypatch):
+    monkeypatch.setattr(bond, "PAGE_SIZE", 2)
+    calls = []
+
+    def fake_fetch(**params):
+        calls.append(params)
+        if params["end_date_min"] != NOW.isoformat():
+            return []
+        return [event("e1"), event("e2")] if params["offset"] == 0 else [event("e3")]
+
+    monkeypatch.setattr(bond, "fetch_events", fake_fetch)
+    assert [e["id"] for e in bond.active_events(NOW)] == ["e1", "e2", "e3"]
+    offsets = [c["offset"] for c in calls if c["end_date_min"] == NOW.isoformat()]
+    assert offsets == [0, 2]
+
+
+def test_failing_window_is_recorded_and_later_windows_read(db, monkeypatch):
+    second = (NOW + timedelta(hours=bond.WINDOW_HOURS)).isoformat()
+
+    def fake_fetch(**params):
+        if params["end_date_min"] == NOW.isoformat():
+            raise CompleteSetError("HTTP 422")
+        return [event()] if params["end_date_min"] == second else []
+
+    monkeypatch.setattr(bond, "fetch_events", fake_fetch)
+    errors = bond.run_once(db, now=NOW)
+    assert errors == [{"error": "HTTP 422"}]
+    assert len(positions(db)) == 1
+
+
 def test_crypto_tag_required(db, network):
     network["events"] = [event(tags=[{"slug": "politics"}])]
     bond.run_once(db, now=NOW)

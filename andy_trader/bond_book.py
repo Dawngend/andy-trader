@@ -21,6 +21,7 @@ MIN_MARGIN = 0.015
 MAX_OPEN = 30
 MAX_OPEN_PER_EVENT = 2
 MAX_DAYS = 3
+WINDOW_HOURS = 6
 PREFILTER_BELOW = 0.70
 CRYPTO_TAG_ID = 21
 PRICE_WORDS = r"\b(reach|dip|above|below|up or down)\b"
@@ -77,18 +78,38 @@ def fetch_events(**params: object) -> list:
     return payload
 
 
-def active_events(now: datetime):
-    offset = 0
-    while True:
-        events = fetch_events(
-            tag_id=CRYPTO_TAG_ID, active="true", closed="false",
-            end_date_min=now.isoformat(), end_date_max=(now + timedelta(days=MAX_DAYS)).isoformat(),
-            limit=PAGE_SIZE, offset=offset, order="id", ascending="true",
-        )
-        yield from events
-        if len(events) < PAGE_SIZE:
-            return
-        offset += PAGE_SIZE
+def end_date_windows(now: datetime):
+    end = now + timedelta(days=MAX_DAYS)
+    step = timedelta(hours=WINDOW_HOURS)
+    start = now
+    while start < end:
+        stop = min(start + step, end)
+        yield start, stop
+        start = stop
+
+
+def active_events(now: datetime, errors: list | None = None):
+    errors = [] if errors is None else errors
+    seen = set()
+    for start, stop in end_date_windows(now):
+        offset = 0
+        try:
+            while True:
+                events = fetch_events(
+                    tag_id=CRYPTO_TAG_ID, active="true", closed="false",
+                    end_date_min=start.isoformat(), end_date_max=stop.isoformat(),
+                    limit=PAGE_SIZE, offset=offset, order="id", ascending="true",
+                )
+                for event in events:
+                    key = str(event.get("id"))
+                    if key not in seen:
+                        seen.add(key)
+                        yield event
+                if len(events) < PAGE_SIZE:
+                    break
+                offset += PAGE_SIZE
+        except DATA_ERRORS as exc:
+            errors.append({"error": str(exc)})
 
 
 def eligible_market(market: dict, now: datetime) -> bool:
@@ -219,7 +240,7 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
     errors = []
     settle_positions(connection, now, errors)
     try:
-        for event in active_events(now):
+        for event in active_events(now, errors):
             if not event.get("active") or event.get("closed"):
                 continue
             if not any(tag.get("slug") == "crypto" for tag in event.get("tags", [])):
