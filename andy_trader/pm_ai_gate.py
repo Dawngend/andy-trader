@@ -159,16 +159,17 @@ def run_agy(
     except subprocess.TimeoutExpired as exc:
         try:
             if kill_tree is not None:
-                try:
-                    kill_tree(proc.pid)
-                except TypeError:
-                    kill_tree(proc)
+                kill_tree(proc.pid)
             else:
                 _default_kill_tree(proc.pid)
         except Exception:
             pass
         try:
             proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=5)
         except Exception:
             pass
         for pipe in (proc.stdout, proc.stderr, proc.stdin):
@@ -302,16 +303,29 @@ def get_candidates(
 
 def recheck_row(
     db_path: Path | str,
+    book: str,
     table: str,
     market_id: str,
     side: str,
     now: datetime,
 ) -> tuple[bool, dict | None]:
-    """Check freshness of one row immediately on a new connection that is closed at once."""
+    """Check freshness and unscored status of one row immediately on a new connection that is closed at once."""
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         conn.row_factory = sqlite3.Row
         try:
+            decisions_exist = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (DECISIONS_TABLE,),
+            ).fetchone()
+            if decisions_exist:
+                already_decided = conn.execute(
+                    f"SELECT 1 FROM {DECISIONS_TABLE} WHERE book = ? AND market_id = ? AND side = ?",
+                    (book, market_id, side),
+                ).fetchone()
+                if already_decided:
+                    return False, None
+
             row = conn.execute(
                 f"SELECT * FROM {table} WHERE market_id = ? AND side = ?",
                 (market_id, side),
@@ -341,7 +355,7 @@ def record_decision(
         conn = sqlite3.connect(db_path, timeout=5)
         try:
             with conn:
-                conn.execute(
+                cursor = conn.execute(
                     f"""
                     INSERT OR IGNORE INTO {DECISIONS_TABLE}
                     (book, market_id, side, verdict, reason, model, decided_at)
@@ -349,7 +363,7 @@ def record_decision(
                     """,
                     (book, market_id, side, verdict, reason, model, decided_at),
                 )
-            return True
+            return cursor.rowcount > 0
         finally:
             conn.close()
     except sqlite3.OperationalError:
@@ -398,7 +412,9 @@ def run_pass(
             break
 
         now = clock()
-        fresh, updated_row = recheck_row(db_path, cand["table"], cand["market_id"], cand["side"], now)
+        fresh, updated_row = recheck_row(
+            db_path, cand["book"], cand["table"], cand["market_id"], cand["side"], now
+        )
         if not fresh or updated_row is None:
             continue
 
@@ -512,7 +528,8 @@ def generate_report(
             return f"# Polymarket AI Approval Gate Report\n\nData cut: {now_dt.isoformat()}\n\nno decisions yet\n"
 
         earliest_decided_at = min(
-            dt for r in decisions if (dt := parse_iso(r["decided_at"])) is not None
+            (dt for r in decisions if (dt := parse_iso(r["decided_at"])) is not None),
+            default=None,
         )
         not_scored_cutoff = now_dt - timedelta(minutes=30)
 
@@ -538,11 +555,12 @@ def generate_report(
         not_scored_by_book: dict[str, int] = {}
         for book, rows in all_book_rows.items():
             count = 0
-            for r in rows:
-                if (book, r["market_id"], r["side"]) not in decision_keys:
-                    opened_dt = parse_iso(r["opened_at"])
-                    if opened_dt is not None and earliest_decided_at <= opened_dt <= not_scored_cutoff:
-                        count += 1
+            if earliest_decided_at is not None:
+                for r in rows:
+                    if (book, r["market_id"], r["side"]) not in decision_keys:
+                        opened_dt = parse_iso(r["opened_at"])
+                        if opened_dt is not None and earliest_decided_at <= opened_dt <= not_scored_cutoff:
+                            count += 1
             not_scored_by_book[book] = count
 
         left_out_count = 0
