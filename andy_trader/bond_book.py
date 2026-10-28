@@ -88,20 +88,20 @@ def fetch_events(**params: object) -> list:
     return payload
 
 
-def end_date_windows(now: datetime):
-    end = now + timedelta(days=MAX_DAYS)
+def end_date_windows(now: datetime, min_days: int = 0, max_days: int | None = None):
+    end = now + timedelta(days=MAX_DAYS if max_days is None else max_days)
     step = timedelta(hours=WINDOW_HOURS)
-    start = now
+    start = now + timedelta(days=min_days)
     while start < end:
         stop = min(start + step, end)
         yield start, stop
         start = stop
 
 
-def active_events(now: datetime, errors: list | None = None):
+def active_events(now: datetime, errors: list | None = None, min_days: int = 0, max_days: int | None = None):
     errors = [] if errors is None else errors
     seen = set()
-    for start, stop in end_date_windows(now):
+    for start, stop in end_date_windows(now, min_days=min_days, max_days=max_days):
         offset = 0
         try:
             while True:
@@ -135,27 +135,34 @@ def eligible_market(market: dict, now: datetime) -> bool:
     return len(outcomes) == len(tokens) == 2 and len(set(outcomes)) == 2 and len(set(tokens)) == 2
 
 
-def record_skip(connection: sqlite3.Connection, now: datetime, reason: str) -> None:
+def record_skip(connection: sqlite3.Connection, now: datetime, reason: str, table: str = "bond_book_skips") -> None:
     with connection:
-        connection.execute("""
-            INSERT INTO bond_book_skips VALUES (?, ?, 1)
+        connection.execute(f"""
+            INSERT INTO {table} VALUES (?, ?, 1)
             ON CONFLICT(day, reason) DO UPDATE SET count = count + 1
         """, (now.date().isoformat(), reason))
 
 
-def open_position(connection, event_id, market, side, price, fee, now) -> None:
+def open_position(
+    connection, event_id, market, side, price, fee, now,
+    table: str = "bond_book_positions", bands=None,
+    max_open: int | None = None, max_open_per_event: int | None = None,
+) -> None:
     # Serialize the limit check and insert, without holding a lock during HTTP reads.
+    effective_max_open = MAX_OPEN if max_open is None else max_open
+    effective_max_event = MAX_OPEN_PER_EVENT if max_open_per_event is None else max_open_per_event
+    effective_bands = ENTRY_BANDS if bands is None else bands
     with connection:
         connection.execute("BEGIN IMMEDIATE")
-        count, event_count = connection.execute("""
+        count, event_count = connection.execute(f"""
             SELECT COUNT(*), COALESCE(SUM(event_id = ?), 0)
-            FROM bond_book_positions WHERE settled_at IS NULL
+            FROM {table} WHERE settled_at IS NULL
         """, (event_id,)).fetchone()
-        if count >= MAX_OPEN or event_count >= MAX_OPEN_PER_EVENT:
+        if count >= effective_max_open or event_count >= effective_max_event:
             return
-        band = next(label for upper, label in ENTRY_BANDS if price < upper)
-        connection.execute("""
-            INSERT OR IGNORE INTO bond_book_positions
+        band = next(label for upper, label in effective_bands if price < upper)
+        connection.execute(f"""
+            INSERT OR IGNORE INTO {table}
             (market_id, event_id, title, side, entry_band, fill_price, fee, shares, opened_at, ends_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (str(market["id"]), event_id, market["question"], side, band,
@@ -209,9 +216,9 @@ def settled_winner(market: dict) -> str | None:
     return None
 
 
-def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list) -> None:
+def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list, table: str = "bond_book_positions") -> None:
     events = connection.execute(
-        "SELECT DISTINCT event_id FROM bond_book_positions WHERE settled_at IS NULL"
+        f"SELECT DISTINCT event_id FROM {table} WHERE settled_at IS NULL"
     ).fetchall()
     for row in events:
         try:
@@ -229,8 +236,8 @@ def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list
                         continue
                     outcomes = list_field(market["outcomes"])
                     with connection:
-                        connection.execute("""
-                            UPDATE bond_book_positions
+                        connection.execute(f"""
+                            UPDATE {table}
                             SET win = (side = ?), settled_at = ?,
                                 pnl = shares * ((side = ?) - fill_price) - fee
                             WHERE market_id = ? AND event_id = ? AND settled_at IS NULL
