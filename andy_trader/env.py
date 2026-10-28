@@ -39,7 +39,9 @@ def load_env_file(path: Path, environ: MutableMapping[str, str] | None = None) -
             raise ConfigurationError(f"Invalid .env line {line_number}: expected KEY=VALUE")
         key, value = line.split("=", 1)
         key = key.strip()
-        if key.upper() in {'BYBIT_API_KEY', 'BYBIT_API_SECRET', 'ANDY_SENDER_LIVE', 'ANDY_SENDER_NET'}:
+        if key.upper() in {'BYBIT_API_KEY', 'BYBIT_API_SECRET', 'ANDY_SENDER_LIVE', 'ANDY_SENDER_NET',
+                           'POLYMARKET_PRIVATE_KEY', 'POLYMARKET_FUNDER_ADDRESS',
+                           'POLYMARKET_SIGNATURE_TYPE'}:
             continue
         if not key:
             raise ConfigurationError(f"Invalid .env line {line_number}: empty key")
