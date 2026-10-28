@@ -16,7 +16,7 @@ from andy_trader.complete_set import (
 
 SHARES = 100
 MIN_ASK = 0.80
-MAX_ASK = 0.98
+MAX_ASK = 0.95  # cut from 0.98 on 2026-10-28: the 0.95 to 0.98 band lost money over 18 settled positions
 MIN_MARGIN = 0.015
 MAX_OPEN = 30
 MAX_OPEN_PER_EVENT = 2

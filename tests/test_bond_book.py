@@ -80,8 +80,9 @@ def test_open_fee_and_no_duplicate(db):
 @pytest.mark.parametrize("price,size,margin,reason", [
     (0.79, 100, 0.015, "ask_too_low"),
     (0.99, 100, 0.015, "ask_too_high"),
+    (0.96, 100, 0.015, "ask_too_high"),
     (0.9, 99, 0.015, "thin_book"),
-    (0.98, 100, 0.02, "margin_too_small"),
+    (0.95, 100, 0.06, "margin_too_small"),
 ])
 def test_skip_reasons(db, network, monkeypatch, price, size, margin, reason):
     monkeypatch.setattr(bond, "MIN_MARGIN", margin)
@@ -92,7 +93,7 @@ def test_skip_reasons(db, network, monkeypatch, price, size, margin, reason):
 
 
 @pytest.mark.parametrize("price,band", [(0.8, "0.80 to 0.90"), (0.9, "0.90 to 0.95"),
-                                        (0.95, "0.95 to 0.98"), (0.98, "0.95 to 0.98")])
+                                        (0.95, "0.95 to 0.98")])
 def test_entry_boundaries(db, network, price, band):
     network["books"]["m1y"] = book(price)
     bond.run_once(db, now=NOW)
