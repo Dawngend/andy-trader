@@ -11,6 +11,9 @@ POLYMARKET_BOOKS = [
     ("copy_book", "copy_book_positions"),
 ]
 
+# Dawn chose 10,000 dollars as reference budget on 2026-10-29.
+REPORT_BUDGET = 10000.0
+
 
 @dataclass
 class GroupResult:
@@ -50,7 +53,91 @@ def create_snapshot_table(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS total_pnl_snapshots_lookup "
         "ON total_pnl_snapshots(recorded_at, group_name)"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS total_pnl_baseline (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            recorded_at TEXT,
+            total_pnl REAL
+        )
+        """
+    )
     connection.commit()
+
+
+def get_baseline(connection: sqlite3.Connection) -> tuple[str, float] | None:
+    if not _table_exists(connection, "total_pnl_baseline"):
+        return None
+    row = connection.execute(
+        "SELECT recorded_at, total_pnl FROM total_pnl_baseline WHERE id = 1"
+    ).fetchone()
+    if row is None or row[0] is None or row[1] is None:
+        return None
+    return (str(row[0]), float(row[1]))
+
+
+def set_baseline(
+    connection: sqlite3.Connection,
+    total_pnl: float,
+    recorded_at: str,
+) -> None:
+    create_snapshot_table(connection)
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO total_pnl_baseline (id, recorded_at, total_pnl)
+        VALUES (1, ?, ?)
+        """,
+        (recorded_at, total_pnl),
+    )
+    connection.commit()
+
+
+def ensure_baseline(
+    connection: sqlite3.Connection,
+    total_pnl: float,
+    recorded_at: str,
+) -> tuple[str, float]:
+    create_snapshot_table(connection)
+    baseline = get_baseline(connection)
+    if baseline is None:
+        set_baseline(connection, total_pnl, recorded_at)
+        return (recorded_at, total_pnl)
+    return baseline
+
+
+def has_data(
+    connection: sqlite3.Connection,
+    groups: list[GroupResult] | None = None,
+) -> bool:
+    if groups is not None:
+        total_group = next((g for g in groups if g.name == "TOTAL"), None)
+        if total_group is None:
+            return False
+        individual = [g for g in groups if g.name != "TOTAL"]
+        if not individual:
+            return False
+        any_real = any(
+            (g.starting_cash is not None and g.starting_cash > 0)
+            or (g.settled_count is not None and g.settled_count > 0)
+            or (g.open_count is not None and g.open_count > 0)
+            or g.newest_time is not None
+            or (g.note not in ("", "no table yet", "empty account") and not g.note.startswith("no table yet"))
+            for g in individual
+        )
+        if any_real:
+            return True
+
+    if _table_exists(connection, "paper_portfolio_state"):
+        if connection.execute("SELECT 1 FROM paper_portfolio_state LIMIT 1").fetchone():
+            return True
+    if _table_exists(connection, "complete_set_paper_account"):
+        if connection.execute("SELECT 1 FROM complete_set_paper_account WHERE id = 1").fetchone():
+            return True
+    for _, table_name in POLYMARKET_BOOKS:
+        if _table_exists(connection, table_name):
+            if connection.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone():
+                return True
+    return False
 
 
 def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResult]:
@@ -461,6 +548,26 @@ def fetch_recent_totals(
     return [(r[0], float(r[1])) for r in rows]
 
 
+def format_zero_point_section(
+    baseline_time: str | None,
+    total_pnl: float | None,
+    baseline_pnl: float | None,
+) -> str:
+    if baseline_time is None or total_pnl is None or baseline_pnl is None:
+        return "### Since the zero point\n\nnot available"
+    diff = total_pnl - baseline_pnl
+    pct = (diff / REPORT_BUDGET) * 100.0
+    diff_sign = "+" if diff >= 0 else "-"
+    diff_str = f"{diff_sign}${abs(diff):,.2f}"
+    return (
+        "### Since the zero point\n\n"
+        f"Zero point: {baseline_time}\n"
+        f"Budget: {format_money(REPORT_BUDGET)}\n"
+        f"Result since zero point: {diff_str} ({pct:+.2f}%)\n\n"
+        "This is a reporting number only and does not limit what the books trade."
+    )
+
+
 def format_table(groups: list[GroupResult]) -> str:
     header = (
         "| Group | Starting Cash | Value | P&L | Open Cost (at cost) | "
@@ -490,6 +597,15 @@ def format_report(
     total_group = next((g for g in groups if g.name == "TOTAL"), None)
     total_pnl = total_group.pnl if total_group else 0.0
 
+    if not has_data(connection, groups) or total_group is None:
+        zero_point_section = format_zero_point_section(None, None, None)
+    else:
+        baseline = ensure_baseline(connection, total_pnl, recorded_at)
+        baseline_time, baseline_pnl = baseline
+        zero_point_section = format_zero_point_section(
+            baseline_time, total_pnl, baseline_pnl
+        )
+
     changes = compute_pnl_changes(connection, total_pnl, current_time)
     change_line = format_pnl_change_line(changes)
 
@@ -509,6 +625,8 @@ def format_report(
         f"Recorded at: {recorded_at}",
         "",
         table_str,
+        "",
+        zero_point_section,
         "",
         change_line,
         "",

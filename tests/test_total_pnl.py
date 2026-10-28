@@ -5,6 +5,8 @@ import pytest
 
 from andy_trader.store import connect
 from andy_trader.total_pnl import (
+    REPORT_BUDGET,
+    _table_exists,
     collect_all_groups,
     collect_crypto_portfolios,
     collect_complete_set,
@@ -13,10 +15,15 @@ from andy_trader.total_pnl import (
     compute_return_pct,
     compute_pnl_changes,
     create_snapshot_table,
+    ensure_baseline,
     format_pnl_change_line,
     format_report,
     format_table,
+    format_zero_point_section,
+    get_baseline,
+    has_data,
     record_snapshot,
+    set_baseline,
 )
 import run_total_pnl as runner
 
@@ -495,3 +502,107 @@ def test_runner_main_writes_report_and_prints(tmp_path, capsys):
     assert "Change in total pnl:" in content
     assert "Recent Total P&L History (last 24 snapshots)" in content
     assert "TOTAL" in content
+
+
+def test_report_budget_constant():
+    assert REPORT_BUDGET == 10000.0
+
+
+def test_zero_point_baseline_lifecycle(tmp_path):
+    db_path = tmp_path / "baseline_test.db"
+    out_file = tmp_path / "research" / "total_pnl.md"
+    with connect(db_path) as conn:
+        setup_test_database(conn)
+
+    # 1. First run stores baseline and section shows 0.00 and 0.00 percent
+    ret = runner.main(["--database", str(db_path), "--output", str(out_file)])
+    assert ret == 0
+
+    content1 = out_file.read_text(encoding="utf-8")
+    assert "### Since the zero point" in content1
+    assert "Budget: $10,000.00" in content1
+    assert "+$0.00" in content1
+    assert "+0.00%" in content1
+    assert "This is a reporting number only and does not limit what the books trade." in content1
+
+    with connect(db_path) as conn:
+        baseline1 = get_baseline(conn)
+        assert baseline1 is not None
+        assert baseline1[1] == 70.0  # Initial TOTAL P&L from setup_test_database
+
+    # 2. Second run does not overwrite the baseline
+    ret = runner.main(["--database", str(db_path), "--output", str(out_file)])
+    assert ret == 0
+    with connect(db_path) as conn:
+        baseline2 = get_baseline(conn)
+        assert baseline2 == baseline1
+
+    # 3. Later run with a changed TOTAL shows the difference and the right percent of 10,000
+    with connect(db_path) as conn:
+        # Increase equity for trend40 BTC-USD by 50 (from 450 to 500, so trend40 pnl becomes 0, total pnl becomes 120.0)
+        conn.execute(
+            "INSERT INTO paper_equity_curve (predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+            "VALUES ('trend40', 'BTC-USD', 500.0, 0.0, 0.0, 0.0, 500.0, ?)",
+            ((NOW + timedelta(hours=1)).isoformat(),),
+        )
+        conn.commit()
+
+    ret = runner.main(["--database", str(db_path), "--output", str(out_file)])
+    assert ret == 0
+
+    with connect(db_path) as conn:
+        baseline_after_change = get_baseline(conn)
+        # Baseline is still the original 70.0
+        assert baseline_after_change == baseline1
+
+    content2 = out_file.read_text(encoding="utf-8")
+    # Total P&L is now 120.0. Difference from baseline (70.0) is +$50.00.
+    # 50.0 / 10,000.0 = 0.50%
+    assert "+$50.00" in content2
+    assert "+0.50%" in content2
+    assert baseline1[0] in content2
+
+    # 4. --reset-baseline replaces the baseline with current TOTAL P&L and time
+    ret = runner.main(["--database", str(db_path), "--output", str(out_file), "--reset-baseline"])
+    assert ret == 0
+
+    with connect(db_path) as conn:
+        baseline_reset = get_baseline(conn)
+        assert baseline_reset is not None
+        assert baseline_reset[1] == 120.0  # Reset to current total P&L
+        assert baseline_reset[0] != baseline1[0]
+
+    content3 = out_file.read_text(encoding="utf-8")
+    assert "+$0.00" in content3
+    assert "+0.00%" in content3
+
+
+def test_zero_point_no_data_shows_not_available_and_stores_nothing(tmp_path):
+    empty_db = tmp_path / "empty.db"
+    out_file = tmp_path / "research" / "total_pnl.md"
+
+    ret = runner.main(["--database", str(empty_db), "--output", str(out_file)])
+    assert ret == 0
+
+    content = out_file.read_text(encoding="utf-8")
+    assert "### Since the zero point" in content
+    assert "not available" in content
+
+    with connect(empty_db) as conn:
+        baseline = get_baseline(conn)
+        assert baseline is None
+        # No rows stored in snapshot or baseline tables
+        if _table_exists(conn, "total_pnl_baseline"):
+            assert conn.execute("SELECT COUNT(*) FROM total_pnl_baseline").fetchone()[0] == 0
+        if _table_exists(conn, "total_pnl_snapshots"):
+            assert conn.execute("SELECT COUNT(*) FROM total_pnl_snapshots").fetchone()[0] == 0
+
+    # Also verify --reset-baseline with no data does not store anything
+    ret2 = runner.main(["--database", str(empty_db), "--output", str(out_file), "--reset-baseline"])
+    assert ret2 == 0
+    content2 = out_file.read_text(encoding="utf-8")
+    assert "### Since the zero point" in content2
+    assert "not available" in content2
+
+    with connect(empty_db) as conn:
+        assert get_baseline(conn) is None
