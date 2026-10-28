@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import groupby
 import math
 from pathlib import Path
 import sqlite3
@@ -117,7 +118,7 @@ def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list
             errors.append({"condition_id": cid, "error": str(exc)})
             continue
         for market in markets:
-            if market.get("conditionId") != cid and market.get("condition_id") != cid and len(markets) != 1:
+            if market.get("conditionId") != cid and market.get("condition_id") != cid:
                 continue
             try:
                 winner = settled_winner(market)
@@ -183,71 +184,83 @@ def copy_wallet_trades(
 
     candidates.sort(key=lambda r: int(r["timestamp"]))
 
-    for trade in candidates:
-        tx_hash = str(trade.get("transactionHash", ""))
-        token_id = str(trade.get("asset", ""))
-        if not tx_hash or not token_id:
-            continue
+    last_safe_ts = stored_start
+    had_error = False
 
-        already_seen = connection.execute(
-            "SELECT 1 FROM copy_book_positions WHERE wallet = ? AND tx_hash = ? AND token_id = ?",
-            (address, tx_hash, token_id),
-        ).fetchone() is not None
-        if already_seen:
-            continue
+    for ts, group in groupby(candidates, key=lambda r: int(r["timestamp"])):
+        for trade in group:
+            tx_hash = str(trade.get("transactionHash", ""))
+            token_id = str(trade.get("asset", ""))
+            if not tx_hash or not token_id:
+                continue
 
-        open_count = connection.execute(
-            "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",
-            (wallet_name,),
-        ).fetchone()[0]
-        if open_count >= MAX_OPEN:
-            record_skip(connection, now, wallet_name, "max_open")
-            continue
+            already_seen = connection.execute(
+                "SELECT 1 FROM copy_book_positions WHERE wallet = ? AND tx_hash = ? AND token_id = ?",
+                (address, tx_hash, token_id),
+            ).fetchone() is not None
+            if already_seen:
+                continue
 
-        try:
-            book = fetch_book(token_id)
-        except DATA_ERRORS as exc:
-            errors.append({"wallet_name": wallet_name, "token_id": token_id, "error": str(exc)})
-            continue
+            open_count = connection.execute(
+                "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",
+                (wallet_name,),
+            ).fetchone()[0]
+            if open_count >= MAX_OPEN:
+                record_skip(connection, now, wallet_name, "max_open")
+                continue
 
-        fill = walk_ask_book(book, SHARES, fee_rate=CRYPTO_TAKER_FEE_RATE)
-        if not fill.complete:
-            record_skip(connection, now, wallet_name, "thin_book")
-            continue
+            try:
+                book = fetch_book(token_id)
+            except DATA_ERRORS as exc:
+                errors.append({"wallet_name": wallet_name, "token_id": token_id, "error": str(exc)})
+                had_error = True
+                break
 
-        fill_price = fill.fill_cost / SHARES
-        fee = fill.fee_cost
+            fill = walk_ask_book(book, SHARES, fee_rate=CRYPTO_TAKER_FEE_RATE)
+            if not fill.complete:
+                record_skip(connection, now, wallet_name, "thin_book")
+                continue
 
-        if fill_price < MIN_FILL:
-            record_skip(connection, now, wallet_name, "fill_too_low")
-            continue
-        if fill_price >= MAX_FILL:
-            record_skip(connection, now, wallet_name, "fill_too_high")
-            continue
+            fill_price = fill.fill_cost / SHARES
+            fee = fill.fee_cost
 
-        their_price = float(trade["price"])
-        their_timestamp = int(trade["timestamp"])
-        delay_seconds = float(now.timestamp() - their_timestamp)
-        condition_id = str(trade.get("conditionId", ""))
-        title = str(trade.get("title", ""))
-        outcome = str(trade.get("outcome", ""))
+            if fill_price < MIN_FILL:
+                record_skip(connection, now, wallet_name, "fill_too_low")
+                continue
+            if fill_price >= MAX_FILL:
+                record_skip(connection, now, wallet_name, "fill_too_high")
+                continue
 
-        with connection:
-            connection.execute("""
-                INSERT OR IGNORE INTO copy_book_positions (
-                    wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
-                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                wallet_name, address, tx_hash, token_id, condition_id, title, outcome,
-                their_price, their_timestamp, fill_price, fee, SHARES, now.isoformat(), delay_seconds,
-            ))
+            their_price = float(trade["price"])
+            their_timestamp = int(trade["timestamp"])
+            delay_seconds = float(now.timestamp() - their_timestamp)
+            condition_id = str(trade.get("conditionId", ""))
+            title = str(trade.get("title", ""))
+            outcome = str(trade.get("outcome", ""))
 
-    if newest_seen is not None and newest_seen > stored_start:
+            with connection:
+                connection.execute("""
+                    INSERT OR IGNORE INTO copy_book_positions (
+                        wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                        their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    wallet_name, address, tx_hash, token_id, condition_id, title, outcome,
+                    their_price, their_timestamp, fill_price, fee, SHARES, now.isoformat(), delay_seconds,
+                ))
+
+        if had_error:
+            break
+        last_safe_ts = ts
+
+    if not had_error and newest_seen is not None and newest_seen > last_safe_ts:
+        last_safe_ts = newest_seen
+
+    if last_safe_ts > stored_start:
         with connection:
             connection.execute(
                 "UPDATE copy_book_cursor SET newest_timestamp = ? WHERE wallet_name = ?",
-                (newest_seen, wallet_name),
+                (last_safe_ts, wallet_name),
             )
 
 
@@ -334,6 +347,14 @@ def format_report(connection: sqlite3.Connection) -> str:
         delays = [float(r["delay_seconds"]) for r in all_wallet_rows if r.get("delay_seconds") is not None]
         median_delay = f"{statistics.median(delays):.1f}s" if delays else "n/a"
         lines.append(f"Median delay_seconds: {median_delay}")
+
+        price_diffs = [
+            float(r["fill_price"]) - float(r["their_price"])
+            for r in all_wallet_rows
+            if r.get("fill_price") is not None and r.get("their_price") is not None
+        ]
+        avg_diff = f"{average(price_diffs):+.4f}" if price_diffs else "n/a"
+        lines.append(f"Average price difference (fill - their): {avg_diff}")
 
         low, high = compute_bootstrap_interval([float(r["pnl"]) for r in settled_rows])
         interval = f"[${low:+.2f}, ${high:+.2f}]" if settled_rows else "n/a"

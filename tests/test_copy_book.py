@@ -310,6 +310,7 @@ def test_format_report(db):
     assert "thin_book: 1" in rep
     assert "Worst loss: $-90.63" in rep
     assert "Median delay_seconds: 6.0s" in rep
+    assert "Average price difference (fill - their): +0.0000" in rep
     assert "Bootstrap 95 percent interval for average pnl per position:" in rep
     assert "Verdict: not enough settled positions yet (2 of 100)" in rep
     assert "By strategy slice" in rep
@@ -331,3 +332,124 @@ def test_runner_journal_and_lock(db, network, tmp_path, monkeypatch, capsys):
     assert "book_reads" in pass_line
     assert "requests" in pass_line
     assert not runner.LOCK_PATH.exists()
+
+
+def test_cursor_advancement_on_transient_order_book_error(db, network, monkeypatch):
+    import urllib.error
+
+    # Pass 1: establishes starting point at 1000
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    # Pass 2: activity has trade 1 (ts 1010, tok1) and trade 2 (ts 1020, tok2)
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx1", asset="tok1", ts=1010),
+        make_trade(tx="tx2", asset="tok2", ts=1020),
+    ]
+    network["books"]["tok1"] = make_book(price=0.90, size=100)
+
+    # Monkeypatch _http_json to raise for tok2
+    original_http = copy._http_json
+
+    def flaky_http(url, timeout):
+        if "tok2" in url:
+            raise urllib.error.URLError("temporary network error")
+        return original_http(url, timeout)
+
+    monkeypatch.setattr(copy, "_http_json", flaky_http)
+
+    errors = copy.run_once(db, now=NOW)
+    assert len(errors) == 1
+    assert "temporary network error" in errors[0]["error"]
+
+    # Position for tx1 opened
+    rows = positions(db)
+    assert len(rows) == 1
+    assert rows[0]["tx_hash"] == "tx1"
+
+    # Cursor must ONLY advance to 1010, NOT 1020!
+    cursor_val = db.execute(
+        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'sharky6999'"
+    ).fetchone()[0]
+    assert cursor_val == 1010
+
+    # Pass 3: network restored, provide book for tok2
+    monkeypatch.setattr(copy, "_http_json", original_http)
+    network["books"]["tok2"] = make_book(price=0.90, size=100)
+
+    errors2 = copy.run_once(db, now=NOW)
+    assert errors2 == []
+
+    # tx2 successfully copied, tx1 not duplicated
+    rows2 = positions(db)
+    assert len(rows2) == 2
+    hashes = {r["tx_hash"] for r in rows2}
+    assert hashes == {"tx1", "tx2"}
+
+    cursor_val_after = db.execute(
+        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'sharky6999'"
+    ).fetchone()[0]
+    assert cursor_val_after == 1020
+
+
+def test_settlement_requires_exact_condition_id(db, network):
+    cid = "0xcid_exact"
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "sharky6999", copy.WALLETS["sharky6999"], "tx_exact", "tok_y", cid,
+            "Will BTC reach 150k?", "Yes", 0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
+        ))
+
+    # Single market returned by Gamma, but with a different conditionId
+    network["markets"][cid] = [{
+        "id": "m_diff",
+        "conditionId": "0xunrelated_condition_id",
+        "closed": True,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["1", "0"]',
+    }]
+
+    copy.run_once(db, now=NOW)
+
+    row = db.execute("SELECT settled_at, win FROM copy_book_positions WHERE tx_hash='tx_exact'").fetchone()
+    assert row[0] is None
+    assert row[1] is None
+
+    # Now with the matching conditionId
+    network["markets"][cid] = [{
+        "id": "m_match",
+        "conditionId": cid,
+        "closed": True,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["1", "0"]',
+    }]
+
+    copy.run_once(db, now=NOW)
+
+    row_settled = db.execute("SELECT settled_at, win FROM copy_book_positions WHERE tx_hash='tx_exact'").fetchone()
+    assert row_settled[0] is not None
+    assert row_settled[1] == 1
+
+
+def test_format_report_price_difference(db):
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds,
+                settled_at, win, pnl
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "dromedaryy", copy.WALLETS["dromedaryy"], "tx_diff", "tok1", "c1",
+            "Will BTC reach 100k?", "Yes", 0.90, 1000, 0.92, 0.63, 100, NOW.isoformat(), 5.0,
+            NOW.isoformat(), 1, 7.37,
+        ))
+
+    rep = copy.format_report(db)
+    assert "Wallet: dromedaryy" in rep
+    assert "Average price difference (fill - their): +0.0200" in rep
