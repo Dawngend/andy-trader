@@ -66,11 +66,12 @@ def create_snapshot_table(connection: sqlite3.Connection) -> None:
 
 
 def get_baseline(connection: sqlite3.Connection) -> tuple[str, float] | None:
-    if not _table_exists(connection, "total_pnl_baseline"):
+    try:
+        row = connection.execute(
+            "SELECT recorded_at, total_pnl FROM total_pnl_baseline WHERE id = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
         return None
-    row = connection.execute(
-        "SELECT recorded_at, total_pnl FROM total_pnl_baseline WHERE id = 1"
-    ).fetchone()
     if row is None or row[0] is None or row[1] is None:
         return None
     return (str(row[0]), float(row[1]))
@@ -81,7 +82,6 @@ def set_baseline(
     total_pnl: float,
     recorded_at: str,
 ) -> None:
-    create_snapshot_table(connection)
     connection.execute(
         """
         INSERT OR REPLACE INTO total_pnl_baseline (id, recorded_at, total_pnl)
@@ -97,47 +97,11 @@ def ensure_baseline(
     total_pnl: float,
     recorded_at: str,
 ) -> tuple[str, float]:
-    create_snapshot_table(connection)
     baseline = get_baseline(connection)
     if baseline is None:
         set_baseline(connection, total_pnl, recorded_at)
         return (recorded_at, total_pnl)
     return baseline
-
-
-def has_data(
-    connection: sqlite3.Connection,
-    groups: list[GroupResult] | None = None,
-) -> bool:
-    if groups is not None:
-        total_group = next((g for g in groups if g.name == "TOTAL"), None)
-        if total_group is None:
-            return False
-        individual = [g for g in groups if g.name != "TOTAL"]
-        if not individual:
-            return False
-        any_real = any(
-            (g.starting_cash is not None and g.starting_cash > 0)
-            or (g.settled_count is not None and g.settled_count > 0)
-            or (g.open_count is not None and g.open_count > 0)
-            or g.newest_time is not None
-            or (g.note not in ("", "no table yet", "empty account") and not g.note.startswith("no table yet"))
-            for g in individual
-        )
-        if any_real:
-            return True
-
-    if _table_exists(connection, "paper_portfolio_state"):
-        if connection.execute("SELECT 1 FROM paper_portfolio_state LIMIT 1").fetchone():
-            return True
-    if _table_exists(connection, "complete_set_paper_account"):
-        if connection.execute("SELECT 1 FROM complete_set_paper_account WHERE id = 1").fetchone():
-            return True
-    for _, table_name in POLYMARKET_BOOKS:
-        if _table_exists(connection, table_name):
-            if connection.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone():
-                return True
-    return False
 
 
 def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResult]:
@@ -595,18 +559,18 @@ def format_report(
     table_str = format_table(groups)
 
     total_group = next((g for g in groups if g.name == "TOTAL"), None)
-    total_pnl = total_group.pnl if total_group else 0.0
+    total_pnl = total_group.pnl if total_group is not None else None
 
-    if not has_data(connection, groups) or total_group is None:
+    baseline = get_baseline(connection) if total_pnl is not None else None
+    if baseline is None or total_pnl is None:
         zero_point_section = format_zero_point_section(None, None, None)
     else:
-        baseline = ensure_baseline(connection, total_pnl, recorded_at)
         baseline_time, baseline_pnl = baseline
         zero_point_section = format_zero_point_section(
             baseline_time, total_pnl, baseline_pnl
         )
 
-    changes = compute_pnl_changes(connection, total_pnl, current_time)
+    changes = compute_pnl_changes(connection, total_pnl or 0.0, current_time)
     change_line = format_pnl_change_line(changes)
 
     recent_totals = fetch_recent_totals(connection, limit=24)

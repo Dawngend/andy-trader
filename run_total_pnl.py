@@ -12,7 +12,6 @@ from andy_trader.total_pnl import (
     ensure_baseline,
     format_report,
     format_table,
-    has_data,
     record_snapshot,
     set_baseline,
 )
@@ -39,11 +38,12 @@ def main(argv: list[str] | None = None) -> int:
 
     with connect(db_path) as connection:
         groups = collect_all_groups(connection)
-        total_group = next((g for g in groups if g.name == "TOTAL"), None)
-        total_pnl = total_group.pnl if total_group else 0.0
+        record_snapshot(connection, groups, recorded_at=now_iso)
 
-        if has_data(connection, groups):
-            record_snapshot(connection, groups, recorded_at=now_iso)
+        total_group = next((g for g in groups if g.name == "TOTAL"), None)
+        total_pnl = total_group.pnl if total_group is not None else None
+
+        if total_pnl is not None:
             if args.reset_baseline:
                 set_baseline(connection, total_pnl, recorded_at=now_iso)
             else:

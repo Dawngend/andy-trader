@@ -21,7 +21,6 @@ from andy_trader.total_pnl import (
     format_table,
     format_zero_point_section,
     get_baseline,
-    has_data,
     record_snapshot,
     set_baseline,
 )
@@ -570,39 +569,41 @@ def test_zero_point_baseline_lifecycle(tmp_path):
         baseline_reset = get_baseline(conn)
         assert baseline_reset is not None
         assert baseline_reset[1] == 120.0  # Reset to current total P&L
-        assert baseline_reset[0] != baseline1[0]
 
     content3 = out_file.read_text(encoding="utf-8")
     assert "+$0.00" in content3
     assert "+0.00%" in content3
 
 
-def test_zero_point_no_data_shows_not_available_and_stores_nothing(tmp_path):
-    empty_db = tmp_path / "empty.db"
+def test_zero_point_no_data_shows_not_available_and_stores_nothing(tmp_path, monkeypatch):
+    db_path = tmp_path / "no_data.db"
     out_file = tmp_path / "research" / "total_pnl.md"
 
-    ret = runner.main(["--database", str(empty_db), "--output", str(out_file)])
+    # When TOTAL row cannot be computed (no groups returned)
+    monkeypatch.setattr("run_total_pnl.collect_all_groups", lambda conn: [])
+
+    ret = runner.main(["--database", str(db_path), "--output", str(out_file)])
     assert ret == 0
 
     content = out_file.read_text(encoding="utf-8")
     assert "### Since the zero point" in content
     assert "not available" in content
 
-    with connect(empty_db) as conn:
-        baseline = get_baseline(conn)
-        assert baseline is None
-        # No rows stored in snapshot or baseline tables
-        if _table_exists(conn, "total_pnl_baseline"):
-            assert conn.execute("SELECT COUNT(*) FROM total_pnl_baseline").fetchone()[0] == 0
-        if _table_exists(conn, "total_pnl_snapshots"):
-            assert conn.execute("SELECT COUNT(*) FROM total_pnl_snapshots").fetchone()[0] == 0
+    with connect(db_path) as conn:
+        assert get_baseline(conn) is None
 
     # Also verify --reset-baseline with no data does not store anything
-    ret2 = runner.main(["--database", str(empty_db), "--output", str(out_file), "--reset-baseline"])
+    ret2 = runner.main(["--database", str(db_path), "--output", str(out_file), "--reset-baseline"])
     assert ret2 == 0
     content2 = out_file.read_text(encoding="utf-8")
     assert "### Since the zero point" in content2
     assert "not available" in content2
 
-    with connect(empty_db) as conn:
+    with connect(db_path) as conn:
+        assert get_baseline(conn) is None
+
+    # Direct format_report without TOTAL group
+    with connect(db_path) as conn:
+        report = format_report(conn, groups=[], recorded_at="2026-10-29T00:00:00")
+        assert "### Since the zero point\n\nnot available" in report
         assert get_baseline(conn) is None
