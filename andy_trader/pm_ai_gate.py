@@ -23,7 +23,13 @@ from andy_trader.price_target_book import POSITIONS_TABLE as PRICE_TARGET_POSITI
 
 AGY_MODEL = "gemini-3.8-flash-high"
 AGY_TIMEOUT_SECONDS = 70
-FIXED_PROMPT = "Read facts.txt and follow it"
+# Tested with the real agy: a prompt that makes it read a file, or that mentions a market it could look
+# up, makes it ask for a tool permission that headless mode cannot grant, and it then prints nothing.
+# Saying plainly that it has no tools makes it answer from the text.
+TOOL_NOTICE = (
+    "You have no tools and no internet access, so do not run any command "
+    "and do not try to look anything up. Judge only from the facts given."
+)
 DECISIONS_TABLE = "pm_ai_gate_decisions"
 MAX_CANDIDATES_DEFAULT = 10
 MAX_PASS_MINUTES = 8
@@ -182,15 +188,16 @@ def run_agy(
 
 
 def ask_model(prompt_text: str, runner=run_agy) -> dict[str, str] | None:
-    """Ask agy model for a verdict in an isolated temporary directory."""
+    """Ask agy model for a verdict, run from an empty temporary directory."""
     executable = shutil.which("agy")
     if not executable:
         return None
-    command = [executable, "--model", AGY_MODEL, "--sandbox", "-p", FIXED_PROMPT]
+    # The facts are already sanitised to letters, digits, spaces and . , : ; ? - /, so they are safe
+    # on one command line; newlines become spaces.
+    argument = TOOL_NOTICE + " " + " ".join(prompt_text.split())
+    command = [executable, "--model", AGY_MODEL, "--sandbox", "-p", argument]
     try:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            facts_path = Path(temp_dir) / "facts.txt"
-            facts_path.write_text(prompt_text, encoding="utf-8")
             returncode, stdout = runner(command, cwd=temp_dir, timeout=AGY_TIMEOUT_SECONDS)
     except Exception:
         return None

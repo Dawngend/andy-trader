@@ -164,25 +164,28 @@ def test_ask_model_command_line_and_tempdir(monkeypatch):
     def fake_runner(cmd, cwd, timeout):
         captured_cmd.extend(cmd)
         captured_cwd.append(cwd)
-        assert os.listdir(cwd) == ["facts.txt"]
+        assert os.listdir(cwd) == []
         cwd_path = Path(cwd).resolve()
         assert REPO_ROOT.resolve() not in cwd_path.parents
         assert cwd_path != REPO_ROOT.resolve()
-        facts_file = Path(cwd) / "facts.txt"
-        assert facts_file.exists()
-        assert "book: bond_book" in facts_file.read_text(encoding="utf-8")
         return 0, '{"verdict": "approve", "reason": "Looks good"}'
 
-    res = pm_ai_gate.ask_model("book: bond_book", runner=fake_runner)
+    res = pm_ai_gate.ask_model("book: bond_book\nside: Yes", runner=fake_runner)
     assert res == {"verdict": "approve", "reason": "Looks good"}
-    assert captured_cmd == [
+    assert captured_cmd[:5] == [
         "C:\\bin\\agy.cmd",
         "--model",
         pm_ai_gate.AGY_MODEL,
         "--sandbox",
         "-p",
-        pm_ai_gate.FIXED_PROMPT,
     ]
+    argument = captured_cmd[5]
+    assert len(captured_cmd) == 6
+    # the prompt tells the model it has no tools, carries the facts on one line, and has no
+    # quote, newline or shell metacharacter
+    assert argument.startswith(pm_ai_gate.TOOL_NOTICE)
+    assert "book: bond_book side: Yes" in argument
+    assert not set(argument) & set('"\'\n%&|^<>')
     # cwd was a temporary directory outside the repo
     temp_dir_used = Path(captured_cwd[0])
     assert not temp_dir_used.exists()  # cleaned up after call
