@@ -135,6 +135,23 @@ def format_board(connection: sqlite3.Connection) -> str:
         if review:
             reviews.append("review: price_target_no_book")
 
+    # 4. Copy book per wallet (skip without error if table does not exist)
+    if _table_exists(connection, "copy_book_positions"):
+        settled_copy, open_copy = _fetch_positions(connection, "copy_book_positions")
+        from andy_trader.copy_book import WALLETS
+        wallet_names = list(WALLETS.keys())
+        for r in settled_copy + open_copy:
+            w = r.get("wallet_name")
+            if w and w not in wallet_names:
+                wallet_names.append(w)
+        for w in wallet_names:
+            w_settled = [r for r in settled_copy if r.get("wallet_name") == w]
+            w_open = [r for r in open_copy if r.get("wallet_name") == w]
+            row_str, review = _strategy_stats(f"copy_{w}", w_settled, w_open)
+            rows_to_display.append(row_str)
+            if review:
+                reviews.append(f"review: copy_{w}")
+
     lines = [HEADER, SEPARATOR, *rows_to_display]
     if reviews:
         lines.append("")

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from andy_trader import bond_book as bond
+from andy_trader import copy_book as copy
 from andy_trader import price_target_book as pt
 from andy_trader.store import connect
 from andy_trader.strategy_board import format_board
@@ -211,3 +212,57 @@ def test_runner_writes_output_and_prints(tmp_path, capsys, monkeypatch):
     ret_default = runner.main(["--database", str(db_path)])
     assert ret_default == 0
     assert default_target.exists()
+
+
+def test_board_with_copy_book_positions(tmp_path):
+    db_path = tmp_path / "copy_board_test.db"
+    with connect(db_path) as conn:
+        copy.initialize_copy_book(conn)
+
+        # sharky6999: 1 settled (win) and 1 open
+        with conn:
+            conn.execute("""
+                INSERT INTO copy_book_positions (
+                    wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds,
+                    settled_at, win, pnl
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "sharky6999", copy.WALLETS["sharky6999"], "0xtx1", "tok1", "c1", "Title 1", "Yes",
+                0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
+                NOW.isoformat(), 1, 9.37,
+            ))
+            conn.execute("""
+                INSERT INTO copy_book_positions (
+                    wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "sharky6999", copy.WALLETS["sharky6999"], "0xtx2", "tok2", "c2", "Title 2", "No",
+                0.80, 1010, 0.85, 0.60, 100, NOW.isoformat(), 3.0,
+            ))
+
+        board = format_board(conn)
+
+    lines = [line.strip() for line in board.splitlines() if line.strip() and not line.startswith("---")]
+    rows_by_strat = {}
+    for line in lines[1:]:
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            rows_by_strat[parts[0]] = parts
+
+    assert "copy_sharky6999" in rows_by_strat
+    assert "copy_dromedaryy" in rows_by_strat
+
+    sharky = rows_by_strat["copy_sharky6999"]
+    assert sharky[1] == "1"  # settled
+    assert sharky[2] == "1"  # open
+    assert sharky[3] == "1"  # wins
+    assert sharky[4] == "100.00%"
+    assert sharky[5] == "0.9000"
+    assert sharky[8] == "collecting"
+
+    dromedaryy = rows_by_strat["copy_dromedaryy"]
+    assert dromedaryy[1] == "0"
+    assert dromedaryy[2] == "0"
+    assert dromedaryy[8] == "collecting"
