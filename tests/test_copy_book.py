@@ -367,11 +367,9 @@ def test_cursor_advancement_on_transient_order_book_error(db, network, monkeypat
     assert len(rows) == 1
     assert rows[0]["tx_hash"] == "tx1"
 
-    # Cursor must ONLY advance to 1010, NOT 1020!
-    cursor_val = db.execute(
-        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'sharky6999'"
-    ).fetchone()[0]
-    assert cursor_val == 1010
+    # The failed trade is not marked as seen, so it is tried again.
+    seen = {tuple(r) for r in db.execute("SELECT tx_hash, token_id FROM copy_book_seen").fetchall()}
+    assert seen == {("tx1", "tok1")}
 
     # Pass 3: network restored, provide book for tok2
     monkeypatch.setattr(copy, "_http_json", original_http)
@@ -386,10 +384,38 @@ def test_cursor_advancement_on_transient_order_book_error(db, network, monkeypat
     hashes = {r["tx_hash"] for r in rows2}
     assert hashes == {"tx1", "tx2"}
 
-    cursor_val_after = db.execute(
-        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'sharky6999'"
-    ).fetchone()[0]
-    assert cursor_val_after == 1020
+    seen_after = {tuple(r) for r in db.execute("SELECT tx_hash, token_id FROM copy_book_seen").fetchall()}
+    assert seen_after == {("tx1", "tok1"), ("tx2", "tok2")}
+
+
+def test_late_trade_with_older_timestamp_is_copied(db, network):
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    # Trade B (ts 1100) is seen first; trade A (ts 1050) only shows up in a later pass.
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx_b", asset="tok2", ts=1100)]
+    copy.run_once(db, now=NOW)
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_b", asset="tok2", ts=1100),
+        make_trade(tx="tx_a", asset="tok1", ts=1050),
+    ]
+    copy.run_once(db, now=NOW)
+
+    assert {r["tx_hash"] for r in positions(db)} == {"tx_a", "tx_b"}
+
+
+def test_skipped_trade_is_not_counted_twice(db, network):
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx_hi", asset="tok_hi", ts=1050)]
+    network["books"]["tok_hi"] = make_book(price=0.99, size=100)
+    copy.run_once(db, now=NOW)
+    copy.run_once(db, now=NOW)
+
+    skips = dict(db.execute("SELECT reason, count FROM copy_book_skips WHERE wallet_name='sharky6999'").fetchall())
+    assert skips == {"fill_too_high": 1}
+    assert positions(db) == []
 
 
 def test_settlement_requires_exact_condition_id(db, network):

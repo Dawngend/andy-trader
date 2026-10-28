@@ -2,10 +2,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from itertools import groupby
-import json
-import math
-from pathlib import Path
 import sqlite3
 import statistics
 from typing import Callable
@@ -80,16 +76,17 @@ def initialize_copy_book(connection: sqlite3.Connection) -> None:
     connection.execute("""
         CREATE TABLE IF NOT EXISTS copy_book_cursor (
             wallet_name TEXT PRIMARY KEY,
-            newest_timestamp INTEGER NOT NULL,
-            processed_keys TEXT DEFAULT '',
-            starting_timestamp INTEGER DEFAULT NULL
+            newest_timestamp INTEGER NOT NULL
         )
     """)
-    cursor_cols = [c[1] for c in connection.execute("PRAGMA table_info(copy_book_cursor)").fetchall()]
-    if "processed_keys" not in cursor_cols:
-        connection.execute("ALTER TABLE copy_book_cursor ADD COLUMN processed_keys TEXT DEFAULT ''")
-    if "starting_timestamp" not in cursor_cols:
-        connection.execute("ALTER TABLE copy_book_cursor ADD COLUMN starting_timestamp INTEGER DEFAULT NULL")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS copy_book_seen (
+            wallet_name TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            PRIMARY KEY (wallet_name, tx_hash, token_id)
+        )
+    """)
     connection.commit()
 
 
@@ -148,6 +145,14 @@ def settle_positions(connection: sqlite3.Connection, now: datetime, errors: list
                 errors.append({"condition_id": cid, "error": str(exc)})
 
 
+def mark_seen(connection: sqlite3.Connection, wallet_name: str, tx_hash: str, token_id: str) -> None:
+    with connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO copy_book_seen (wallet_name, tx_hash, token_id) VALUES (?, ?, ?)",
+            (wallet_name, tx_hash, token_id),
+        )
+
+
 def copy_wallet_trades(
     connection: sqlite3.Connection,
     wallet_name: str,
@@ -159,160 +164,98 @@ def copy_wallet_trades(
 ) -> None:
     global REQUEST_COUNT
     reader = reader or PublicReader()
-    cursor_row = connection.execute(
-        "SELECT newest_timestamp, processed_keys, starting_timestamp FROM copy_book_cursor WHERE wallet_name = ?",
-        (wallet_name,),
-    ).fetchone()
-
     REQUEST_COUNT += 1
     activity = reader.get("activity", user=address, limit=500)
     if not isinstance(activity, list):
         return
 
-    timestamps = [int(r["timestamp"]) for r in activity if "timestamp" in r and r.get("timestamp") is not None]
-    newest_seen = max(timestamps) if timestamps else None
-
-    # First pass: store the newest timestamp seen and copy nothing.
-    if cursor_row is None:
-        if newest_seen is not None:
+    start = connection.execute(
+        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = ?", (wallet_name,),
+    ).fetchone()
+    if start is None:
+        # First pass: remember the newest trade as the starting point and copy nothing.
+        timestamps = [int(row["timestamp"]) for row in activity if row.get("timestamp") is not None]
+        if timestamps:
             with connection:
                 connection.execute(
-                    "INSERT INTO copy_book_cursor (wallet_name, newest_timestamp, processed_keys, starting_timestamp) "
-                    "VALUES (?, ?, ?, ?)",
-                    (wallet_name, newest_seen, "[]", newest_seen),
+                    "INSERT INTO copy_book_cursor (wallet_name, newest_timestamp) VALUES (?, ?)",
+                    (wallet_name, max(timestamps)),
                 )
         return
+    starting_timestamp = start[0]
 
-    stored_cursor = cursor_row[0] if isinstance(cursor_row, (list, tuple)) else cursor_row["newest_timestamp"]
-    raw_keys = cursor_row[1] if isinstance(cursor_row, (list, tuple)) else cursor_row["processed_keys"]
-    stored_start = cursor_row[2] if isinstance(cursor_row, (list, tuple)) else cursor_row["starting_timestamp"]
-    if stored_start is None:
-        stored_start = stored_cursor
-
-    try:
-        processed_keys = set(json.loads(raw_keys)) if raw_keys else set()
-    except (ValueError, TypeError):
-        processed_keys = set()
-
-    candidates = []
+    seen = {
+        (row[0], row[1])
+        for row in connection.execute(
+            "SELECT tx_hash, token_id FROM copy_book_seen WHERE wallet_name = ?", (wallet_name,),
+        )
+    }
+    new_trades = []
     for row in activity:
         if row.get("type") != "TRADE" or row.get("side") != "BUY":
             continue
+        if int(row.get("timestamp") or 0) <= starting_timestamp:
+            continue
+        key = (str(row.get("transactionHash", "")), str(row.get("asset", "")))
+        if all(key) and key not in seen:
+            new_trades.append((key, row))
+    new_trades.sort(key=lambda item: int(item[1]["timestamp"]))
+
+    # A trade is marked seen once it was copied or skipped for a counted reason. A failed
+    # order book read is not marked, so the trade is tried again on the next pass.
+    for (tx_hash, token_id), trade in new_trades:
+        if (tx_hash, token_id) in seen:
+            continue
+        seen.add((tx_hash, token_id))
+
+        open_count = connection.execute(
+            "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",
+            (wallet_name,),
+        ).fetchone()[0]
+        if open_count >= MAX_OPEN:
+            record_skip(connection, now or _utc_now(), wallet_name, "max_open")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
+            continue
+
         try:
-            ts = int(row["timestamp"])
-        except (ValueError, TypeError, KeyError):
+            book = fetch_book(token_id)
+        except DATA_ERRORS as exc:
+            errors.append({"wallet_name": wallet_name, "token_id": token_id, "error": str(exc)})
+            seen.discard((tx_hash, token_id))
             continue
-        if ts <= stored_start:
+
+        fill_time = clock() if clock is not None else (_utc_now() if now is None else now)
+
+        fill = walk_ask_book(book, SHARES, fee_rate=CRYPTO_TAKER_FEE_RATE)
+        if not fill.complete:
+            record_skip(connection, fill_time, wallet_name, "thin_book")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
-        if ts < stored_cursor:
+
+        fill_price = fill.fill_cost / SHARES
+        if fill_price < MIN_FILL:
+            record_skip(connection, fill_time, wallet_name, "fill_too_low")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
-        tx_hash = str(row.get("transactionHash", ""))
-        token_id = str(row.get("asset", ""))
-        if not tx_hash or not token_id:
+        if fill_price >= MAX_FILL:
+            record_skip(connection, fill_time, wallet_name, "fill_too_high")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
-        key = f"{tx_hash}:{token_id}"
-        if ts == stored_cursor and key in processed_keys:
-            continue
-        candidates.append(row)
 
-    candidates.sort(key=lambda r: int(r["timestamp"]))
-
-    last_safe_ts = stored_cursor
-    current_processed_keys = set(processed_keys)
-    had_error = False
-
-    for ts, group in groupby(candidates, key=lambda r: int(r["timestamp"])):
-        group_keys = set(current_processed_keys) if ts == last_safe_ts else set()
-
-        for trade in group:
-            tx_hash = str(trade.get("transactionHash", ""))
-            token_id = str(trade.get("asset", ""))
-            if not tx_hash or not token_id:
-                continue
-            key = f"{tx_hash}:{token_id}"
-
-            already_seen = connection.execute(
-                "SELECT 1 FROM copy_book_positions WHERE wallet = ? AND tx_hash = ? AND token_id = ?",
-                (address, tx_hash, token_id),
-            ).fetchone() is not None
-            if already_seen:
-                group_keys.add(key)
-                continue
-
-            open_count = connection.execute(
-                "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",
-                (wallet_name,),
-            ).fetchone()[0]
-            if open_count >= MAX_OPEN:
-                record_skip(connection, now or _utc_now(), wallet_name, "max_open")
-                group_keys.add(key)
-                continue
-
-            try:
-                book = fetch_book(token_id)
-            except DATA_ERRORS as exc:
-                errors.append({"wallet_name": wallet_name, "token_id": token_id, "error": str(exc)})
-                had_error = True
-                break
-
-            fill_time = clock() if clock is not None else (_utc_now() if now is None else now)
-
-            fill = walk_ask_book(book, SHARES, fee_rate=CRYPTO_TAKER_FEE_RATE)
-            if not fill.complete:
-                record_skip(connection, fill_time, wallet_name, "thin_book")
-                group_keys.add(key)
-                continue
-
-            fill_price = fill.fill_cost / SHARES
-            fee = fill.fee_cost
-
-            if fill_price < MIN_FILL:
-                record_skip(connection, fill_time, wallet_name, "fill_too_low")
-                group_keys.add(key)
-                continue
-            if fill_price >= MAX_FILL:
-                record_skip(connection, fill_time, wallet_name, "fill_too_high")
-                group_keys.add(key)
-                continue
-
-            their_price = float(trade["price"])
-            their_timestamp = int(trade["timestamp"])
-            delay_seconds = float(fill_time.timestamp() - their_timestamp)
-            condition_id = str(trade.get("conditionId", ""))
-            title = str(trade.get("title", ""))
-            outcome = str(trade.get("outcome", ""))
-
-            with connection:
-                connection.execute("""
-                    INSERT OR IGNORE INTO copy_book_positions (
-                        wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
-                        their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    wallet_name, address, tx_hash, token_id, condition_id, title, outcome,
-                    their_price, their_timestamp, fill_price, fee, SHARES, fill_time.isoformat(), delay_seconds,
-                ))
-            group_keys.add(key)
-
-        if had_error:
-            if group_keys:
-                last_safe_ts = ts
-                current_processed_keys = group_keys
-            break
-
-        last_safe_ts = ts
-        current_processed_keys = group_keys
-
-    if not had_error and newest_seen is not None and newest_seen > last_safe_ts:
-        last_safe_ts = newest_seen
-        current_processed_keys = set()
-
-    if last_safe_ts != stored_cursor or current_processed_keys != processed_keys:
+        their_timestamp = int(trade["timestamp"])
         with connection:
-            connection.execute(
-                "UPDATE copy_book_cursor SET newest_timestamp = ?, processed_keys = ? WHERE wallet_name = ?",
-                (last_safe_ts, json.dumps(sorted(current_processed_keys)), wallet_name),
-            )
+            connection.execute("""
+                INSERT OR IGNORE INTO copy_book_positions (
+                    wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                wallet_name, address, tx_hash, token_id, str(trade.get("conditionId", "")),
+                str(trade.get("title", "")), str(trade.get("outcome", "")),
+                float(trade["price"]), their_timestamp, fill_price, fill.fee_cost, SHARES,
+                fill_time.isoformat(), float(fill_time.timestamp() - their_timestamp),
+            ))
+        mark_seen(connection, wallet_name, tx_hash, token_id)
 
 
 def run_once(
