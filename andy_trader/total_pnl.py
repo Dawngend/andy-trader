@@ -141,7 +141,9 @@ def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResul
 
 
 def collect_complete_set(connection: sqlite3.Connection) -> GroupResult:
-    if not _table_exists(connection, "complete_set_paper_account"):
+    if not _table_exists(connection, "complete_set_paper_account") or not _table_exists(
+        connection, "complete_set_paper_trades"
+    ):
         return GroupResult(
             name="complete_set",
             starting_cash=0.0,

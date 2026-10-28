@@ -445,6 +445,37 @@ def test_missing_all_tables_returns_zeros_and_no_table_yet(tmp_path):
     assert total.pnl == 0.0
 
 
+def test_complete_set_missing_trades_table_shows_zeros_and_no_table_yet(tmp_path):
+    db_path = tmp_path / "missing_trades.db"
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE complete_set_paper_account (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cash REAL NOT NULL,
+                starting_cash REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO complete_set_paper_account VALUES (1, 150.0, 200.0, ?)",
+            (NOW.isoformat(),),
+        )
+        conn.commit()
+
+        res = collect_complete_set(conn)
+
+    assert res.name == "complete_set"
+    assert res.starting_cash == 0.0
+    assert res.value == 0.0
+    assert res.pnl == 0.0
+    assert res.open_cost == 0.0
+    assert res.settled_count == 0
+    assert res.open_count == 0
+    assert res.note == "no table yet"
+
+
 def test_runner_main_writes_report_and_prints(tmp_path, capsys):
     db_path = tmp_path / "runner_test.db"
     with connect(db_path) as conn:
