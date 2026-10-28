@@ -116,7 +116,9 @@ def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResul
 
         pnl = value - starting_cash
         note = ""
-        if missing:
+        if not has_equity:
+            note = "no table yet (paper_equity_curve)"
+        elif missing:
             if len(missing) == len(rows):
                 note = "no equity row yet"
             else:
@@ -374,9 +376,9 @@ def compute_pnl_changes(
         now = now.replace(tzinfo=UTC)
 
     windows = {
-        "30m": 30 * 60,
-        "3h": 3 * 3600,
-        "24h": 24 * 3600,
+        "30m": timedelta(minutes=30),
+        "3h": timedelta(hours=3),
+        "24h": timedelta(hours=24),
     }
 
     rows = connection.execute(
@@ -388,31 +390,23 @@ def compute_pnl_changes(
         """
     ).fetchall()
 
+    snapshots: list[tuple[datetime, float]] = []
+    for r in rows:
+        try:
+            dt = datetime.fromisoformat(r[0])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            snapshots.append((dt, float(r[1])))
+        except Exception:
+            continue
+
     results: dict[str, float | None] = {}
-    for key, target_seconds in windows.items():
-        tolerance = target_seconds * 0.5
-        best_pnl: float | None = None
-        min_dist = float("inf")
-
-        for r in rows:
-            try:
-                dt = datetime.fromisoformat(r[0])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=UTC)
-            except Exception:
-                continue
-
-            age_seconds = (now - dt).total_seconds()
-            if age_seconds <= 0.001:
-                continue
-
-            dist = abs(age_seconds - target_seconds)
-            if dist <= tolerance and dist < min_dist:
-                min_dist = dist
-                best_pnl = float(r[1])
-
-        if best_pnl is not None:
-            results[key] = current_pnl - best_pnl
+    for key, delta in windows.items():
+        cutoff = now - delta
+        candidates = [s for s in snapshots if s[0] <= cutoff]
+        if candidates:
+            nearest = max(candidates, key=lambda s: s[0])
+            results[key] = current_pnl - nearest[1]
         else:
             results[key] = None
 

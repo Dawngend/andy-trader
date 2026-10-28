@@ -301,14 +301,99 @@ def test_three_hour_change_from_two_stored_snapshots(tmp_path):
 
     # 3-hour change: 70.0 - 50.0 = 20.0
     assert changes["3h"] == pytest.approx(20.0)
-    # 30 minutes and 24 hours have no snapshot near those intervals
-    assert changes["30m"] is None
+    # The 3-hour-old snapshot is also at or before the 30m cutoff
+    assert changes["30m"] == pytest.approx(20.0)
+    # 24 hours has no snapshot at or before its cutoff
     assert changes["24h"] is None
 
     line = format_pnl_change_line(changes)
-    assert "last 30 minutes: not enough history" in line
+    assert "last 30 minutes: +$20.00" in line
     assert "last 3 hours: +$20.00" in line
     assert "last 24 hours: not enough history" in line
+
+
+def test_change_uses_nearest_snapshot_at_or_before_cutoff(tmp_path):
+    db_path = tmp_path / "test_lookbacks.db"
+    with connect(db_path) as conn:
+        create_snapshot_table(conn)
+
+        # 1. Snapshot only 15 minutes ago (newer than 30m, 3h, 24h cutoffs)
+        t_15m = (NOW - timedelta(minutes=15)).isoformat()
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, 110.0, 10.0, 0.0)",
+            (t_15m,),
+        )
+        conn.commit()
+
+        # All windows should report not enough history because 15m is newer than all cutoffs
+        changes = compute_pnl_changes(conn, current_pnl=100.0, current_time=NOW)
+        assert changes["30m"] is None
+        assert changes["3h"] is None
+        assert changes["24h"] is None
+
+        # 2. Add snapshot 45 minutes ago (pnl = 30.0)
+        t_45m = (NOW - timedelta(minutes=45)).isoformat()
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, 130.0, 30.0, 0.0)",
+            (t_45m,),
+        )
+        # 3. Add snapshot 4 hours ago (pnl = 20.0)
+        t_4h = (NOW - timedelta(hours=4)).isoformat()
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, 120.0, 20.0, 0.0)",
+            (t_4h,),
+        )
+        # 4. Add snapshot 30 hours ago (pnl = 10.0)
+        t_30h = (NOW - timedelta(hours=30)).isoformat()
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, 110.0, 10.0, 0.0)",
+            (t_30h,),
+        )
+        conn.commit()
+
+        changes = compute_pnl_changes(conn, current_pnl=100.0, current_time=NOW)
+        # 30m uses 45m snapshot (nearest at or before 30m cutoff): 100 - 30 = 70
+        assert changes["30m"] == pytest.approx(70.0)
+        # 3h uses 4h snapshot (nearest at or before 3h cutoff): 100 - 20 = 80
+        assert changes["3h"] == pytest.approx(80.0)
+        # 24h uses 30h snapshot (nearest at or before 24h cutoff): 100 - 10 = 90
+        assert changes["24h"] == pytest.approx(90.0)
+
+
+def test_missing_paper_equity_curve_shows_no_table_yet(tmp_path):
+    db_path = tmp_path / "test_missing_equity.db"
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE paper_portfolio_state (
+                predictor TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                starting_cash REAL NOT NULL,
+                cash REAL NOT NULL,
+                position_qty REAL NOT NULL,
+                avg_entry_price REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (predictor, instrument)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO paper_portfolio_state VALUES ('probe', 'BTC-USD', 1000.0, 1000.0, 0.0, NULL, ?)",
+            (NOW.isoformat(),),
+        )
+        conn.commit()
+
+        # paper_equity_curve is not created
+        results = collect_crypto_portfolios(conn)
+
+    assert len(results) == 1
+    probe = results[0]
+    assert probe.name == "probe"
+    assert probe.starting_cash == 1000.0
+    assert probe.value == 1000.0
+    assert probe.pnl == 0.0
+    assert "no table yet" in probe.note
+    assert "paper_equity_curve" in probe.note
 
 
 def test_second_run_appends_without_touching_first(tmp_path):
