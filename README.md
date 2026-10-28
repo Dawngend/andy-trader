@@ -710,7 +710,9 @@ python -m andy_trader.dry_run_executor
 ```
 
 `BYBIT_API_KEY` and `BYBIT_API_SECRET` must be supplied through the process environment.
-The `.env` loader ignores both credentials and both `ANDY_SENDER_*` switches. Credentials
+`POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS` and `POLYMARKET_SIGNATURE_TYPE`
+also come only from the process environment. The `.env` loader ignores these three names,
+both Bybit credentials and both `ANDY_SENDER_*` switches. Credentials
 and signatures go only in authentication headers and are redacted from the journal.
 Testnet (`https://api-testnet.bybit.com`) is the default. Only the exact process value
 `ANDY_SENDER_NET=mainnet` selects real mainnet (`https://api.bybit.com`).
