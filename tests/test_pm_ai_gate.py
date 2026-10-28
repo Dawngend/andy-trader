@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -163,6 +164,10 @@ def test_ask_model_command_line_and_tempdir(monkeypatch):
     def fake_runner(cmd, cwd, timeout):
         captured_cmd.extend(cmd)
         captured_cwd.append(cwd)
+        assert os.listdir(cwd) == ["facts.txt"]
+        cwd_path = Path(cwd).resolve()
+        assert REPO_ROOT.resolve() not in cwd_path.parents
+        assert cwd_path != REPO_ROOT.resolve()
         facts_file = Path(cwd) / "facts.txt"
         assert facts_file.exists()
         assert "book: bond_book" in facts_file.read_text(encoding="utf-8")
@@ -473,6 +478,14 @@ def test_max_candidates_limit(tmp_path):
     fake_model = MagicMock(return_value={"verdict": "approve", "reason": "ok"})
     result = pm_ai_gate.run_pass(db_path, max_candidates=10, ask_model=fake_model, clock=lambda: now)
     assert result["scored"] == 10
+    assert fake_model.call_count == 10
+
+    # Passing max_candidates > 10 clamps to 10
+    fake_model.reset_mock()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM pm_ai_gate_decisions")
+    result_clamped = pm_ai_gate.run_pass(db_path, max_candidates=20, ask_model=fake_model, clock=lambda: now)
+    assert result_clamped["scored"] == 10
     assert fake_model.call_count == 10
 
 

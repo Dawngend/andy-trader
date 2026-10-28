@@ -378,6 +378,7 @@ def run_pass(
     clock: Callable[[], datetime] = utc_now,
 ) -> dict:
     """Run one pass of the AI approval gate."""
+    max_candidates = max(1, min(MAX_CANDIDATES_DEFAULT, int(max_candidates)))
     db_path = Path(db_path)
     try:
         conn = sqlite3.connect(db_path, timeout=5)
@@ -462,14 +463,13 @@ def compute_diff_bootstrap_interval(
     assert resamples >= 40, "BOOTSTRAP_RESAMPLES must be at least 40"
     if not group1 or not group2:
         return 0.0, 0.0
-    rng = random.Random(seed)
     n1 = len(group1)
     n2 = len(group2)
-    diff_means = []
-    for _ in range(resamples):
-        s1 = sum(rng.choices(group1, k=n1)) / n1
-        s2 = sum(rng.choices(group2, k=n2)) / n2
-        diff_means.append(s1 - s2)
+    rng1 = random.Random(seed)
+    means1 = [sum(rng1.choices(group1, k=n1)) / n1 for _ in range(resamples)]
+    rng2 = random.Random(seed)
+    means2 = [sum(rng2.choices(group2, k=n2)) / n2 for _ in range(resamples)]
+    diff_means = [m1 - m2 for m1, m2 in zip(means1, means2)]
     diff_means.sort()
     low = diff_means[int(0.025 * resamples) - 1]
     high = diff_means[int(0.975 * resamples) - 1]
@@ -677,20 +677,6 @@ def generate_report(
             "## Verdict",
             "",
             verdict_text,
-        ])
-
-        for book, _ in BOOKS:
-            b_app = stats[book]["approve"]["pnls"]
-            b_skip = stats[book]["skip"]["pnls"]
-            if b_app and b_skip:
-                b_diff_avg = (sum(b_app) / len(b_app)) - (sum(b_skip) / len(b_skip))
-                b_low, b_high = compute_diff_bootstrap_interval(b_app, b_skip)
-                lines.append(
-                    f"- {book} difference (approved minus skipped): {b_diff_avg:+.4f} "
-                    f"(95% CI: [{b_low:+.4f}, {b_high:+.4f}])"
-                )
-
-        lines.extend([
             "",
             "## Details",
             "",
@@ -706,8 +692,6 @@ def generate_report(
             "5. A candidate that was never scored is excluded; the report counts such rows as not scored, for any reason, without splitting the reasons.",
             "6. Whether --sandbox stops the model from reading files outside its working directory is not established; the empty working directory only hides the repository from a model that does not go looking, and the databases hold paper data only.",
             "7. Facts text from the book is untrusted; the sanitiser and the closing instruction reduce prompt injection but cannot remove it.",
-            "8. The verdict pools approved and skipped positions across bond_book and price_target_book. The books have different payoff shapes, and the model may approve more of one book than the other. A mix difference between the groups could produce 'AI adds value' or 'AI hurts' with no real model effect.",
-            "9. The per-position average pnl is not normalised by stake. Positions of different sizes (shares x price) differ in scale, so approved and skipped groups with different sizes are not directly comparable.",
             "",
         ])
         return "\n".join(lines)
