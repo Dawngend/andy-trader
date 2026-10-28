@@ -453,3 +453,60 @@ def test_format_report_price_difference(db):
     rep = copy.format_report(db)
     assert "Wallet: dromedaryy" in rep
     assert "Average price difference (fill - their): +0.0200" in rep
+
+
+def test_opened_at_and_delay_capture_after_order_book_read(db, network):
+    # Establish starting point
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    trade_ts = int(NOW.timestamp())  # their_timestamp
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_time_check", asset="tok_timed", price=0.90, ts=trade_ts)
+    ]
+    network["books"]["tok_timed"] = make_book(price=0.90, size=100)
+
+    # Time progresses: pass starts at NOW, but order book read finishes 8 seconds later
+    fill_time = datetime(2026, 10, 28, 12, 0, 8, tzinfo=UTC)
+    copy.run_once(db, now=NOW, clock=lambda: fill_time)
+
+    rows = positions(db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["opened_at"] == fill_time.isoformat()
+    assert row["delay_seconds"] == pytest.approx(8.0)
+
+
+def test_unseen_trades_at_cursor_timestamp_accepted(db, network):
+    # Pass 1: establishes starting point at 1000
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    # Pass 2: activity has trade A at ts 1050
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_a", asset="tok1", ts=1050)
+    ]
+    network["books"]["tok1"] = make_book(price=0.90, size=100)
+    copy.run_once(db, now=NOW)
+
+    rows = positions(db)
+    assert len(rows) == 1
+    assert rows[0]["tx_hash"] == "tx_a"
+
+    # Pass 3: activity now includes trade B also at ts 1050
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_a", asset="tok1", ts=1050),
+        make_trade(tx="tx_b", asset="tok2", ts=1050),
+    ]
+    network["books"]["tok2"] = make_book(price=0.90, size=100)
+    copy.run_once(db, now=NOW)
+
+    rows_after = positions(db)
+    assert len(rows_after) == 2
+    hashes = {r["tx_hash"] for r in rows_after}
+    assert hashes == {"tx_a", "tx_b"}
+
+    # Pass 4: repeat pass with same activity; neither trade is copied again
+    copy.run_once(db, now=NOW)
+    rows_final = positions(db)
+    assert len(rows_final) == 2
