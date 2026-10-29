@@ -33,6 +33,8 @@ UP_DOWN = "up_down"
 ABOVE_BELOW = "above_below"
 OTHER = "other"
 SLICES = (PRICE_TARGET_NO, PRICE_TARGET_YES, UP_DOWN, ABOVE_BELOW, OTHER)
+# paused on 2026-10-29 after 220 settled positions totalled minus 790 dollars; remove the slice from the tuple to resume it.
+PAUSED_SLICES = (UP_DOWN,)
 SLICE_HEADER = ("Slice | Settled | Wins | Average entry price | Win rate | "
                 "Gap before fees | Average pnl/share after fees | Average win | Average loss")
 ENTRY_BANDS = ((0.90, "0.80 to 0.90"), (0.95, "0.90 to 0.95"), (1.0, "0.95 to 0.98"))
@@ -175,6 +177,9 @@ def consider_side(connection, event_id, market, side, token, now) -> None:
         "SELECT 1 FROM bond_book_positions WHERE market_id = ? AND side = ?",
         (str(market["id"]), side),
     ).fetchone():
+        return
+    if strategy_slice(market["question"], side) in PAUSED_SLICES:
+        record_skip(connection, now, "slice_paused")
         return
     gamma = gamma_price(market, side)
     if gamma is not None and gamma < PREFILTER_BELOW:

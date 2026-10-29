@@ -132,6 +132,7 @@ def test_missing_or_invalid_gamma_price_reads_book(db, network, changes):
 
 def test_pass_journal_has_seconds_and_book_reads(db, network, tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "JOURNAL_PATH", tmp_path / ".bond-book.jsonl")
+    network["events"] = [event(markets=[market(endDate=(datetime.now(UTC) + timedelta(days=1)).isoformat())])]
     path = db.execute("PRAGMA database_list").fetchone()[2]
     assert runner.main(["--database", path]) == 0
     entries = [json.loads(line) for line in runner.JOURNAL_PATH.read_text().splitlines()]
@@ -370,3 +371,43 @@ def test_concurrent_inserts(tmp_path, monkeypatch, same_side, limit):
         list(pool.map(insert, range(2)))
     with connect(path) as conn:
         assert len(positions(conn)) == 1
+
+
+def test_paused_slice_skips_up_down_market_side(db, network):
+    network["events"] = [event(markets=[market("m1", question="Bitcoin Up or Down on October 28?")])]
+    assert bond.run_once(db, now=NOW) == []
+    assert network["book_calls"] == []
+    assert positions(db) == []
+    assert dict(db.execute("SELECT reason, count FROM bond_book_skips")) == {"slice_paused": 2}
+
+
+def test_above_below_market_side_still_opens_position(db, network):
+    question = "Bitcoin above 100,000?"
+    assert bond.strategy_slice(question, "Yes") == bond.ABOVE_BELOW
+    network["events"] = [event(markets=[market("m1", question=question)])]
+    assert bond.run_once(db, now=NOW) == []
+    assert "m1y" in network["book_calls"]
+    row, = positions(db)
+    assert row["side"] == "Yes"
+    assert row["market_id"] == "m1"
+
+
+def test_already_open_up_down_position_still_settles(db, network):
+    up_down_market = market("m1", question="Bitcoin Up or Down on October 28?")
+    bond.open_position(db, "e1", up_down_market, "Yes", 0.9, 0.63, NOW)
+    network["closed"]["e1"] = [event("e1", markets=[market("m1", question="Bitcoin Up or Down on October 28?",
+                                                           closed=True, outcomePrices='[1, 0]')])]
+    bond.run_once(db, now=NOW + timedelta(hours=1))
+    row, = positions(db)
+    assert row["win"] == 1
+    assert row["settled_at"] is not None
+
+
+def test_empty_paused_slices_allows_up_down_entry(db, network, monkeypatch):
+    monkeypatch.setattr(bond, "PAUSED_SLICES", ())
+    network["events"] = [event(markets=[market("m1", question="Bitcoin Up or Down on October 28?")])]
+    assert bond.run_once(db, now=NOW) == []
+    assert "m1y" in network["book_calls"]
+    row, = positions(db)
+    assert row["side"] == "Yes"
+    assert row["market_id"] == "m1"
