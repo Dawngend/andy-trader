@@ -132,7 +132,7 @@ def test_missing_or_invalid_gamma_price_reads_book(db, network, changes):
 
 def test_pass_journal_has_seconds_and_book_reads(db, network, tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "JOURNAL_PATH", tmp_path / ".bond-book.jsonl")
-    monkeypatch.setattr(runner, "run_once", lambda conn: bond.run_once(conn, now=NOW))
+    network["events"] = [event(markets=[market(endDate=(datetime.now(UTC) + timedelta(days=1)).isoformat())])]
     path = db.execute("PRAGMA database_list").fetchone()[2]
     assert runner.main(["--database", path]) == 0
     entries = [json.loads(line) for line in runner.JOURNAL_PATH.read_text().splitlines()]
@@ -382,7 +382,9 @@ def test_paused_slice_skips_up_down_market_side(db, network):
 
 
 def test_above_below_market_side_still_opens_position(db, network):
-    network["events"] = [event(markets=[market("m1", question="Bitcoin above 100,000?")])]
+    question = "Bitcoin above 100,000?"
+    assert bond.strategy_slice(question, "Yes") == bond.ABOVE_BELOW
+    network["events"] = [event(markets=[market("m1", question=question)])]
     assert bond.run_once(db, now=NOW) == []
     assert "m1y" in network["book_calls"]
     row, = positions(db)
