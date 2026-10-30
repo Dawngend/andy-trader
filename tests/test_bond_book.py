@@ -92,12 +92,18 @@ def test_skip_reasons(db, network, monkeypatch, price, size, margin, reason):
     assert dict(db.execute("SELECT reason, count FROM bond_book_skips")) == {reason: 2}
 
 
-@pytest.mark.parametrize("price,band", [(0.8, "0.80 to 0.90"), (0.9, "0.90 to 0.95"),
-                                        (0.95, "0.95 to 0.98")])
+@pytest.mark.parametrize("price,band", [(0.9, "0.90 to 0.95"), (0.95, "0.95 to 0.98")])
 def test_entry_boundaries(db, network, price, band):
     network["books"]["m1y"] = book(price)
     bond.run_once(db, now=NOW)
     assert positions(db)[0]["entry_band"] == band
+
+
+def test_ask_below_ninety_is_skipped(db, network):
+    network["books"] = {"m1y": book(0.85), "m1n": book(0.85)}
+    bond.run_once(db, now=NOW)
+    assert positions(db) == []
+    assert dict(db.execute("SELECT reason, count FROM bond_book_skips")) == {"ask_too_low": 2}
 
 
 def test_gamma_price_below_prefilter_skips_book(db, network):
@@ -143,11 +149,11 @@ def test_pass_journal_has_seconds_and_book_reads(db, network, tmp_path, monkeypa
 
 def test_walks_depth_and_fees_per_level(db, network):
     network["books"]["m1y"] = {"asks": [{"price": "0.96", "size": "60"},
-                                           {"price": "0.8", "size": "40"}]}
+                                           {"price": "0.9", "size": "40"}]}
     bond.run_once(db, now=NOW)
     row, = positions(db)
-    assert row["fill_price"] == pytest.approx(0.896)
-    assert row["fee"] == float(taker_fee(40, 0.8) + taker_fee(60, 0.96))
+    assert row["fill_price"] == pytest.approx(0.936)
+    assert row["fee"] == float(taker_fee(40, 0.9) + taker_fee(60, 0.96))
 
 
 def test_limits_and_pagination(db, network, monkeypatch):

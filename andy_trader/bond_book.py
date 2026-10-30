@@ -17,7 +17,7 @@ from andy_trader.complete_set import (
 from andy_trader.loss_rules import blocking_rule, load_rules
 
 SHARES = 100
-MIN_ASK = 0.80
+MIN_ASK = 0.90  # raised from 0.80 on 2026-10-30: the 0.80 to 0.90 band had a 24 percent loss rate and -$455 over 45 settled positions
 MAX_ASK = 0.95  # cut from 0.98 on 2026-10-28: the 0.95 to 0.98 band lost money over 18 settled positions
 MIN_MARGIN = 0.015
 MAX_OPEN = 30
