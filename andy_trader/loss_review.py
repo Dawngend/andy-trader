@@ -7,7 +7,7 @@ import sqlite3
 
 from andy_trader.bond_book import strategy_slice
 from andy_trader.env import REPO_ROOT
-from andy_trader.loss_rules import learn_rules
+from andy_trader.loss_rules import learn_rules, load_rules
 
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "research" / "loss_review.md"
 TABLES = ("bond_book_positions", "price_target_book_positions")
@@ -118,14 +118,15 @@ def row_tags(row: dict, end_count: int = 1) -> dict[str, str]:
 
 
 def summarize(rows: list[dict]) -> dict:
-    wins = [row["pnl"] for row in rows if row.get("pnl") is not None and row["pnl"] >= 0]
-    losses = [row["pnl"] for row in rows if row.get("pnl") is not None and row["pnl"] < 0]
+    settled = [row for row in rows if row.get("pnl") is not None]
+    wins = [row["pnl"] for row in settled if row["pnl"] >= 0]
+    losses = [row["pnl"] for row in settled if row["pnl"] < 0]
     return {
-        "settled": len(rows),
+        "settled": len(settled),
         "wins": len(wins),
         "losses": len(losses),
-        "loss_rate": len(losses) / len(rows) if rows else 0.0,
-        "pnl": sum(row["pnl"] for row in rows if row.get("pnl") is not None),
+        "loss_rate": len(losses) / len(settled) if settled else 0.0,
+        "pnl": sum(row["pnl"] for row in settled),
         "average_loss": sum(losses) / len(losses) if losses else 0.0,
         "average_win": sum(wins) / len(wins) if wins else 0.0,
     }
@@ -211,7 +212,7 @@ def build_report(rows: list[dict], counts: dict[str, int], rules: list[dict] | N
                   "In-sample hindsight: a forward paper test is needed before any rule is trusted.", ""])
     lines.extend(suggested_rules or ["No tag stands out yet."])
 
-    active_rules = learn_rules(rows) if rules is None else rules
+    active_rules = load_rules() if rules is None else rules
     lines.extend(["", "## Rules now active", ""])
     if active_rules:
         lines.extend(f"- Skip {r['tag']} {cell(r['value'])}: {r['reason']}" for r in active_rules)

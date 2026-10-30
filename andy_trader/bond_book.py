@@ -152,6 +152,7 @@ def open_position(
     table: str = "bond_book_positions", bands=None,
     max_open: int | None = None, max_open_per_event: int | None = None,
     rules_path: Path | str | None = None,
+    skips_table: str | None = None,
 ) -> None:
     # Serialize the limit check and insert, without holding a lock during HTTP reads.
     effective_max_open = MAX_OPEN if max_open is None else max_open
@@ -169,43 +170,47 @@ def open_position(
 
         rules = load_rules(rules_path)
         if rules:
-            try:
-                from andy_trader.loss_review import row_tags, utc_time
-                end_val = market.get("endDate")
-                target_dt = None
-                if end_val:
+            from andy_trader.loss_review import TABLES, row_tags, utc_time
+            end_val = market.get("endDate")
+            target_dt = None
+            if end_val:
+                try:
+                    target_dt = utc_time(end_val).replace(microsecond=0)
+                except Exception:
+                    target_dt = None
+            existing_tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            check_tables = [t for t in TABLES if t in existing_tables]
+            if table not in check_tables and table in existing_tables:
+                check_tables.append(table)
+            open_ends = []
+            if check_tables:
+                query = " UNION ALL ".join(f"SELECT ends_at FROM {t} WHERE settled_at IS NULL" for t in check_tables)
+                open_ends = connection.execute(query).fetchall()
+            same_end_open = 0
+            if target_dt is not None:
+                for (row_end,) in open_ends:
+                    if not row_end:
+                        continue
                     try:
-                        target_dt = utc_time(end_val).replace(microsecond=0)
+                        if utc_time(row_end).replace(microsecond=0) == target_dt:
+                            same_end_open += 1
                     except Exception:
-                        target_dt = None
-                open_ends = connection.execute(f"SELECT ends_at FROM {table} WHERE settled_at IS NULL").fetchall()
-                same_end_open = 0
-                if target_dt is not None:
-                    for (row_end,) in open_ends:
-                        if not row_end:
-                            continue
-                        try:
-                            if utc_time(row_end).replace(microsecond=0) == target_dt:
-                                same_end_open += 1
-                        except Exception:
-                            continue
-                tags = row_tags(
-                    {
-                        "title": market.get("question", ""),
-                        "side": side,
-                        "entry_band": band,
-                        "opened_at": now.isoformat(),
-                        "ends_at": end_val,
-                    },
-                    end_count=same_end_open + 1,
-                )
-                rule = blocking_rule(rules, tags)
-                if rule is not None:
-                    skips_table = table.replace("_positions", "_skips")
-                    record_skip(connection, now, "loss_rule", table=skips_table)
-                    return
-            except Exception:
-                pass
+                        continue
+            tags = row_tags(
+                {
+                    "title": market.get("question", ""),
+                    "side": side,
+                    "entry_band": band,
+                    "opened_at": now.isoformat(),
+                    "ends_at": end_val,
+                },
+                end_count=same_end_open + 1,
+            )
+            rule = blocking_rule(rules, tags)
+            if rule is not None:
+                target_skips = skips_table or table.replace("_positions", "_skips")
+                record_skip(connection, now, "loss_rule", table=target_skips)
+                return
 
         connection.execute(f"""
             INSERT OR IGNORE INTO {table}

@@ -224,3 +224,18 @@ def test_win_loss_decided_by_pnl_not_win_column():
     assert summary["wins"] == 2
     assert summary["loss_rate"] == 1 / 3
     assert summary["pnl"] == 0.0
+
+
+def test_summarize_ignores_null_pnl():
+    rows = [
+        dict(win=1, pnl=-10.0),
+        dict(win=0, pnl=10.0),
+        dict(win=1, pnl=None),
+    ]
+    summary = summarize(rows)
+    assert summary["settled"] == 2
+    assert summary["losses"] == 1
+    assert summary["wins"] == 1
+    assert summary["loss_rate"] == 0.5
+    assert summary["pnl"] == 0.0
+

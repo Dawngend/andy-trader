@@ -8,8 +8,11 @@ from pathlib import Path
 import sys
 
 from andy_trader.loss_review import DEFAULT_OUTPUT_PATH, build_report, read_positions
-from andy_trader.loss_rules import DEFAULT_RULES_PATH, learn_rules
+from andy_trader.loss_rules import learn_rules, load_rules
+import andy_trader.loss_rules as loss_rules
 from andy_trader.store import default_database_path
+
+DEFAULT_RULES_PATH = loss_rules.DEFAULT_RULES_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,7 +32,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Rules output must not overwrite the database")
         rows, counts = read_positions(database)
         rules = learn_rules(rows)
-        report = build_report(rows, counts, rules=rules)
+        active_rules = load_rules(rules_output) if args.dry_run else rules
+        report = build_report(rows, counts, rules=active_rules)
         if args.dry_run:
             print(report, end="")
         else:

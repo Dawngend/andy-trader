@@ -18,5 +18,8 @@ def default_starting_cash(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated_loss_rules(monkeypatch, tmp_path):
-    """Prevent tests from reading the live or generated loss_rules.json at repo root."""
-    monkeypatch.setattr("andy_trader.loss_rules.DEFAULT_RULES_PATH", tmp_path / "nonexistent_loss_rules.json")
+    """Prevent tests from reading or overwriting the live loss_rules.json at repo root."""
+    test_rules_path = tmp_path / "nonexistent_loss_rules.json"
+    monkeypatch.setattr("andy_trader.loss_rules.DEFAULT_RULES_PATH", test_rules_path)
+    monkeypatch.setattr("run_loss_review.DEFAULT_RULES_PATH", test_rules_path)
+

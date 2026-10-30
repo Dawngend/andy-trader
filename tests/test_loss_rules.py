@@ -323,3 +323,37 @@ def test_open_position_gracefully_handles_malformed_dates(tmp_path):
         bond_open_position(conn, "e_new", bad_market, "Yes", 0.92, 0.60, NOW, rules_path=rules_path)
         pos = conn.execute("SELECT * FROM bond_book_positions WHERE market_id = 'm_new'").fetchall()
         assert len(pos) == 1
+
+
+def test_same_end_count_rule_blocks_across_books(tmp_path):
+    db_path = tmp_path / "cross_books.db"
+    rules_path = tmp_path / "loss_rules.json"
+    rules_data = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "rules": [
+            {"tag": "same_end_count", "value": "3 or more", "settled": 35, "loss_rate": 0.4, "pnl": -350.0, "reason": "Clusters lose."},
+        ],
+    }
+    rules_path.write_text(json.dumps(rules_data), encoding="utf-8")
+
+    end_time = (NOW + timedelta(days=2)).isoformat()
+    with connect(db_path) as conn:
+        initialize_bond_book(conn)
+        initialize_price_target_book(conn)
+
+        # 2 open positions in bond_book
+        m1 = market("m1", question="Bitcoin above 100,000?", endDate=end_time)
+        bond_open_position(conn, "e1", m1, "Yes", 0.92, 0.60, NOW, rules_path=rules_path)
+        m2 = market("m2", question="Ethereum above 4,000?", endDate=end_time)
+        bond_open_position(conn, "e2", m2, "Yes", 0.92, 0.60, NOW, rules_path=rules_path)
+
+        # 1 position in price_target_book sharing same end_time -> should be blocked!
+        m3 = market("m3", question="Solana dip to 100?", endDate=end_time)
+        pt_open_position(conn, "e3", m3, "No", 0.92, 0.60, NOW, rules_path=rules_path)
+
+        pos_pt = conn.execute("SELECT * FROM price_target_book_positions").fetchall()
+        assert len(pos_pt) == 0
+
+        skips_pt = dict(conn.execute("SELECT reason, count FROM price_target_book_skips"))
+        assert skips_pt.get("loss_rule") == 1
+
