@@ -169,26 +169,43 @@ def open_position(
 
         rules = load_rules(rules_path)
         if rules:
-            from andy_trader.loss_review import row_tags, utc_time
-            end_val = market.get("endDate")
-            target_dt = utc_time(end_val) if end_val else None
-            open_ends = connection.execute(f"SELECT ends_at FROM {table} WHERE settled_at IS NULL").fetchall()
-            same_end_open = sum(1 for (row_end,) in open_ends if row_end and target_dt and utc_time(row_end) == target_dt)
-            tags = row_tags(
-                {
-                    "title": market.get("question", ""),
-                    "side": side,
-                    "entry_band": band,
-                    "opened_at": now.isoformat(),
-                    "ends_at": end_val,
-                },
-                end_count=same_end_open + 1,
-            )
-            rule = blocking_rule(rules, tags)
-            if rule is not None:
-                skips_table = table.replace("_positions", "_skips")
-                record_skip(connection, now, "loss_rule", table=skips_table)
-                return
+            try:
+                from andy_trader.loss_review import row_tags, utc_time
+                end_val = market.get("endDate")
+                target_dt = None
+                if end_val:
+                    try:
+                        target_dt = utc_time(end_val).replace(microsecond=0)
+                    except Exception:
+                        target_dt = None
+                open_ends = connection.execute(f"SELECT ends_at FROM {table} WHERE settled_at IS NULL").fetchall()
+                same_end_open = 0
+                if target_dt is not None:
+                    for (row_end,) in open_ends:
+                        if not row_end:
+                            continue
+                        try:
+                            if utc_time(row_end).replace(microsecond=0) == target_dt:
+                                same_end_open += 1
+                        except Exception:
+                            continue
+                tags = row_tags(
+                    {
+                        "title": market.get("question", ""),
+                        "side": side,
+                        "entry_band": band,
+                        "opened_at": now.isoformat(),
+                        "ends_at": end_val,
+                    },
+                    end_count=same_end_open + 1,
+                )
+                rule = blocking_rule(rules, tags)
+                if rule is not None:
+                    skips_table = table.replace("_positions", "_skips")
+                    record_skip(connection, now, "loss_rule", table=skips_table)
+                    return
+            except Exception:
+                pass
 
         connection.execute(f"""
             INSERT OR IGNORE INTO {table}

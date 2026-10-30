@@ -14,7 +14,7 @@ ALLOWED_RULE_TAGS = ("slice", "entry_band", "asset", "time_to_end", "open_hour",
 def learn_rules(rows: list[dict]) -> list[dict]:
     """Learn loss rules from settled positions not in paused slices."""
     from andy_trader.bond_book import PAUSED_SLICES, strategy_slice
-    from andy_trader.loss_review import group_by_end, row_tags, summarize
+    from andy_trader.loss_review import group_by_end, row_tags, summarize, utc_time
 
     active_rows = [
         row for row in rows
@@ -30,7 +30,14 @@ def learn_rules(rows: list[dict]) -> list[dict]:
     active_ends = group_by_end(active_rows)
     groups: dict[tuple[str, str], list[dict]] = {}
     for row in active_rows:
-        end_count = len(active_ends.get(row.get("ends_at"), [])) if row.get("ends_at") else 1
+        end_count = 1
+        end_val = row.get("ends_at")
+        if end_val:
+            try:
+                key = utc_time(end_val).replace(microsecond=0)
+                end_count = len(active_ends.get(key, []))
+            except Exception:
+                end_count = 1
         tags = row_tags(row, end_count)
         for tag, value in tags.items():
             if tag not in ALLOWED_RULE_TAGS:
@@ -97,7 +104,17 @@ def load_rules(path: Path | str | None = None) -> list[dict]:
         rules = data.get("rules")
         if not isinstance(rules, list):
             return []
-        return [r for r in rules if isinstance(r, dict)]
+        valid_rules = []
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            tag = r.get("tag")
+            if tag not in ALLOWED_RULE_TAGS:
+                continue
+            if tag == "same_end_count" and r.get("value") != "3 or more":
+                continue
+            valid_rules.append(r)
+        return valid_rules
     except Exception:
         return []
 

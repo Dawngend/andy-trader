@@ -153,6 +153,23 @@ def test_load_rules_missing_bad_and_old_files(tmp_path):
     valid.write_text(json.dumps({"generated_at": recent_time, "rules": [{"tag": "asset", "value": "BTC"}]}))
     assert load_rules(valid) == [{"tag": "asset", "value": "BTC"}]
 
+    # Unknown tags or invalid same_end_count values are filtered out
+    invalid_rules_file = tmp_path / "invalid_tags.json"
+    invalid_rules_file.write_text(json.dumps({
+        "generated_at": recent_time,
+        "rules": [
+            {"tag": "unknown_tag", "value": "xyz"},
+            {"tag": "same_end_count", "value": "1"},
+            {"tag": "same_end_count", "value": "2"},
+            {"tag": "asset", "value": "BTC"},
+            {"tag": "same_end_count", "value": "3 or more"},
+        ],
+    }))
+    assert load_rules(invalid_rules_file) == [
+        {"tag": "asset", "value": "BTC"},
+        {"tag": "same_end_count", "value": "3 or more"},
+    ]
+
 
 def test_open_position_blocks_and_records_skip(tmp_path):
     db_path = tmp_path / "book.db"
@@ -279,3 +296,30 @@ def test_dry_run_does_not_write_rules_file(tmp_path, capsys):
     content = json.loads(rules_output.read_text(encoding="utf-8"))
     assert "generated_at" in content
     assert "rules" in content
+
+
+def test_open_position_gracefully_handles_malformed_dates(tmp_path):
+    db_path = tmp_path / "malformed.db"
+    rules_path = tmp_path / "loss_rules.json"
+    rules_data = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "rules": [
+            {"tag": "same_end_count", "value": "3 or more", "settled": 35, "loss_rate": 0.4, "pnl": -350.0, "reason": "Clusters lose."},
+        ],
+    }
+    rules_path.write_text(json.dumps(rules_data), encoding="utf-8")
+
+    with connect(db_path) as conn:
+        initialize_bond_book(conn)
+        # Row with malformed ends_at already in DB
+        conn.execute("""
+            INSERT INTO bond_book_positions
+            (market_id, event_id, title, side, entry_band, fill_price, fee, shares, opened_at, ends_at)
+            VALUES ('m_bad', 'e_bad', 'Bad Date Question', 'Yes', '0.90 to 0.95', 0.92, 0.60, 100, 'bad_date', 'not-a-date')
+        """)
+        conn.commit()
+        # Opening a market with malformed endDate does not raise and does not crash
+        bad_market = market("m_new", endDate="invalid_iso")
+        bond_open_position(conn, "e_new", bad_market, "Yes", 0.92, 0.60, NOW, rules_path=rules_path)
+        pos = conn.execute("SELECT * FROM bond_book_positions WHERE market_id = 'm_new'").fetchall()
+        assert len(pos) == 1

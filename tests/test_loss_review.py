@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from andy_trader.loss_review import (
-    TABLES, build_report, group_by_end, loss_clusters, read_positions, row_tags, summarize,
+    TABLES, build_report, group_by_end, loss_clusters, read_positions, row_tags, summarize, utc_time,
 )
 import run_loss_review as runner
 
@@ -73,7 +73,8 @@ def test_clusters_across_books(tmp_path):
     assert len(clusters) == 1
     assert clusters[0][2]["pnl"] == -180
     assert clusters[0][2]["losses"] == 2
-    assert row_tags(rows[0], len(ends[rows[0]["ends_at"]]))["same_end_count"] == "3 or more"
+    end_key = utc_time(rows[0]["ends_at"]).replace(microsecond=0)
+    assert row_tags(rows[0], len(ends[end_key]))["same_end_count"] == "3 or more"
     report = build_report(rows, counts).split("## Clusters")[1]
     assert "Bitcoin Up or Down; XRP Up or Down; ZCash above $100" in report
     assert "| 3 | 2 | -$180.00 |" in report
@@ -186,8 +187,8 @@ def test_group_by_end_treats_equivalent_timestamps_as_same_moment():
     ]
     ends = group_by_end(rows)
     assert len(ends) == 1
-    assert len(ends["2026-10-01T00:30:00Z"]) == 4
-    assert len(ends["2026-10-01T00:30:00.123456Z"]) == 4
+    key = utc_time("2026-10-01T00:30:00Z").replace(microsecond=0)
+    assert len(ends[key]) == 4
 
 
 def test_null_fields_handled_gracefully(tmp_path):

@@ -13,31 +13,6 @@ DEFAULT_OUTPUT_PATH = REPO_ROOT / "research" / "loss_review.md"
 TABLES = ("bond_book_positions", "price_target_book_positions")
 
 
-class EndGroups(dict):
-    """Dictionary of groups keyed by UTC datetime, with lookup support by ISO strings."""
-
-    def _normalize_key(self, key):
-        if super().__contains__(key):
-            return key
-        if isinstance(key, str):
-            try:
-                dt = utc_time(key)
-                if super().__contains__(dt):
-                    return dt
-            except Exception:
-                pass
-        return key
-
-    def __getitem__(self, key):
-        return super().__getitem__(self._normalize_key(key))
-
-    def get(self, key, default=None):
-        return super().get(self._normalize_key(key), default)
-
-    def __contains__(self, key):
-        return super().__contains__(self._normalize_key(key))
-
-
 def read_positions(database_path: Path) -> tuple[list[dict], dict[str, int]]:
     if not database_path.is_file():
         raise FileNotFoundError(f"Database file not found: {database_path}")
@@ -66,7 +41,7 @@ def utc_time(value: str) -> datetime:
     timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    return timestamp.astimezone(UTC).replace(microsecond=0)
+    return timestamp.astimezone(UTC)
 
 
 def time_bucket(hours: float) -> str:
@@ -79,14 +54,14 @@ def time_bucket(hours: float) -> str:
     return "over 24h"
 
 
-def group_by_end(rows: list[dict]) -> EndGroups:
-    groups = EndGroups()
+def group_by_end(rows: list[dict]) -> dict[datetime, list[dict]]:
+    groups: dict[datetime, list[dict]] = {}
     for row in rows:
         end_val = row.get("ends_at")
         if not end_val:
             continue
         try:
-            key = utc_time(end_val)
+            key = utc_time(end_val).replace(microsecond=0)
         except Exception:
             continue
         groups.setdefault(key, []).append(row)
@@ -159,7 +134,14 @@ def summarize(rows: list[dict]) -> dict:
 def tag_summaries(rows: list[dict], ends: dict) -> list[tuple[str, str, dict]]:
     groups: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
-        end_count = len(ends.get(row.get("ends_at"), [])) if row.get("ends_at") else 1
+        end_count = 1
+        end_val = row.get("ends_at")
+        if end_val:
+            try:
+                key = utc_time(end_val).replace(microsecond=0)
+                end_count = len(ends.get(key, []))
+            except Exception:
+                end_count = 1
         for tag, value in row_tags(row, end_count).items():
             groups.setdefault((tag, value), []).append(row)
     return [(tag, value, summarize(group)) for (tag, value), group in sorted(groups.items())
