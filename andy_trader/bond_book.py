@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 import math
+from pathlib import Path
 import re
 import sqlite3
 from urllib.parse import urlencode
@@ -13,6 +14,7 @@ from andy_trader.complete_set import (
     CLOB_BOOK_URL, CRYPTO_TAKER_FEE_RATE, GAMMA_EVENTS_URL,
     CompleteSetError, _http_json, walk_ask_book,
 )
+from andy_trader.loss_rules import blocking_rule, load_rules
 
 SHARES = 100
 MIN_ASK = 0.80
@@ -41,7 +43,7 @@ ENTRY_BANDS = ((0.90, "0.80 to 0.90"), (0.95, "0.90 to 0.95"), (1.0, "0.95 to 0.
 VERDICT_THRESHOLD = 100
 PAGE_SIZE = 100
 TIMEOUT_SECONDS = 10
-SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "margin_too_small")
+SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "margin_too_small", "loss_rule")
 DATA_ERRORS = (CompleteSetError, OSError, ValueError, TypeError, KeyError)
 BOOK_READS = 0
 
@@ -149,6 +151,7 @@ def open_position(
     connection, event_id, market, side, price, fee, now,
     table: str = "bond_book_positions", bands=None,
     max_open: int | None = None, max_open_per_event: int | None = None,
+    rules_path: Path | str | None = None,
 ) -> None:
     # Serialize the limit check and insert, without holding a lock during HTTP reads.
     effective_max_open = MAX_OPEN if max_open is None else max_open
@@ -163,6 +166,30 @@ def open_position(
         if count >= effective_max_open or event_count >= effective_max_event:
             return
         band = next(label for upper, label in effective_bands if price < upper)
+
+        rules = load_rules(rules_path)
+        if rules:
+            from andy_trader.loss_review import row_tags, utc_time
+            end_val = market.get("endDate")
+            target_dt = utc_time(end_val) if end_val else None
+            open_ends = connection.execute(f"SELECT ends_at FROM {table} WHERE settled_at IS NULL").fetchall()
+            same_end_open = sum(1 for (row_end,) in open_ends if row_end and target_dt and utc_time(row_end) == target_dt)
+            tags = row_tags(
+                {
+                    "title": market.get("question", ""),
+                    "side": side,
+                    "entry_band": band,
+                    "opened_at": now.isoformat(),
+                    "ends_at": end_val,
+                },
+                end_count=same_end_open + 1,
+            )
+            rule = blocking_rule(rules, tags)
+            if rule is not None:
+                skips_table = table.replace("_positions", "_skips")
+                record_skip(connection, now, "loss_rule", table=skips_table)
+                return
+
         connection.execute(f"""
             INSERT OR IGNORE INTO {table}
             (market_id, event_id, title, side, entry_band, fill_price, fee, shares, opened_at, ends_at)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 import re
 import sqlite3
 from urllib.parse import urlencode
@@ -31,7 +32,7 @@ PREFILTER_BELOW = 0.70
 PRICE_TARGET_WORDS = r"\b(reach|dip|hit)\b"
 ENTRY_BANDS = ((0.90, "0.85 to 0.90"), (0.96, "0.90 to 0.96"))
 VERDICT_THRESHOLD = 100
-SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book")
+SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "loss_rule")
 POSITIONS_TABLE = "price_target_book_positions"
 SKIPS_TABLE = "price_target_book_skips"
 BOOK_READS = 0
@@ -80,11 +81,13 @@ def record_skip(connection: sqlite3.Connection, now: datetime, reason: str) -> N
 
 
 def open_position(connection: sqlite3.Connection, event_id: str, market: dict,
-                  side: str, price: float, fee: float, now: datetime) -> None:
+                  side: str, price: float, fee: float, now: datetime,
+                  rules_path: Path | str | None = None) -> None:
     bond_open_position(
         connection, event_id, market, side, price, fee, now,
         table=POSITIONS_TABLE, bands=ENTRY_BANDS,
         max_open=MAX_OPEN, max_open_per_event=MAX_OPEN_PER_EVENT,
+        rules_path=rules_path,
     )
 
 

@@ -7,9 +7,35 @@ import sqlite3
 
 from andy_trader.bond_book import strategy_slice
 from andy_trader.env import REPO_ROOT
+from andy_trader.loss_rules import learn_rules
 
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "research" / "loss_review.md"
 TABLES = ("bond_book_positions", "price_target_book_positions")
+
+
+class EndGroups(dict):
+    """Dictionary of groups keyed by UTC datetime, with lookup support by ISO strings."""
+
+    def _normalize_key(self, key):
+        if super().__contains__(key):
+            return key
+        if isinstance(key, str):
+            try:
+                dt = utc_time(key)
+                if super().__contains__(dt):
+                    return dt
+            except Exception:
+                pass
+        return key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._normalize_key(key))
+
+    def get(self, key, default=None):
+        return super().get(self._normalize_key(key), default)
+
+    def __contains__(self, key):
+        return super().__contains__(self._normalize_key(key))
 
 
 def read_positions(database_path: Path) -> tuple[list[dict], dict[str, int]]:
@@ -40,7 +66,7 @@ def utc_time(value: str) -> datetime:
     timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
-    return timestamp.astimezone(UTC)
+    return timestamp.astimezone(UTC).replace(microsecond=0)
 
 
 def time_bucket(hours: float) -> str:
@@ -53,69 +79,111 @@ def time_bucket(hours: float) -> str:
     return "over 24h"
 
 
-def group_by_end(rows: list[dict]) -> dict[str, list[dict]]:
-    groups = {}
+def group_by_end(rows: list[dict]) -> EndGroups:
+    groups = EndGroups()
     for row in rows:
-        groups.setdefault(row["ends_at"], []).append(row)
+        end_val = row.get("ends_at")
+        if not end_val:
+            continue
+        try:
+            key = utc_time(end_val)
+        except Exception:
+            continue
+        groups.setdefault(key, []).append(row)
     return groups
 
 
-def row_tags(row: dict, end_count: int) -> dict[str, str]:
-    opened = utc_time(row["opened_at"])
-    hours = (utc_time(row["ends_at"]) - opened).total_seconds() / 3600
-    hour_start = opened.hour // 4 * 4
-    words = row["title"].split()
+def row_tags(row: dict, end_count: int = 1) -> dict[str, str]:
+    title = row.get("title") or "unknown"
+    side = row.get("side") or ""
+    entry_band = row.get("entry_band") or "unknown"
+    words = title.split()
+    asset = words[0] if words else "unknown"
+
+    opened_raw = row.get("opened_at")
+    ends_raw = row.get("ends_at")
+
+    if opened_raw:
+        try:
+            opened = utc_time(opened_raw)
+            hour_start = opened.hour // 4 * 4
+            open_hour = f"{hour_start:02d}-{hour_start + 3:02d}"
+        except Exception:
+            opened = None
+            open_hour = "unknown"
+    else:
+        opened = None
+        open_hour = "unknown"
+
+    if opened and ends_raw:
+        try:
+            ends = utc_time(ends_raw)
+            hours = (ends - opened).total_seconds() / 3600
+            time_tag = time_bucket(hours)
+        except Exception:
+            time_tag = "unknown"
+    else:
+        time_tag = "unknown"
+
+    if not ends_raw or end_count <= 0:
+        same_end = "unknown"
+    elif end_count < 3:
+        same_end = str(end_count)
+    else:
+        same_end = "3 or more"
+
     return {
-        "slice": strategy_slice(row["title"], row["side"]),
-        "entry_band": row["entry_band"],
-        "asset": words[0] if words else "",
-        "time_to_end": time_bucket(hours),
-        "open_hour": f"{hour_start:02d}-{hour_start + 3:02d}",
-        "same_end_count": str(end_count) if end_count < 3 else "3 or more",
+        "slice": strategy_slice(title, side),
+        "entry_band": entry_band,
+        "asset": asset,
+        "time_to_end": time_tag,
+        "open_hour": open_hour,
+        "same_end_count": same_end,
     }
 
 
 def summarize(rows: list[dict]) -> dict:
-    wins = [row["pnl"] for row in rows if row["win"]]
-    losses = [row["pnl"] for row in rows if not row["win"]]
+    wins = [row["pnl"] for row in rows if row.get("pnl") is not None and row["pnl"] >= 0]
+    losses = [row["pnl"] for row in rows if row.get("pnl") is not None and row["pnl"] < 0]
     return {
         "settled": len(rows),
         "wins": len(wins),
         "losses": len(losses),
         "loss_rate": len(losses) / len(rows) if rows else 0.0,
-        "pnl": sum(row["pnl"] for row in rows),
+        "pnl": sum(row["pnl"] for row in rows if row.get("pnl") is not None),
         "average_loss": sum(losses) / len(losses) if losses else 0.0,
         "average_win": sum(wins) / len(wins) if wins else 0.0,
     }
 
 
 def tag_summaries(rows: list[dict], ends: dict) -> list[tuple[str, str, dict]]:
-    groups = {}
+    groups: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
-        for tag, value in row_tags(row, len(ends[row["ends_at"]])).items():
+        end_count = len(ends.get(row.get("ends_at"), [])) if row.get("ends_at") else 1
+        for tag, value in row_tags(row, end_count).items():
             groups.setdefault((tag, value), []).append(row)
     return [(tag, value, summarize(group)) for (tag, value), group in sorted(groups.items())
             if len(group) >= 20]
 
 
-def loss_clusters(ends: dict) -> list[tuple[str, list[dict], dict]]:
+def loss_clusters(ends: dict) -> list[tuple[str | datetime, list[dict], dict]]:
     clusters = []
     for end, rows in ends.items():
         stats = summarize(rows)
         if stats["losses"] >= 2:
             clusters.append((end, rows, stats))
-    return sorted(clusters, key=lambda cluster: (cluster[2]["pnl"], cluster[0]))[:10]
+    return sorted(clusters, key=lambda cluster: (cluster[2]["pnl"], str(cluster[0])))[:10]
 
 
 def money(value: float) -> str:
     return f"{'-' if value < 0 else ''}${abs(value):,.2f}"
 
 
-def cell(value: str) -> str:
-    return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+def cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
-def build_report(rows: list[dict], counts: dict[str, int]) -> str:
+def build_report(rows: list[dict], counts: dict[str, int], rules: list[dict] | None = None) -> str:
     overall = summarize(rows)
     ends = group_by_end(rows)
     lines = [
@@ -133,7 +201,7 @@ def build_report(rows: list[dict], counts: dict[str, int]) -> str:
         "| Tag | Value | Settled | Losses | Loss rate | Total pnl | Status |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-    rules = []
+    suggested_rules = []
     for tag, value, stats in tag_summaries(rows, ends):
         flagged = stats["loss_rate"] > overall["loss_rate"] and stats["pnl"] < 0
         lines.append(
@@ -141,7 +209,7 @@ def build_report(rows: list[dict], counts: dict[str, int]) -> str:
             f"{stats['loss_rate']:.1%} | {money(stats['pnl'])} | {'FLAGGED' if flagged else ''} |"
         )
         if flagged:
-            rules.append(
+            suggested_rules.append(
                 f"Skip {tag} {cell(value)}: {stats['settled']} settled, loss rate "
                 f"{stats['loss_rate'] * 100:.1f} percent vs {overall['loss_rate'] * 100:.1f} "
                 f"percent overall, pnl {money(stats['pnl'])} if kept, would have been $0 if skipped."
@@ -152,11 +220,20 @@ def build_report(rows: list[dict], counts: dict[str, int]) -> str:
                   "| --- | --- | --- | --- | --- |"])
     clusters = loss_clusters(ends)
     for end, group, stats in clusters:
-        titles = "; ".join(cell(row["title"]) for row in group)
-        lines.append(f"| {cell(end)} | {titles} | {stats['settled']} | {stats['losses']} | {money(stats['pnl'])} |")
+        titles = "; ".join(cell(row.get("title") or "unknown") for row in group)
+        end_str = end.isoformat() if isinstance(end, datetime) else str(end)
+        lines.append(f"| {cell(end_str)} | {titles} | {stats['settled']} | {stats['losses']} | {money(stats['pnl'])} |")
     if not clusters:
         lines.extend(["", "No clusters with two or more losses."])
     lines.extend(["", "## Suggested rules (not applied)", "",
                   "In-sample hindsight: a forward paper test is needed before any rule is trusted.", ""])
-    lines.extend(rules or ["No tag stands out yet."])
+    lines.extend(suggested_rules or ["No tag stands out yet."])
+
+    active_rules = learn_rules(rows) if rules is None else rules
+    lines.extend(["", "## Rules now active", ""])
+    if active_rules:
+        lines.extend(f"- Skip {r['tag']} {cell(r['value'])}: {r['reason']}" for r in active_rules)
+    else:
+        lines.append("No rules active.")
+
     return "\n".join(lines) + "\n"

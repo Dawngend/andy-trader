@@ -144,13 +144,17 @@ def test_cli_and_database_unchanged(tmp_path, capsys, dry_run):
 def test_default_output_and_dry_run_preserves_existing_file(tmp_path, monkeypatch):
     database = tmp_path / "paper.db"
     output = tmp_path / "research" / "loss_review.md"
+    rules_file = tmp_path / "loss_rules.json"
     create_database(database, {})
     monkeypatch.setattr(runner, "default_database_path", lambda: database)
     monkeypatch.setattr(runner, "DEFAULT_OUTPUT_PATH", output)
+    monkeypatch.setattr(runner, "DEFAULT_RULES_PATH", rules_file)
     assert runner.main([]) == 0
     before = output.read_bytes(), output.stat().st_mtime_ns
+    before_rules = rules_file.read_bytes(), rules_file.stat().st_mtime_ns
     assert runner.main(["--dry-run"]) == 0
     assert (output.read_bytes(), output.stat().st_mtime_ns) == before
+    assert (rules_file.read_bytes(), rules_file.stat().st_mtime_ns) == before_rules
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
@@ -171,3 +175,51 @@ def test_output_cannot_overwrite_database(tmp_path, capsys):
     assert runner.main(["--database", str(database), "--output", str(database)]) == 1
     assert "Output must not overwrite the database" in capsys.readouterr().err
     assert database.read_bytes() == before
+
+
+def test_group_by_end_treats_equivalent_timestamps_as_same_moment():
+    rows = [
+        position(ends_at="2026-10-01T00:30:00Z"),
+        position(ends_at="2026-10-01T00:30:00+00:00"),
+        position(ends_at="2026-10-01T00:30:00.123456Z"),
+        position(ends_at="2026-10-01T00:30:00.000+00:00"),
+    ]
+    ends = group_by_end(rows)
+    assert len(ends) == 1
+    assert len(ends["2026-10-01T00:30:00Z"]) == 4
+    assert len(ends["2026-10-01T00:30:00.123456Z"]) == 4
+
+
+def test_null_fields_handled_gracefully(tmp_path):
+    database = tmp_path / "nulls.db"
+    row_with_nulls = position(
+        title=None,
+        entry_band=None,
+        opened_at=None,
+        ends_at=None,
+        pnl=-50.0,
+    )
+    create_database(database, {TABLES[0]: [row_with_nulls]})
+    rows, counts = read_positions(database)
+    assert len(rows) == 1
+    tags = row_tags(rows[0], 1)
+    assert tags["asset"] == "unknown"
+    assert tags["entry_band"] == "unknown"
+    assert tags["open_hour"] == "unknown"
+    assert tags["time_to_end"] == "unknown"
+    assert tags["same_end_count"] == "unknown"
+    report = build_report(rows, counts)
+    assert "# Loss Review Report" in report
+
+
+def test_win_loss_decided_by_pnl_not_win_column():
+    rows = [
+        dict(win=1, pnl=-10.0),
+        dict(win=0, pnl=10.0),
+        dict(win=0, pnl=0.0),
+    ]
+    summary = summarize(rows)
+    assert summary["losses"] == 1
+    assert summary["wins"] == 2
+    assert summary["loss_rate"] == 1 / 3
+    assert summary["pnl"] == 0.0
