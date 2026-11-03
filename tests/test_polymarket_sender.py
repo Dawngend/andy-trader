@@ -319,7 +319,8 @@ def test_late_answer_after_clear(setup, reject, capsys):
         setup.client.response = {'success': False, 'errorMsg': 'rejected'}
     result = send(setup)
     s.clear_stuck(result['id'], 'checked exchange', True, database_path=setup.path)
-    time.sleep(.25)
+    # The fake client answers after .15 seconds; wait well past that so a busy machine does not fail the test.
+    time.sleep(1)
     records = rows(setup)
     assert records[0]['status'] == 'cleared_by_operator'
     assert len(records) == (1 if reject else 2)
