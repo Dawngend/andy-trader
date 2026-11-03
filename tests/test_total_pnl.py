@@ -6,6 +6,7 @@ import pytest
 from andy_trader.store import connect
 from andy_trader.total_pnl import (
     REPORT_BUDGET,
+    GroupResult,
     _table_exists,
     collect_all_groups,
     collect_crypto_portfolios,
@@ -316,6 +317,40 @@ def test_three_hour_change_from_two_stored_snapshots(tmp_path):
     assert "last 30 minutes: +$20.00" in line
     assert "last 3 hours: +$20.00" in line
     assert "last 24 hours: not enough history" in line
+
+
+@pytest.mark.parametrize("previous_pnl", [50.0, -50.0])
+def test_report_without_current_total_does_not_invent_a_change(tmp_path, previous_pnl):
+    with connect(tmp_path / "missing_total.db") as conn:
+        create_snapshot_table(conn)
+        snapshot_time = (NOW - timedelta(hours=24)).isoformat()
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, ?, ?, 0.0)",
+            (snapshot_time, 100.0 + previous_pnl, previous_pnl),
+        )
+
+        report = format_report(conn, groups=[], recorded_at=NOW.isoformat(), current_time=NOW)
+
+        change_line = next(line for line in report.splitlines() if line.startswith("Change in total pnl:"))
+        assert change_line == "Change in total pnl: not available (current total P&L is missing)"
+        assert f"| {snapshot_time} |" in report
+
+
+def test_report_with_zero_current_total_still_calculates_changes(tmp_path):
+    with connect(tmp_path / "zero_total.db") as conn:
+        create_snapshot_table(conn)
+        conn.execute(
+            "INSERT INTO total_pnl_snapshots VALUES (?, 'TOTAL', 100.0, 150.0, 50.0, 0.0)",
+            ((NOW - timedelta(hours=24)).isoformat(),),
+        )
+        total = GroupResult(name="TOTAL", starting_cash=100.0, value=100.0, pnl=0.0, open_cost=0.0)
+
+        report = format_report(conn, groups=[total], recorded_at=NOW.isoformat(), current_time=NOW)
+
+        assert "last 30 minutes: -$50.00" in report
+        assert "last 3 hours: -$50.00" in report
+        assert "last 24 hours: -$50.00" in report
+        assert "current total P&L is missing" not in report
 
 
 def test_change_uses_nearest_snapshot_at_or_before_cutoff(tmp_path):

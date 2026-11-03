@@ -197,6 +197,12 @@ def run_survival(
     )
 
 
+def win_rate_cell(book: Bankroll) -> str:
+    if book.trades == 0:
+        return f"{'n/a':>10}"
+    return f"{book.win_rate:>10.2%}"
+
+
 def format_report(report: SurvivalReport) -> str:
     """Print the living and the dead. The graveyard is not optional."""
 
@@ -211,12 +217,12 @@ def format_report(report: SurvivalReport) -> str:
     for book in report.survivors:
         lines.append(
             f"{book.predictor:<26}{book.equity:>10.4f}{book.trades:>8}"
-            f"{book.win_rate:>10.2%}{book.max_drawdown:>10.2%}  alive"
+            f"{win_rate_cell(book)}{book.max_drawdown:>10.2%}  alive"
         )
     for book in report.retired:
         lines.append(
             f"{book.predictor:<26}{book.equity:>10.4f}{book.trades:>8}"
-            f"{book.win_rate:>10.2%}{book.max_drawdown:>10.2%}  "
+            f"{win_rate_cell(book)}{book.max_drawdown:>10.2%}  "
             f"RETIRED after trade {book.retired_after_trade}"
         )
 

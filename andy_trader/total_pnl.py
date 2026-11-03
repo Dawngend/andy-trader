@@ -570,8 +570,11 @@ def format_report(
             baseline_time, total_pnl, baseline_pnl
         )
 
-    changes = compute_pnl_changes(connection, total_pnl or 0.0, current_time)
-    change_line = format_pnl_change_line(changes)
+    if total_pnl is None:
+        change_line = "Change in total pnl: not available (current total P&L is missing)"
+    else:
+        changes = compute_pnl_changes(connection, total_pnl, current_time)
+        change_line = format_pnl_change_line(changes)
 
     recent_totals = fetch_recent_totals(connection, limit=24)
     history_lines = [

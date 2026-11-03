@@ -229,10 +229,11 @@ def compute_instrument_report(
     longest_run = 0
 
     for obs_at, venues in snapshots.items():
-        if len(venues) >= 2:
-            gap = max(venues.values()) - min(venues.values())
-        else:
-            gap = 0.0
+        if len(venues) < 2:
+            # One venue gives no cross-venue gap, so this snapshot is not measured.
+            # It neither counts as above nor below, and it does not break a run.
+            continue
+        gap = max(venues.values()) - min(venues.values())
         if gap > threshold:
             count_above += 1
             current_run += 1

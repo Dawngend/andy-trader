@@ -300,27 +300,27 @@ def format_report(connection: sqlite3.Connection) -> str:
         avg_profit = sum(profits) / n_bets
         low_ci, high_ci = compute_bootstrap_interval(profits)
 
-        half = n_bets // 2
-        if half > 0:
-            first_half_avg = sum(profits[:half]) / half
-            second_half_avg = sum(profits[half:]) / len(profits[half:])
-        else:
-            first_half_avg = avg_profit
-            second_half_avg = avg_profit
-
         lines.append(f"  Hit rate: {hit_rate:.3f}")
         lines.append(f"  Average ask: {avg_ask:.3f}")
         lines.append(f"  Average profit per contract: {avg_profit:+.4f} (after {FEE_PER_CONTRACT:.2f} fee)")
         lines.append(f"  95% bootstrap interval: [{low_ci:+.4f}, {high_ci:+.4f}]")
-        lines.append(f"  First half average profit: {first_half_avg:+.4f}")
-        lines.append(f"  Second half average profit: {second_half_avg:+.4f}")
+
+        half = n_bets // 2
+        if half > 0:
+            first_half_avg = sum(profits[:half]) / half
+            second_half_avg = sum(profits[half:]) / len(profits[half:])
+            lines.append(f"  First half average profit: {first_half_avg:+.4f}")
+            lines.append(f"  Second half average profit: {second_half_avg:+.4f}")
+        else:
+            lines.append("  First half average profit: n/a")
+            lines.append("  Second half average profit: n/a")
     else:
-        lines.append("  Hit rate: 0.000")
-        lines.append("  Average ask: 0.000")
-        lines.append(f"  Average profit per contract: +0.0000 (after {FEE_PER_CONTRACT:.2f} fee)")
-        lines.append("  95% bootstrap interval: [+0.0000, +0.0000]")
-        lines.append("  First half average profit: +0.0000")
-        lines.append("  Second half average profit: +0.0000")
+        lines.append("  Hit rate: n/a")
+        lines.append("  Average ask: n/a")
+        lines.append("  Average profit per contract: n/a")
+        lines.append("  95% bootstrap interval: n/a")
+        lines.append("  First half average profit: n/a")
+        lines.append("  Second half average profit: n/a")
 
     lines.append(f"  Bets so far: {n_bets} of {VERDICT_THRESHOLD} needed for a first verdict")
 
@@ -334,7 +334,7 @@ def format_report(connection: sqlite3.Connection) -> str:
         lines.append(f"  Hit rate: {high_hit_rate:.3f}")
         lines.append(f"  Average ask: {high_avg_ask:.3f}")
     else:
-        lines.append("  Hit rate: 0.000")
-        lines.append("  Average ask: 0.000")
+        lines.append("  Hit rate: n/a")
+        lines.append("  Average ask: n/a")
 
     return "\n".join(lines)

@@ -45,6 +45,16 @@ def test_overall_and_settled_filter(tmp_path):
     assert "price_target_book_positions: 2" in report
 
 
+@pytest.mark.parametrize("rows, expected_row", [
+    ([], "| 0 | 0 | 0 | n/a | $0.00 | n/a | n/a |"),
+    ([position(5), position(10)], "| 2 | 2 | 0 | 0.0% | $15.00 | n/a | $7.50 |"),
+    ([position(-10)], "| 1 | 0 | 1 | 100.0% | -$10.00 | -$10.00 | n/a |"),
+    ([position(0)], "| 1 | 1 | 0 | 0.0% | $0.00 | n/a | $0.00 |"),
+])
+def test_overall_row_marks_unobserved_values_not_applicable(rows, expected_row):
+    assert expected_row in build_report(rows, dict.fromkeys(TABLES, len(rows)), rules=[])
+
+
 def test_flagged_tags_and_minimum_sample(tmp_path):
     database = tmp_path / "paper.db"
     rows = [position(-95, title="XRP Up or Down") for _ in range(20)]

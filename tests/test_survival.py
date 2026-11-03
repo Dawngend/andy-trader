@@ -91,6 +91,16 @@ def test_an_abstaining_predictor_takes_no_trades_and_cannot_die() -> None:
     assert report.trades_evaluated == 0
     assert report.survivors[0].trades == 0
     assert report.survivors[0].equity == 1.0
+    assert report.survivors[0].win_rate == 0.0
+    abstainer = next(line for line in format_report(report).splitlines() if line.startswith("abstainer"))
+    assert abstainer.split()[3] == "n/a"
+
+
+def test_measured_zero_win_rate_stays_numeric() -> None:
+    trades = [_trade("loser", up=True, correct=False)]
+    text = format_report(run_survival(trades, grace_trades=100))
+    loser = next(line for line in text.splitlines() if line.startswith("loser"))
+    assert loser.split()[3] == "0.00%"
 
 
 def test_costs_make_a_coin_flip_bleed() -> None:

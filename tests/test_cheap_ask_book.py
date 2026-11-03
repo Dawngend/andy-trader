@@ -285,7 +285,73 @@ def test_report_ignores_settled_rows_with_no_ask(db: sqlite3.Connection) -> None
     insert_observation(db, up_best_ask=None, up_depth=None)
     run_once(db, now=NOW)
 
-    assert "ask_too_high: 1" in format_report(db)
+    report_text = format_report(db)
+    assert "ask_too_high: 1" in report_text
+    assert "Hit rate: n/a" in report_text
+    assert "Average ask: n/a" in report_text
+
+
+@pytest.mark.parametrize("win, expected_profit", [(1, "+0.5800"), (0, "-0.4200")])
+def test_report_single_bet_has_no_half_averages(
+    db: sqlite3.Connection, win: int, expected_profit: str,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO cheap_ask_decisions
+            (prediction_id, decided_at, ask, decision, win, settled_at)
+        VALUES (1, ?, 0.40, 'bet', ?, ?)
+        """,
+        (PRED_CREATED.isoformat(), win, NOW.isoformat()),
+    )
+
+    report = format_report(db)
+
+    assert "Number of bets: 1" in report
+    assert f"Average profit per contract: {expected_profit}" in report
+    assert "First half average profit: n/a" in report
+    assert "Second half average profit: n/a" in report
+
+
+@pytest.mark.parametrize("n_bets, expected_second_half", [(2, "-0.5200"), (3, "-0.0700")])
+def test_report_half_averages_use_separate_ordered_bets(
+    db: sqlite3.Connection, n_bets: int, expected_second_half: str,
+) -> None:
+    rows = [
+        (3, "2026-10-25T12:01:00+00:00", 0.40, 1, NOW.isoformat()),
+        (2, "2026-10-25T12:02:00+00:00", 0.50, 0, NOW.isoformat()),
+        (1, "2026-10-25T12:03:00+00:00", 0.60, 1, NOW.isoformat()),
+    ]
+    db.executemany(
+        """
+        INSERT INTO cheap_ask_decisions
+            (prediction_id, decided_at, ask, decision, win, settled_at)
+        VALUES (?, ?, ?, 'bet', ?, ?)
+        """,
+        list(reversed(rows[:n_bets])),
+    )
+
+    report = format_report(db)
+
+    assert f"Number of bets: {n_bets}" in report
+    assert "First half average profit: +0.5800" in report
+    assert f"Second half average profit: {expected_second_half}" in report
+
+
+def test_report_empty_book_shows_not_available(db: sqlite3.Connection) -> None:
+    """No settled bets yet must read n/a, never fabricated zeros."""
+    report_text = format_report(db)
+
+    assert "Number of bets: 0" in report_text
+    assert "Bets so far: 0 of 100 needed for a first verdict" in report_text
+    assert "Hit rate: 0.000" not in report_text
+    assert "Average ask: 0.000" not in report_text
+    assert "Average profit per contract: +0.0000" not in report_text
+    assert "95% bootstrap interval: [+0.0000, +0.0000]" not in report_text
+    assert report_text.count("Hit rate: n/a") == 2
+    assert "Average profit per contract: n/a" in report_text
+    assert "95% bootstrap interval: n/a" in report_text
+    assert "First half average profit: n/a" in report_text
+    assert "Second half average profit: n/a" in report_text
 
 
 def test_running_twice_in_a_row_changes_nothing(db: sqlite3.Connection) -> None:

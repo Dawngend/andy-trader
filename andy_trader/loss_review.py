@@ -168,6 +168,9 @@ def cell(value: object) -> str:
 
 def build_report(rows: list[dict], counts: dict[str, int], rules: list[dict] | None = None) -> str:
     overall = summarize(rows)
+    loss_rate = f"{overall['loss_rate']:.1%}" if overall["settled"] else "n/a"
+    average_loss = money(overall["average_loss"]) if overall["losses"] else "n/a"
+    average_win = money(overall["average_win"]) if overall["wins"] else "n/a"
     ends = group_by_end(rows)
     lines = [
         "# Loss Review Report", "",
@@ -178,8 +181,8 @@ def build_report(rows: list[dict], counts: dict[str, int], rules: list[dict] | N
         "| Settled | Wins | Losses | Loss rate | Total pnl | Average loss | Average win |",
         "| --- | --- | --- | --- | --- | --- | --- |",
         f"| {overall['settled']} | {overall['wins']} | {overall['losses']} | "
-        f"{overall['loss_rate']:.1%} | {money(overall['pnl'])} | "
-        f"{money(overall['average_loss'])} | {money(overall['average_win'])} |",
+        f"{loss_rate} | {money(overall['pnl'])} | "
+        f"{average_loss} | {average_win} |",
         "", "## By tag", "", "Only values with at least 20 settled rows are listed.", "",
         "| Tag | Value | Settled | Losses | Loss rate | Total pnl | Status |",
         "| --- | --- | --- | --- | --- | --- | --- |",

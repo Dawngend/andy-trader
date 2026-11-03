@@ -43,7 +43,7 @@ ENTRY_BANDS = ((0.90, "0.80 to 0.90"), (0.95, "0.90 to 0.95"), (1.0, "0.95 to 0.
 VERDICT_THRESHOLD = 100
 PAGE_SIZE = 100
 TIMEOUT_SECONDS = 10
-SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "margin_too_small", "loss_rule")
+SKIP_REASONS = ("ask_too_low", "ask_too_high", "thin_book", "margin_too_small", "loss_rule", "slice_paused")
 DATA_ERRORS = (CompleteSetError, OSError, ValueError, TypeError, KeyError)
 BOOK_READS = 0
 
@@ -355,12 +355,19 @@ def report_row(label: str, rows: list) -> str:
     price = average([row["fill_price"] for row in rows])
     rate = wins / len(rows) if rows else 0.0
     profit = average([row["pnl"] / row["shares"] for row in rows])
-    win_dollars = average([row["pnl"] for row in rows if row["win"]])
-    loss_dollars = average([row["pnl"] for row in rows if not row["win"]])
+    win_pnls = [row["pnl"] for row in rows if row["win"]]
+    loss_pnls = [row["pnl"] for row in rows if not row["win"]]
     if not rows:
         return f"{label} | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a"
+    # An empty group is "none yet", not a $0.00 result.
+    average_win = f"${average(win_pnls):+.2f}" if win_pnls else "n/a"
+    average_loss = f"${average(loss_pnls):+.2f}" if loss_pnls else "n/a"
     return (f"{label} | {len(rows)} | {wins} | {price:.4f} | {rate:.2%} | "
-            f"{rate - price:+.2%} | ${profit:+.4f} | ${win_dollars:+.2f} | ${loss_dollars:+.2f}")
+            f"{rate - price:+.2%} | ${profit:+.4f} | {average_win} | {average_loss}")
+
+
+def worst_loss(losses: list) -> str:
+    return f"${min(losses):.2f}" if losses else "n/a"
 
 
 def cohort_report_row(label: str, rows: list) -> str:
@@ -443,7 +450,7 @@ def format_report(connection: sqlite3.Connection) -> str:
     lines.append(report_row("Overall", rows))
     losses = [r["pnl"] for r in rows if not r["win"]]
     wins = [r["pnl"] for r in rows if r["win"]]
-    lines.append(f"Worst loss: ${min(losses, default=0):.2f}")
+    lines.append(f"Worst loss: {worst_loss(losses)}")
     ratio = f"{abs(average(losses)) / average(wins):.2f}" if losses and wins and average(wins) > 0 else "n/a"
     lines.append(f"Average wins wiped out by one average loss: {ratio}")
     low, high = compute_bootstrap_interval([r["pnl"] for r in rows])
@@ -469,7 +476,7 @@ def format_report(connection: sqlite3.Connection) -> str:
         slice_rows = by_slice[name]
         lines.append(report_row(name, slice_rows))
         slice_losses = [r["pnl"] for r in slice_rows if not r["win"]]
-        lines.append(f"  worst loss: ${min(slice_losses, default=0):.2f}")
+        lines.append(f"  worst loss: {worst_loss(slice_losses)}")
     shown = [name for name in SLICES if name in by_slice or name in open_by_slice]
     if shown:
         open_counts = ", ".join(f"{name} {open_by_slice.get(name, 0)}" for name in shown)

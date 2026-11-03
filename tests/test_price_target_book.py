@@ -217,6 +217,9 @@ def test_report_verdict_when_100_settled(db):
             )
     report = pt.format_report(db)
     assert "Verdict: positive edge shown (100 settled, including 0 losses)" in report
+    assert "Worst loss: n/a" in report
+    assert "Worst loss: $0.00" not in report
+    assert "Overall | 100 | 100 | 0.9000 | 100.00% | +10.00% | $+0.0937 | $+9.37 | n/a" in report
 
 
 def test_runner_journal_and_lock(db, network, tmp_path, monkeypatch, capsys):

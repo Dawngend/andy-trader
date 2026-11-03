@@ -12,7 +12,7 @@ from andy_trader.bond_book import (
     CLOB_BOOK_URL, CRYPTO_TAKER_FEE_RATE, DATA_ERRORS,
     SLICES, SLICE_HEADER, TIMEOUT_SECONDS, average,
     compute_bootstrap_interval, report_row, settled_winner,
-    strategy_slice, walk_ask_book,
+    strategy_slice, walk_ask_book, worst_loss,
 )
 from andy_trader.wallet_scout import PublicReader
 
@@ -27,6 +27,7 @@ MAX_FILL = 0.98
 MAX_OPEN = 60
 VERDICT_THRESHOLD = 100
 SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open")
+WALLET_HEADER = SLICE_HEADER.replace("Slice |", "Wallet |", 1)
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
 BOOK_READS = 0
@@ -336,11 +337,11 @@ def format_report(connection: sqlite3.Connection) -> str:
         for reason in SKIP_REASONS:
             lines.append(f"  {reason}: {skips.get(reason, 0)}")
 
-        lines.append(SLICE_HEADER)
+        lines.append(WALLET_HEADER)
         lines.append(report_row(wallet_name, settled_rows))
 
         losses = [float(r["pnl"]) for r in settled_rows if not r["win"]]
-        lines.append(f"Worst loss: ${min(losses, default=0):.2f}")
+        lines.append(f"Worst loss: {worst_loss(losses)}")
 
         delays = [float(r["delay_seconds"]) for r in all_wallet_rows if r.get("delay_seconds") is not None]
         median_delay = f"{statistics.median(delays):.1f}s" if delays else "n/a"

@@ -14,7 +14,7 @@ from andy_trader.bond_book import (
     compute_bootstrap_interval, fetch_events, gamma_price, list_field,
     open_position as bond_open_position, record_skip as bond_record_skip,
     report_row, settle_positions as bond_settle_positions,
-    settled_winner, walk_ask_book,
+    settled_winner, walk_ask_book, worst_loss,
 )
 
 # Reference bond_book._http_json directly so mocking bond_book._http_json works
@@ -182,7 +182,7 @@ def format_report(connection: sqlite3.Connection) -> str:
     lines.append(report_row("Overall", rows))
     losses = [r["pnl"] for r in rows if not r["win"]]
     wins = [r["pnl"] for r in rows if r["win"]]
-    lines.append(f"Worst loss: ${min(losses, default=0):.2f}")
+    lines.append(f"Worst loss: {worst_loss(losses)}")
     ratio = f"{abs(average(losses)) / average(wins):.2f}" if losses and wins and average(wins) > 0 else "n/a"
     lines.append(f"Average wins wiped out by one average loss: {ratio}")
     low, high = compute_bootstrap_interval([r["pnl"] for r in rows])

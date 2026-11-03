@@ -309,11 +309,22 @@ def test_format_report(db):
     assert "Settled positions: 2" in rep
     assert "thin_book: 1" in rep
     assert "Worst loss: $-90.63" in rep
+    assert "Worst loss: $0.00" not in rep
+    assert "Worst loss: n/a" in rep
     assert "Median delay_seconds: 6.0s" in rep
     assert "Average price difference (fill - their): +0.0000" in rep
     assert "Bootstrap 95 percent interval for average pnl per position:" in rep
     assert "Verdict: not enough settled positions yet (2 of 100)" in rep
     assert "By strategy slice" in rep
+
+
+def test_format_report_wallet_row_has_wallet_heading(db):
+    rep = copy.format_report(db)
+    lines = rep.splitlines()
+    wallet_row = lines.index("sharky6999 | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a")
+    assert lines[wallet_row - 1].startswith("Wallet | Settled | Wins |")
+    assert lines[lines.index("By strategy slice") + 1].startswith("Slice | Settled | Wins |")
+    assert copy.WALLET_HEADER == copy.SLICE_HEADER.replace("Slice |", "Wallet |", 1)
 
 
 def test_runner_journal_and_lock(db, network, tmp_path, monkeypatch, capsys):

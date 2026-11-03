@@ -797,13 +797,21 @@ Run `python run_bond_book.py --report` for one public-data pass and a report;
 `--database PATH` selects a different local database. Errors are recorded in
 `.bond-book.jsonl`. No orders are placed and no schedule is installed.
 
+To review a past cohort without collecting or settling anything, run
+`python run_bond_book.py --database PATH --cohort-since YYYY-MM-DD`. It opens an
+existing database read-only, includes positions opened on or after that UTC date,
+and prints the report without running a pass. Both `--database` and a valid date
+are required, and a missing database or table returns an error instead of creating one.
+
 The book buys 100 paper shares of either side of an active binary crypto price
 market ending within three days (reach, dip, above, below, or Up or Down).
-The full ask fill must average 0.80 through 0.98 and leave at least 0.015 per share
-after entry fees. Fees use `taker_fee` at each filled level with the 0.07 crypto rate.
-It holds at most 30 positions, with at most two per event. A unique market-side
-key prevents repeat purchases, including after settlement; database transactions
-enforce the limits during overlapping runs. No lock file is used.
+The full ask fill must average 0.90 through 0.95 inclusive and leave at least
+0.015 per share after entry fees. Fees use `taker_fee` at each filled level with
+the 0.07 crypto rate. New Up or Down entries are paused; the slice stays in old
+results but no longer accepts positions. It holds at most 30 positions, with at
+most two per event. A unique market-side key prevents repeat purchases, including
+after settlement; database transactions enforce the limits during overlapping runs.
+No lock file is used.
 
 Closed markets settle only when Gamma reports one outcome at least 0.99 and the
 other at most 0.01. Winners pay 1 per share with no exit fee; unclear results stay
@@ -811,7 +819,11 @@ open. Gamma's event `crypto` tag (id 21), market `endDate`, and JSON-encoded
 `outcomes`, `clobTokenIds`, and `outcomePrices` were checked with public reads on
 2026-10-27.
 
-The report groups settled results into [0.80, 0.90), [0.90, 0.95), and [0.95, 0.98].
+The report groups settled results by their stored entry band: 0.80 to 0.90,
+0.90 to 0.95, and 0.95 to 0.98. Older positions may retain the band label
+stored when they were opened.
+The cohort report applies the current 0.90 to 0.95 entry rule and leaves out
+paused slices, so use the regular report to see old bands.
 The win-rate gap above average entry price measures the edge before fees; profit
 per share includes fees. Dollar wins, losses, and the loss-to-win ratio show how
 many wins a loss erases. Skip counts are daily side checks, so repeat checks count

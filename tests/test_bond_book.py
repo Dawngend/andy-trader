@@ -332,7 +332,9 @@ def test_report_strategy_slices(db):
     assert ("price_target_no | 2 | 1 | 0.9000 | 50.00% | -40.00% | "
             "$-0.4063 | $+9.37 | $-90.63") in report
     assert ("up_down | 1 | 1 | 0.9000 | 100.00% | +10.00% | "
-            "$+0.0937 | $+9.37 | $+0.00") in report
+            "$+0.0937 | $+9.37 | n/a") in report
+    assert "  worst loss: $-90.63" in report
+    assert "  worst loss: n/a" in report
     assert report.index("price_target_no |") < report.index("up_down |")
     assert "above_below |" not in report
     assert "Open positions by slice: price_target_no 0, up_down 0, above_below 1" in report
@@ -355,6 +357,17 @@ def test_verdict_and_loss_statistics(db, losses, verdict):
     if losses:
         assert "Worst loss: $-90.63" in report
         assert "one average loss: 9.67" in report
+    else:
+        assert "Worst loss: n/a" in report
+        assert "Worst loss: $0.00" not in report
+        assert "Overall | 100 | 100 | 0.9000 | 100.00% | +10.00% | $+0.0937 | $+9.37 | n/a" in report
+
+
+def test_report_row_with_no_wins_shows_average_win_as_not_available():
+    rows = [{"win": 0, "fill_price": 0.9, "pnl": -90.63, "shares": 100}]
+    assert bond.report_row("Overall", rows) == (
+        "Overall | 1 | 0 | 0.9000 | 0.00% | -90.00% | $-0.9063 | n/a | $-90.63"
+    )
 
 
 @pytest.mark.parametrize("same_side,limit", [(True, 30), (False, 1)])
@@ -386,6 +399,7 @@ def test_paused_slice_skips_up_down_market_side(db, network):
     assert network["book_calls"] == []
     assert positions(db) == []
     assert dict(db.execute("SELECT reason, count FROM bond_book_skips")) == {"slice_paused": 2}
+    assert "slice_paused: 2" in bond.format_report(db)
 
 
 def test_above_below_market_side_still_opens_position(db, network):

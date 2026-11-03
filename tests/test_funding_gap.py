@@ -364,6 +364,45 @@ def test_empty_database_report(db):
     assert "No observations recorded" in text
 
 
+def insert_snapshot(db, obs_time, venue_rates):
+    for venue, ann in venue_rates.items():
+        db.execute(
+            """
+            INSERT INTO funding_gap_observations
+            (observed_at, instrument, venue, funding_rate, interval_hours, annualized)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (obs_time, "BTC-USD", venue, ann * 8 / 8760, 8.0, ann),
+        )
+
+
+def test_one_venue_snapshot_is_not_counted_as_a_zero_gap(db):
+    """A snapshot with one venue has no gap, so it must not end a run above 15%."""
+    funding_gap.initialize_database(db)
+    insert_snapshot(db, "2026-10-25T00:00:00+00:00", {"bybit": 0.0, "binance": 0.20})
+    insert_snapshot(db, "2026-10-25T01:00:00+00:00", {"bybit": 0.0})
+    insert_snapshot(db, "2026-10-25T02:00:00+00:00", {"bybit": 0.0, "binance": 0.18})
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["snapshots_above_15"] == 2
+    assert report["longest_consecutive_above_15"] == 2
+
+
+def test_real_zero_gap_still_ends_a_run(db):
+    """Two venues at the same rate are a measured zero gap, which does end a run."""
+    funding_gap.initialize_database(db)
+    insert_snapshot(db, "2026-10-25T00:00:00+00:00", {"bybit": 0.0, "binance": 0.20})
+    insert_snapshot(db, "2026-10-25T01:00:00+00:00", {"bybit": 0.10, "binance": 0.10})
+    insert_snapshot(db, "2026-10-25T02:00:00+00:00", {"bybit": 0.0, "binance": 0.18})
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["snapshots_above_15"] == 2
+    assert report["longest_consecutive_above_15"] == 1
+    assert "Latest gap: 0.1800 (18.00% annualized)" in funding_gap.format_report(db)
+
+
 def test_prompt_btc_funding_gap_example(db):
     """Verify the prompt's real-world example calculation:
     Binance +0.0009%, Bybit -0.0009%, OKX +0.0045% gives ~5.9% annualized gap."""
