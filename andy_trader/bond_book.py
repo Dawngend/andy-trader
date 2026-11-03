@@ -363,6 +363,68 @@ def report_row(label: str, rows: list) -> str:
             f"{rate - price:+.2%} | ${profit:+.4f} | ${win_dollars:+.2f} | ${loss_dollars:+.2f}")
 
 
+def cohort_report_row(label: str, rows: list) -> str:
+    settled = [row for row in rows if row["settled_at"] is not None]
+    open_count = len(rows) - len(settled)
+    if not settled:
+        return f"{label} | 0 | {open_count} | n/a | n/a | n/a"
+    profits = [row["pnl"] for row in settled]
+    low, high = compute_bootstrap_interval(profits)
+    return (f"{label} | {len(settled)} | {open_count} | ${sum(profits):+.2f} | "
+            f"${average(profits):+.2f} | [${low:+.2f}, ${high:+.2f}]")
+
+
+def format_cohort_report(connection: sqlite3.Connection, start_date: str) -> str:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date):
+        raise ValueError("Use a cohort start date in YYYY-MM-DD format")
+    start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC)
+    active_slices = [name for name in SLICES if name not in PAUSED_SLICES]
+    rows = connection.execute(
+        "SELECT * FROM bond_book_positions ORDER BY opened_at, market_id, side"
+    ).fetchall()
+    cohort = []
+    for row in rows:
+        opened = datetime.fromisoformat(row["opened_at"])
+        opened = opened.replace(tzinfo=UTC) if opened.tzinfo is None else opened.astimezone(UTC)
+        if opened < start or strategy_slice(row["title"], row["side"]) not in active_slices:
+            continue
+        if not MIN_ASK <= row["fill_price"] <= MAX_ASK:
+            continue
+        if row["shares"] <= 0 or 1 - row["fill_price"] - row["fee"] / row["shares"] < MIN_MARGIN:
+            continue
+        cohort.append(row)
+    header = ("Settled | Open | Total pnl after fees | Average pnl per settled position | "
+              "95 percent bootstrap interval of average pnl per settled position")
+    lines = [
+        "Bond Book Cohort (paper only, read-only)",
+        f"Opened on or after {start_date} 00:00:00 UTC (inclusive)",
+        f"Entry prices: {MIN_ASK:.2f} to {MAX_ASK:.2f} inclusive. Minimum margin after fees: {MIN_MARGIN:.2%}.",
+        f"Active strategy slices: {', '.join(active_slices)}",
+        "Historical position limits and loss rules are not replayed.",
+        "Pnl uses stored settled results after fees. Open positions are excluded from pnl and intervals.",
+        "Intervals resample positions, not independent events. They are not proof of an edge.",
+        "Entry bands use stored labels. An entry at 0.95 is in 0.95 to 0.98.",
+        "", "Cohort | " + header, cohort_report_row("Overall", cohort),
+    ]
+    if not cohort:
+        lines.append("No positions match this cohort.")
+    lines.extend(["", "By active strategy slice", "Slice | " + header])
+    for name in active_slices:
+        slice_rows = [row for row in cohort if strategy_slice(row["title"], row["side"]) == name]
+        lines.append(cohort_report_row(name, slice_rows))
+    lines.extend(["", "By entry band", "Entry band | " + header])
+    for _, label in ENTRY_BANDS:
+        lines.append(cohort_report_row(label, [row for row in cohort if row["entry_band"] == label]))
+    lines.extend(["", "By active strategy slice and entry band", "Slice | Entry band | " + header])
+    for name in active_slices:
+        for _, label in ENTRY_BANDS:
+            group = [row for row in cohort if strategy_slice(row["title"], row["side"]) == name
+                     and row["entry_band"] == label]
+            if group:
+                lines.append(cohort_report_row(f"{name} | {label}", group))
+    return "\n".join(lines)
+
+
 def format_report(connection: sqlite3.Connection) -> str:
     rows = connection.execute(
         "SELECT * FROM bond_book_positions WHERE settled_at IS NOT NULL ORDER BY opened_at, market_id, side"

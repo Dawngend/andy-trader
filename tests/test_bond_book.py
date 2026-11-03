@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 import json
+import sqlite3
 from threading import Barrier
 from urllib.parse import parse_qs, urlparse
 
@@ -417,3 +418,185 @@ def test_empty_paused_slices_allows_up_down_entry(db, network, monkeypatch):
     row, = positions(db)
     assert row["side"] == "Yes"
     assert row["market_id"] == "m1"
+
+
+def add_cohort_position(db, mid, *, title="Will Bitcoin reach 150,000?", side="No",
+                        opened_at="2026-10-30T00:00:00+00:00", price=0.9, fee=0.5, win=None):
+    band = next(label for upper, label in bond.ENTRY_BANDS if price < upper)
+    settled_at = "2026-11-01T00:00:00+00:00" if win is not None else None
+    pnl = 100 * (win - price) - fee if win is not None else None
+    with db:
+        db.execute("""
+            INSERT INTO bond_book_positions
+            (market_id, event_id, title, side, entry_band, fill_price, fee, shares,
+             opened_at, ends_at, settled_at, win, pnl)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (mid, mid, title, side, band, price, fee, 100, opened_at,
+              "2026-10-31T00:00:00+00:00", settled_at, win, pnl))
+
+
+def block_cohort_side_effects(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Cohort reporting must not collect, initialize, settle, or journal")
+
+    for name in ("connect", "default_database_path", "run_once", "journal"):
+        monkeypatch.setattr(runner, name, unexpected)
+    for name in ("initialize_bond_book", "settle_positions", "_http_json"):
+        monkeypatch.setattr(bond, name, unexpected)
+
+
+def test_cohort_report_counts_net_pnl_and_intervals(db):
+    add_cohort_position(db, "win", win=1)
+    add_cohort_position(db, "loss", win=0)
+    add_cohort_position(db, "open")
+    add_cohort_position(db, "boundary", title="Bitcoin above 100,000?", side="Yes", price=0.95, win=1)
+    with db:
+        db.execute("UPDATE bond_book_positions SET pnl=999 WHERE market_id='open'")
+    before = bond.format_report(db)
+    report = bond.format_cohort_report(db, "2026-10-30")
+    assert "Overall | 3 | 1 | $-76.50 | $-25.50 | [$-90.50, $+9.50]" in report
+    assert "price_target_no | 2 | 1 | $-81.00 | $-40.50 | [$-90.50, $+9.50]" in report
+    assert "above_below | 1 | 0 | $+4.50 | $+4.50 | [$+4.50, $+4.50]" in report
+    assert "0.90 to 0.95 | 2 | 1 | $-81.00 | $-40.50 | [$-90.50, $+9.50]" in report
+    assert "0.95 to 0.98 | 1 | 0 | $+4.50 | $+4.50 | [$+4.50, $+4.50]" in report
+    assert "price_target_no | 0.90 to 0.95 | 2 | 1 | $-81.00" in report
+    assert "95 percent bootstrap interval of average pnl per settled position" in report
+    assert "not proof of an edge" in report
+    assert report == bond.format_cohort_report(db, "2026-10-30")
+    assert bond.format_report(db) == before
+
+
+def test_cohort_report_excludes_old_paused_and_outside_current_rules(db):
+    add_cohort_position(db, "old", opened_at="2026-10-29T23:59:59.999999Z", win=0)
+    add_cohort_position(db, "old-open", opened_at="2026-10-29T23:59:59Z")
+    add_cohort_position(db, "paused", title="Bitcoin Up or Down?", side="Up", win=0)
+    add_cohort_position(db, "paused-open", title="Bitcoin Up or Down?", side="Down")
+    add_cohort_position(db, "low", price=0.89, win=0)
+    add_cohort_position(db, "high", price=0.96, win=0)
+    add_cohort_position(db, "margin", price=0.95, fee=4, win=0)
+    add_cohort_position(db, "current", win=1)
+    report = bond.format_cohort_report(db, "2026-10-30")
+    assert "Overall | 1 | 0 | $+9.50 | $+9.50 | [$+9.50, $+9.50]" in report
+    assert "up_down |" not in report
+
+
+@pytest.mark.parametrize("opened_at,included", [
+    ("2026-10-29T23:59:59.999999+00:00", False),
+    ("2026-10-30T00:00:00+00:00", True),
+    ("2026-10-30T00:00:00Z", True),
+    ("2026-10-30T00:00:00", True),
+    ("2026-10-30T07:59:59+08:00", False),
+    ("2026-10-30T08:00:00+08:00", True),
+    ("2026-10-29T20:00:00-04:00", True),
+])
+def test_cohort_report_uses_inclusive_utc_entry_date(db, opened_at, included):
+    add_cohort_position(db, "sample", opened_at=opened_at)
+    report = bond.format_cohort_report(db, "2026-10-30")
+    assert f"Overall | 0 | {int(included)} | n/a | n/a | n/a" in report
+
+
+@pytest.mark.parametrize("start_date", ["", "bad", "2026-02-30", "2026-13-01", "20261030",
+                                        "2026-1-1", "2026-10-30T00:00:00Z"])
+def test_cohort_report_rejects_invalid_start_date(db, start_date):
+    with pytest.raises(ValueError):
+        bond.format_cohort_report(db, start_date)
+
+
+@pytest.mark.parametrize("open_count", [0, 1])
+def test_cohort_report_without_settled_positions(db, open_count):
+    if open_count:
+        add_cohort_position(db, "open", side="Yes")
+    report = bond.format_cohort_report(db, "2026-10-30")
+    assert f"Overall | 0 | {open_count} | n/a | n/a | n/a" in report
+    assert f"price_target_yes | 0 | {open_count} | n/a | n/a | n/a" in report
+    assert ("No positions match this cohort." in report) == (open_count == 0)
+    assert "positive edge shown" not in report
+    assert "[$+0.00, $+0.00]" not in report
+
+
+def test_cohort_report_only_reads_positions(db):
+    add_cohort_position(db, "sample", win=1)
+    with db:
+        db.execute("DROP TABLE bond_book_skips")
+    db.set_authorizer(lambda action, *args: sqlite3.SQLITE_OK
+                      if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ) else sqlite3.SQLITE_DENY)
+    try:
+        report = bond.format_cohort_report(db, "2026-10-30")
+    finally:
+        db.set_authorizer(None)
+    assert "Overall | 1 | 0" in report
+
+
+def test_cohort_cli_opens_existing_database_read_only(db, tmp_path, monkeypatch, capsys):
+    add_cohort_position(db, "sample", win=1)
+    path = tmp_path / "paper #1.db"
+    destination = sqlite3.connect(path)
+    db.backup(destination)
+    destination.close()
+    before = path.read_bytes()
+    block_cohort_side_effects(monkeypatch)
+    original_connect = sqlite3.connect
+    connections = []
+
+    def read_only_connect(database, **kwargs):
+        assert database == path.resolve().as_uri() + "?mode=ro"
+        assert kwargs == {"uri": True}
+        connection = original_connect(database, **kwargs)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM bond_book_positions")
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(runner.sqlite3, "connect", read_only_connect)
+    assert runner.main(["--database", str(path), "--cohort-since", "2026-10-30"]) == 0
+    output = capsys.readouterr()
+    assert "Overall | 1 | 0 | $+9.50" in output.out
+    assert output.err == ""
+    assert path.read_bytes() == before
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+
+
+def test_cohort_cli_requires_explicit_database(monkeypatch, capsys):
+    block_cohort_side_effects(monkeypatch)
+    with pytest.raises(SystemExit) as error:
+        runner.main(["--cohort-since", "2026-10-30"])
+    assert error.value.code == 2
+    assert "requires --database" in capsys.readouterr().err
+
+
+def test_cohort_cli_cannot_be_combined_with_normal_report(monkeypatch):
+    block_cohort_side_effects(monkeypatch)
+    with pytest.raises(SystemExit) as error:
+        runner.main(["--cohort-since", "2026-10-30", "--report"])
+    assert error.value.code == 2
+
+
+def test_cohort_cli_does_not_create_missing_database(tmp_path, monkeypatch, capsys):
+    block_cohort_side_effects(monkeypatch)
+    path = tmp_path / "missing" / "paper.db"
+    assert runner.main(["--database", str(path), "--cohort-since", "2026-10-30"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "Cannot read bond book cohort" in output.err
+    assert not path.parent.exists()
+
+
+def test_cohort_cli_does_not_initialize_missing_table(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "empty.db"
+    sqlite3.connect(path).close()
+    before = path.read_bytes()
+    block_cohort_side_effects(monkeypatch)
+    assert runner.main(["--database", str(path), "--cohort-since", "2026-10-30"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "no such table: bond_book_positions" in output.err
+    assert path.read_bytes() == before
+
+
+def test_cohort_cli_invalid_date_does_not_journal(db, tmp_path, monkeypatch, capsys):
+    block_cohort_side_effects(monkeypatch)
+    assert runner.main(["--database", str(tmp_path / "book.db"), "--cohort-since", "bad"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "YYYY-MM-DD" in output.err

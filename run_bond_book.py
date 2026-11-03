@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import sqlite3
+import sys
 import time
 
 from andy_trader import bond_book
@@ -23,8 +26,24 @@ def journal(event: str, **details: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", help="Path to database file")
-    parser.add_argument("--report", action="store_true", help="Print summary after the pass")
+    reports = parser.add_mutually_exclusive_group()
+    reports.add_argument("--report", action="store_true", help="Print summary after the pass")
+    reports.add_argument("--cohort-since", metavar="YYYY-MM-DD",
+                         help="Read-only cohort report from this UTC entry date. Requires --database. No pass is run.")
     args = parser.parse_args(argv)
+    if args.cohort_since is not None:
+        if not args.database:
+            parser.error("--cohort-since requires --database pointing to an existing database")
+        try:
+            uri = Path(args.database).resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                connection.row_factory = sqlite3.Row
+                report = bond_book.format_cohort_report(connection, args.cohort_since)
+            print(report)
+            return 0
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            print(f"Cannot read bond book cohort: {exc}", file=sys.stderr)
+            return 1
     try:
         started = time.monotonic()
         path = Path(args.database) if args.database else default_database_path()
