@@ -8,6 +8,7 @@ from andy_trader.bond_book import (
     compute_bootstrap_interval,
     strategy_slice,
 )
+from andy_trader.total_pnl import POLYMARKET_BOOKS
 
 HEADER = (
     "Strategy | Settled | Open | Wins | Win rate | Average entry price | "
@@ -157,3 +158,38 @@ def format_board(connection: sqlite3.Connection) -> str:
         lines.append("")
         lines.extend(reviews)
     return "\n".join(lines)
+
+
+def _weekly_line(connection: sqlite3.Connection, name: str, table_name: str) -> str:
+    settled = 0
+    wins = 0
+    total_pnl = None
+    worst_pnl = None
+    if _table_exists(connection, table_name):
+        row = connection.execute(
+            f"SELECT COUNT(*), SUM(CASE WHEN win THEN 1 ELSE 0 END), SUM(pnl), MIN(pnl) "
+            f"FROM {table_name} WHERE settled_at IS NOT NULL"
+        ).fetchone()
+        settled = int(row[0] or 0)
+        wins = int(row[1] or 0)
+        total_pnl = row[2]
+        worst_pnl = row[3]
+
+    if settled == 0:
+        return f"{name}: settled 0, win rate n/a, total P&L n/a, worst loss n/a"
+
+    win_rate_str = f"{wins / settled:.2%}"
+    total_str = f"${float(total_pnl or 0.0):+.2f}"
+    worst_loss = min(float(worst_pnl), 0.0) if worst_pnl is not None else 0.0
+    worst_str = f"${worst_loss:+.2f}"
+    return (
+        f"{name}: settled {settled}, win rate {win_rate_str}, "
+        f"total P&L {total_str}, worst loss {worst_str}"
+    )
+
+
+def format_weekly_lines(connection: sqlite3.Connection) -> str:
+    return "\n".join(
+        _weekly_line(connection, name, table_name)
+        for name, table_name in POLYMARKET_BOOKS
+    )

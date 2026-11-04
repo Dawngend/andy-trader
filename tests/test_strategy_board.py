@@ -6,7 +6,7 @@ from andy_trader import bond_book as bond
 from andy_trader import copy_book as copy
 from andy_trader import price_target_book as pt
 from andy_trader.store import connect
-from andy_trader.strategy_board import format_board
+from andy_trader.strategy_board import format_board, format_weekly_lines
 import run_strategy_board as runner
 
 NOW = datetime(2026, 10, 28, 12, tzinfo=UTC)
@@ -266,3 +266,80 @@ def test_board_with_copy_book_positions(tmp_path):
     assert dromedaryy[1] == "0"
     assert dromedaryy[2] == "0"
     assert dromedaryy[8] == "collecting"
+
+
+@pytest.fixture
+def weekly_db(tmp_path):
+    db_path = tmp_path / "weekly_board.db"
+    with connect(db_path) as conn:
+        bond.initialize_bond_book(conn)
+        pt.initialize_price_target_book(conn)
+        copy.initialize_copy_book(conn)
+        yield conn
+
+
+def _settle(conn, table: str, market_id: str, win: int, pnl: float) -> None:
+    with conn:
+        conn.execute(
+            f"UPDATE {table} SET win=?, pnl=?, settled_at=? WHERE market_id=?",
+            (win, pnl, NOW.isoformat(), market_id),
+        )
+
+
+def test_weekly_lines_one_line_per_book_with_stats(weekly_db):
+    conn = weekly_db
+    reach_q = "Will Bitcoin reach 150,000?"
+    for mid, win, pnl in (("m1", 1, 9.37), ("m2", 0, -90.63), ("m3", 1, 9.37), ("m4", 0, -20.0)):
+        bond.open_position(conn, f"e_{mid}", _market(mid, question=reach_q), "No", 0.90, 0.63, NOW)
+        _settle(conn, "bond_book_positions", mid, win, pnl)
+    bond.open_position(conn, "e_open", _market("m_open", question=reach_q), "No", 0.90, 0.63, NOW)
+
+    pt.open_position(conn, "p1", _market("p1", question=reach_q), "No", 0.90, 0.63, NOW)
+    _settle(conn, "price_target_book_positions", "p1", 1, 9.37)
+
+    lines = format_weekly_lines(conn).splitlines()
+
+    assert lines == [
+        "bond_book: settled 4, win rate 50.00%, total P&L $-91.89, worst loss $-90.63",
+        "price_target_book: settled 1, win rate 100.00%, total P&L $+9.37, worst loss $+0.00",
+        "copy_book: settled 0, win rate n/a, total P&L n/a, worst loss n/a",
+    ]
+
+
+def test_weekly_lines_empty_books_show_na(weekly_db):
+    conn = weekly_db
+    reach_q = "Will Bitcoin reach 150,000?"
+    bond.open_position(conn, "e1", _market("m1", question=reach_q), "No", 0.90, 0.63, NOW)
+
+    lines = format_weekly_lines(conn).splitlines()
+
+    assert lines == [
+        "bond_book: settled 0, win rate n/a, total P&L n/a, worst loss n/a",
+        "price_target_book: settled 0, win rate n/a, total P&L n/a, worst loss n/a",
+        "copy_book: settled 0, win rate n/a, total P&L n/a, worst loss n/a",
+    ]
+
+
+def test_weekly_lines_missing_tables_show_na(tmp_path):
+    with connect(tmp_path / "blank.db") as conn:
+        lines = format_weekly_lines(conn).splitlines()
+
+    assert len(lines) == 3
+    assert all(line.endswith("settled 0, win rate n/a, total P&L n/a, worst loss n/a") for line in lines)
+
+
+def test_runner_includes_weekly_lines(tmp_path, capsys):
+    db_path = tmp_path / "runner_weekly.db"
+    with connect(db_path) as conn:
+        bond.initialize_bond_book(conn)
+        bond.open_position(conn, "e1", _market("m1"), "No", 0.90, 0.63, NOW)
+        _settle(conn, "bond_book_positions", "m1", 0, -90.63)
+
+    output_file = tmp_path / "board.md"
+    assert runner.main(["--database", str(db_path), "--output", str(output_file), "--date", "2026-11-04"]) == 0
+
+    expected = "bond_book: settled 1, win rate 0.00%, total P&L $-90.63, worst loss $-90.63"
+    assert expected in capsys.readouterr().out
+    content = output_file.read_text(encoding="utf-8")
+    assert expected in content
+    assert "copy_book: settled 0, win rate n/a, total P&L n/a, worst loss n/a" in content

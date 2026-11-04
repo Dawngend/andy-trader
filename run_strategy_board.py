@@ -7,7 +7,7 @@ from pathlib import Path
 
 from andy_trader.env import REPO_ROOT
 from andy_trader.store import connect, default_database_path
-from andy_trader.strategy_board import format_board
+from andy_trader.strategy_board import format_board, format_weekly_lines
 
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "research" / "strategy_board.md"
 
@@ -25,11 +25,17 @@ def main(argv: list[str] | None = None) -> int:
 
     with connect(db_path) as connection:
         board = format_board(connection)
+        weekly = format_weekly_lines(connection)
 
+    print(weekly)
+    print()
     print(board)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    content = f"# Weekly Strategy Board - {date_str}\n\nDate: {date_str}\n\n{board}\n"
+    content = (
+        f"# Weekly Strategy Board - {date_str}\n\nDate: {date_str}\n\n"
+        f"```text\n{weekly}\n```\n\n{board}\n"
+    )
     output_path.write_text(content, encoding="utf-8")
     return 0
 
