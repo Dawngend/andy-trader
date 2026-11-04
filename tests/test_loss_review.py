@@ -99,6 +99,57 @@ def test_book_totals_handle_rows_without_book():
     assert "| unknown | 1 | 0 | 1 | 100.0% | -$10.00 | -$10.00 | n/a |" in books
 
 
+def test_new_sections_exist_and_stay_empty_without_positions():
+    report = build_report([], dict.fromkeys(TABLES, 0), rules=[])
+
+    books = report.split("## Book totals")[1].split("## Entry bands")[0]
+    assert "| Book | Settled |" in books
+    assert "| unknown |" not in books
+
+    bands = report.split("## Entry bands")[1].split("## Worst individual losses")[0]
+    assert "| Entry band | Settled |" in bands
+    assert "| unknown |" not in bands
+
+    assert "No losing positions." in report
+    assert "## By tag" in report
+
+
+def test_worst_individual_losses_break_ties_by_end_then_title(tmp_path):
+    database = tmp_path / "paper.db"
+    create_database(database, {TABLES[0]: [
+        position(-10, market_id="late", ends_at="2026-10-02T00:00:00Z"),
+        position(-10, market_id="early", ends_at="2026-10-01T00:00:00Z"),
+        position(-10, market_id="z", ends_at="2026-10-01T00:00:00Z", title="Zebra"),
+        position(-10, market_id="a", ends_at="2026-10-01T00:00:00Z", title="Apple"),
+    ]})
+    report = build_report(*read_positions(database), rules=[])
+    section = report.split("## Worst individual losses")[1].split("## By tag")[0]
+    worst_rows = [
+        line
+        for line in section.splitlines()
+        if line.startswith("| ") and "Market" not in line and "---" not in line
+    ]
+
+    assert [line.split("|")[1].strip() for line in worst_rows] == [
+        "a", "early", "z", "late",
+    ]
+
+
+def test_worst_loss_row_with_missing_fields_marks_them_unknown(tmp_path):
+    database = tmp_path / "paper.db"
+    create_database(database, {TABLES[0]: [
+        position(-10, market_id=None, title=None, side=None, entry_band=None,
+                 fill_price=None, shares=None, ends_at=None),
+    ]})
+    report = build_report(*read_positions(database), rules=[])
+    section = report.split("## Worst individual losses")[1].split("## By tag")[0]
+
+    assert (
+        "| unknown | unknown | unknown | unknown | unknown | unknown | unknown | -$10.00 |"
+        in section
+    )
+
+
 @pytest.mark.parametrize("rows, expected_row", [
     ([], "| 0 | 0 | 0 | n/a | $0.00 | n/a | n/a |"),
     ([position(5), position(10)], "| 2 | 2 | 0 | 0.0% | $15.00 | n/a | $7.50 |"),

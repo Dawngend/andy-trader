@@ -166,3 +166,97 @@ def test_a_non_positive_reference_price_is_refused() -> None:
                         reference_price=0.0, settle_price=10.0)
     with pytest.raises(SurvivalError, match="non-positive"):
         run_survival([bad])
+
+
+def test_empty_run_reports_nobody_rather_than_a_zero_survival_rate() -> None:
+    """No trades is an empty population, not a cohort that all died."""
+
+    report = run_survival([])
+
+    assert report.survivors == []
+    assert report.retired == []
+    assert report.population == 0
+    assert report.survival_rate == 0.0
+    assert report.trades_evaluated == 0
+
+    text = format_report(report)
+    assert "Survival run over 0 resolved trades" in text
+    assert "survival rate 0% (0 of 0)" in text
+    assert "RETIRED" not in text
+
+
+def test_one_winning_trade_is_counted_exactly_once() -> None:
+    report = run_survival(
+        [_trade("solo", up=True, correct=True)],
+        grace_trades=1,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    book = report.survivors[0]
+    assert report.trades_evaluated == 1
+    assert (book.trades, book.wins) == (1, 1)
+    assert book.win_rate == 1.0
+    assert book.equity == pytest.approx(1.01)
+    assert book.max_drawdown == pytest.approx(0.0)
+    assert book.retired_after_trade is None
+
+
+def test_equity_exactly_at_the_ruin_level_is_still_ruin() -> None:
+    """The threshold is inclusive, so a book sitting on it is retired."""
+
+    report = run_survival(
+        [_trade("edge", up=True, correct=False)],
+        ruin_fraction=0.95,
+        grace_trades=1,
+        stake_fraction=0.5,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert report.survivors == []
+    assert report.retired[0].equity == pytest.approx(0.95)
+    assert report.retired[0].retired_after_trade == 1
+
+
+def test_equity_just_above_the_ruin_level_keeps_the_book_alive() -> None:
+    report = run_survival(
+        [_trade("edge", up=True, correct=False)],
+        ruin_fraction=0.949,
+        grace_trades=1,
+        stake_fraction=0.5,
+        fee_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    assert report.retired == []
+    assert report.survivors[0].equity == pytest.approx(0.95)
+    assert report.survivors[0].retired_after_trade is None
+
+
+def test_tied_books_are_both_reported_and_keep_a_stable_order() -> None:
+    trades = (
+        [_trade("first", up=True, correct=True) for _ in range(10)]
+        + [_trade("second", up=True, correct=True) for _ in range(10)]
+    )
+    report = run_survival(trades, grace_trades=1, fee_bps=0.0, slippage_bps=0.0)
+
+    assert [b.predictor for b in report.survivors] == ["first", "second"]
+    assert report.survivors[0].equity == report.survivors[1].equity
+
+
+def test_an_abstention_with_a_missing_price_is_not_counted() -> None:
+    """A skipped trade never risks capital, so its placeholder price is irrelevant."""
+
+    trade = ResolvedTrade(
+        "abstainer",
+        probability_up=0.5,
+        outcome_up=1,
+        reference_price=0.0,
+        settle_price=0.0,
+    )
+    report = run_survival([trade])
+
+    assert report.trades_evaluated == 0
+    assert report.survivors[0].trades == 0
+    assert report.survivors[0].equity == 1.0

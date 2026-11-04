@@ -431,3 +431,125 @@ def test_prompt_btc_funding_gap_example(db):
     # Gap is 0.049275 - (-0.009855) = 0.05913 (~5.91% / year)
     assert report["latest_gap"] == pytest.approx(0.05913, abs=1e-4)
 
+
+def test_empty_data_reports_an_unmeasured_gap(db):
+    """No observations means no latest gap and no measured snapshots, not a zero gap."""
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+
+    assert report == {
+        "instrument": "BTC-USD",
+        "latest_venues": {},
+        "latest_gap": None,
+        "snapshots_above_15": 0,
+        "longest_consecutive_above_15": 0,
+    }
+
+
+def test_one_observation_has_no_cross_venue_gap(db):
+    """A single row is shown, but a gap needs two venues to exist."""
+    funding_gap.initialize_database(db)
+    insert_snapshot(db, "2026-10-25T00:00:00+00:00", {"bybit": 0.1095})
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["latest_venues"] == {"bybit": pytest.approx(0.1095)}
+    assert report["latest_gap"] is None
+    assert report["snapshots_above_15"] == 0
+    assert report["longest_consecutive_above_15"] == 0
+
+    text = funding_gap.format_report(db)
+    assert "bybit: +0.1095 (+10.95% annualized)" in text
+    assert "Latest gap: not available" in text
+
+
+def test_equal_venue_rates_tie_to_a_measured_zero_gap(db):
+    """Equal rates are a real measured zero gap, not an unknown one."""
+    funding_gap.initialize_database(db)
+    insert_snapshot(db, "2026-10-25T00:00:00+00:00", {"binance": 0.10, "bybit": 0.10})
+    insert_snapshot(db, "2026-10-25T01:00:00+00:00", {"binance": 0.20, "bybit": 0.20})
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["latest_gap"] == pytest.approx(0.0)
+    assert report["snapshots_above_15"] == 0
+    assert report["longest_consecutive_above_15"] == 0
+
+
+def test_tied_extremes_still_measure_the_gap(db):
+    """A tie for the highest rate does not hide the gap to the lowest venue."""
+    funding_gap.initialize_database(db)
+    insert_snapshot(
+        db,
+        "2026-10-25T00:00:00+00:00",
+        {"binance": 0.30, "bybit": 0.30, "okx": 0.0},
+    )
+    db.commit()
+
+    report = funding_gap.compute_instrument_report(db, "BTC-USD")
+    assert report["latest_gap"] == pytest.approx(0.30)
+    assert report["snapshots_above_15"] == 1
+    assert report["longest_consecutive_above_15"] == 1
+
+
+@pytest.mark.parametrize(
+    "parser, payload",
+    [
+        (funding_gap.parse_binance, {}),
+        (funding_gap.parse_binance, {"lastFundingRate": ""}),
+        (funding_gap.parse_bybit, {}),
+        (funding_gap.parse_bybit, {"result": {"list": []}}),
+        (funding_gap.parse_bybit, {"result": {"list": [{}]}}),
+        (funding_gap.parse_okx, {}),
+        (funding_gap.parse_okx, {"data": []}),
+        (funding_gap.parse_okx, {"data": [{}]}),
+    ],
+    ids=[
+        "binance-no-rate",
+        "binance-blank-rate",
+        "bybit-no-result",
+        "bybit-empty-list",
+        "bybit-no-rate",
+        "okx-no-data",
+        "okx-empty-data",
+        "okx-no-rate",
+    ],
+)
+def test_parsers_reject_payloads_missing_required_fields(parser, payload):
+    """A missing required rate is a failed venue, not a silent zero."""
+    with pytest.raises(ValueError):
+        parser(payload)
+
+
+def test_missing_optional_interval_fields_default_to_eight_hours():
+    rate, interval = funding_gap.parse_binance({"lastFundingRate": "0.0001"})
+    assert rate == pytest.approx(0.0001)
+    assert interval == pytest.approx(8.0)
+
+    rate, interval = funding_gap.parse_bybit(
+        {"result": {"list": [{"fundingRate": "0.0002"}]}}
+    )
+    assert rate == pytest.approx(0.0002)
+    assert interval == pytest.approx(8.0)
+
+
+def test_run_once_skips_one_missing_field_without_losing_other_venues(db, monkeypatch):
+    """A payload missing a field fails only that venue; the rest of the pass still writes."""
+    monkeypatch.setattr(funding_gap, "INSTRUMENTS", ("BTC-USD",))
+
+    def fetch_missing_binance_rate(url: str):
+        if "binance" in url:
+            return {}
+        if "bybit" in url:
+            return {"result": {"list": [{"fundingRate": "0.0001"}]}}
+        if "okx" in url:
+            return {"data": [{"fundingRate": "0.0002"}]}
+        raise ValueError(f"Unexpected url {url}")
+
+    written, failed = funding_gap.run_once(
+        db, fetch=fetch_missing_binance_rate, now="2026-10-25T00:00:00+00:00"
+    )
+    assert (written, failed) == (2, 1)
+
+    rows = db.execute("SELECT venue FROM funding_gap_observations").fetchall()
+    assert {row["venue"] for row in rows} == {"bybit", "okx"}
+
