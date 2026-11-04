@@ -45,6 +45,60 @@ def test_overall_and_settled_filter(tmp_path):
     assert "price_target_book_positions: 2" in report
 
 
+def test_book_totals_split_by_book(tmp_path):
+    database = tmp_path / "paper.db"
+    create_database(database, {
+        TABLES[0]: [position(-95), position(5)],
+        TABLES[1]: [position(-85, title="XRP above $100"), position(15)],
+    })
+    report = build_report(*read_positions(database), rules=[])
+    books = report.split("## Book totals")[1].split("## Entry bands")[0]
+    assert "| bond_book | 2 | 1 | 1 | 50.0% | -$90.00 | -$95.00 | $5.00 |" in books
+    assert ("| price_target_book | 2 | 1 | 1 | 50.0% | -$70.00 | -$85.00 | $15.00 |"
+            in books)
+
+
+def test_entry_bands_include_small_samples(tmp_path):
+    database = tmp_path / "paper.db"
+    create_database(database, {TABLES[0]: [
+        position(-95, entry_band="0.80 to 0.90"),
+        position(10, entry_band="0.90 to 0.95"),
+        position(-30, entry_band=None),
+    ]})
+    report = build_report(*read_positions(database), rules=[])
+    bands = report.split("## Entry bands")[1].split("## Worst individual losses")[0]
+    assert "| 0.80 to 0.90 | 1 | 0 | 1 | 100.0% | -$95.00 | -$95.00 | n/a |" in bands
+    assert "| 0.90 to 0.95 | 1 | 1 | 0 | 0.0% | $10.00 | n/a | $10.00 |" in bands
+    assert "| unknown | 1 | 0 | 1 | 100.0% | -$30.00 | -$30.00 | n/a |" in bands
+    tags = report.split("## By tag")[1].split("## Clusters")[0]
+    assert "0.80 to 0.90" not in tags
+
+
+def test_worst_individual_losses_are_ordered_and_limited(tmp_path):
+    database = tmp_path / "paper.db"
+    rows = [
+        position(-value, title=f"Loser {value:02d}", ends_at=f"2026-10-{value:02d}T00:00:00Z")
+        for value in range(1, 13)
+    ]
+    rows.append(position(50, title="Winner"))
+    create_database(database, {TABLES[0]: rows})
+    report = build_report(*read_positions(database), rules=[])
+    section = report.split("## Worst individual losses")[1].split("## By tag")[0]
+    worst_rows = [line for line in section.splitlines() if line.startswith("| market | Loser")]
+    assert len(worst_rows) == 10
+    assert ("| market | Loser 12 | Yes | 0.90 to 0.95 | 0.9500 | 100 | "
+            "2026-10-12T00:00:00Z | -$12.00 |") == worst_rows[0]
+    assert "Loser 03" in worst_rows[-1]
+    assert "Loser 02" not in section
+    assert "Winner" not in section
+
+
+def test_book_totals_handle_rows_without_book():
+    report = build_report([position(-10)], dict.fromkeys(TABLES, 1), rules=[])
+    books = report.split("## Book totals")[1].split("## Entry bands")[0]
+    assert "| unknown | 1 | 0 | 1 | 100.0% | -$10.00 | -$10.00 | n/a |" in books
+
+
 @pytest.mark.parametrize("rows, expected_row", [
     ([], "| 0 | 0 | 0 | n/a | $0.00 | n/a | n/a |"),
     ([position(5), position(10)], "| 2 | 2 | 0 | 0.0% | $15.00 | n/a | $7.50 |"),

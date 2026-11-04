@@ -11,6 +11,11 @@ from andy_trader.loss_rules import learn_rules, load_rules
 
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "research" / "loss_review.md"
 TABLES = ("bond_book_positions", "price_target_book_positions")
+WORST_LOSS_COUNT = 10
+
+
+def book_name(table: str) -> str:
+    return table.removesuffix("_positions")
 
 
 def read_positions(database_path: Path) -> tuple[list[dict], dict[str, int]]:
@@ -31,7 +36,10 @@ def read_positions(database_path: Path) -> tuple[list[dict], dict[str, int]]:
                 FROM {table} WHERE pnl IS NOT NULL
             """).fetchall()
             counts[table] = len(positions)
-            rows.extend(dict(row) for row in positions)
+            for position in positions:
+                row = dict(position)
+                row["book"] = book_name(table)
+                rows.append(row)
     finally:
         connection.close()
     return rows, counts
@@ -158,8 +166,43 @@ def loss_clusters(ends: dict) -> list[tuple[str | datetime, list[dict], dict]]:
     return sorted(clusters, key=lambda cluster: (cluster[2]["pnl"], str(cluster[0])))[:10]
 
 
+def book_groups(rows: list[dict]) -> list[tuple[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row.get("book") or "unknown", []).append(row)
+    known = [book_name(table) for table in TABLES]
+    order = [name for name in known if name in groups]
+    order.extend(sorted(name for name in groups if name not in known))
+    return [(name, groups[name]) for name in order]
+
+
+def entry_band_groups(rows: list[dict]) -> list[tuple[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row.get("entry_band") or "unknown", []).append(row)
+    return [(value, groups[value]) for value in sorted(groups, key=lambda v: (v == "unknown", v))]
+
+
+def worst_losses(rows: list[dict], limit: int = WORST_LOSS_COUNT) -> list[dict]:
+    losses = [row for row in rows if row.get("pnl") is not None and row["pnl"] < 0]
+    losses.sort(key=lambda row: (row["pnl"], str(row.get("ends_at") or ""), str(row.get("title") or "")))
+    return losses[:limit]
+
+
 def money(value: float) -> str:
     return f"{'-' if value < 0 else ''}${abs(value):,.2f}"
+
+
+def rate(stats: dict) -> str:
+    return f"{stats['loss_rate']:.1%}" if stats["settled"] else "n/a"
+
+
+def decimal(value: object, places: int = 4) -> str:
+    return f"{value:.{places}f}" if isinstance(value, (int, float)) else "unknown"
+
+
+def quantity(value: object) -> str:
+    return f"{value:g}" if isinstance(value, (int, float)) else "unknown"
 
 
 def cell(value: object) -> str:
@@ -183,10 +226,49 @@ def build_report(rows: list[dict], counts: dict[str, int], rules: list[dict] | N
         f"| {overall['settled']} | {overall['wins']} | {overall['losses']} | "
         f"{loss_rate} | {money(overall['pnl'])} | "
         f"{average_loss} | {average_win} |",
-        "", "## By tag", "", "Only values with at least 20 settled rows are listed.", "",
-        "| Tag | Value | Settled | Losses | Loss rate | Total pnl | Status |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
+    lines.extend(["", "## Book totals", "",
+                  "Settled paper positions grouped by book.", "",
+                  "| Book | Settled | Wins | Losses | Loss rate | Total pnl | Average loss | Average win |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"])
+    for name, group in book_groups(rows):
+        stats = summarize(group)
+        lines.append(
+            f"| {cell(name)} | {stats['settled']} | {stats['wins']} | {stats['losses']} | "
+            f"{rate(stats)} | {money(stats['pnl'])} | "
+            f"{money(stats['average_loss']) if stats['losses'] else 'n/a'} | "
+            f"{money(stats['average_win']) if stats['wins'] else 'n/a'} |"
+        )
+    lines.extend(["", "## Entry bands", "",
+                  "Every stored entry band is listed, including bands with fewer than 20 settled rows.", "",
+                  "| Entry band | Settled | Wins | Losses | Loss rate | Total pnl | Average loss | Average win |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"])
+    for value, group in entry_band_groups(rows):
+        stats = summarize(group)
+        lines.append(
+            f"| {cell(value)} | {stats['settled']} | {stats['wins']} | {stats['losses']} | "
+            f"{rate(stats)} | {money(stats['pnl'])} | "
+            f"{money(stats['average_loss']) if stats['losses'] else 'n/a'} | "
+            f"{money(stats['average_win']) if stats['wins'] else 'n/a'} |"
+        )
+    lines.extend(["", "## Worst individual losses", "",
+                  f"The {WORST_LOSS_COUNT} worst settled positions by loss.", "",
+                  "| Market | Title | Side | Entry band | Entry price | Shares | Ends at | Pnl |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"])
+    worst = worst_losses(rows)
+    if worst:
+        for row in worst:
+            lines.append(
+                f"| {cell(row.get('market_id') or 'unknown')} | {cell(row.get('title') or 'unknown')} | "
+                f"{cell(row.get('side') or 'unknown')} | {cell(row.get('entry_band') or 'unknown')} | "
+                f"{decimal(row.get('fill_price'))} | {quantity(row.get('shares'))} | "
+                f"{cell(row.get('ends_at') or 'unknown')} | {money(row['pnl'])} |"
+            )
+    else:
+        lines.append("No losing positions.")
+    lines.extend(["", "## By tag", "", "Only values with at least 20 settled rows are listed.", "",
+                  "| Tag | Value | Settled | Losses | Loss rate | Total pnl | Status |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"])
     suggested_rules = []
     for tag, value, stats in tag_summaries(rows, ends):
         flagged = stats["loss_rate"] > overall["loss_rate"] and stats["pnl"] < 0
