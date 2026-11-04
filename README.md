@@ -831,6 +831,29 @@ again. A verdict waits for 100 settlements, states the loss count, and shows
 positive edge only if the entire bootstrap 95 percent interval for average profit
 per position is above zero. Otherwise it says "no edge shown".
 
+## Loss review and weekly paper board (paper only)
+
+Both reports summarize the paper ledger; neither collects data or places orders.
+
+### Loss review
+
+```powershell
+python run_loss_review.py            # writes research/loss_review.md and loss_rules.json
+python run_loss_review.py --dry-run  # prints the report, writes nothing
+python run_loss_review.py --database PATH --output PATH --rules-output PATH
+```
+
+It reads settled (`pnl` not null) `bond_book` and `price_target_book` positions. The output shows overall, per-book, and per-entry-band win/loss counts, loss rate, total and average PnL, the 10 worst losses, and loss clusters sharing the same market end time. In **By tag** (20+ settled rows only), `FLAGGED` means a slice, asset, entry band, timing, or similar grouping has a loss rate above the overall rate and negative PnL. **Suggested rules** are in-sample hindsight from those flags, not evidence on their own. A normal run also writes up to five stricter learned rules (30+ settled, loss rate at least 1.5x overall, negative PnL) to `loss_rules.json`, listed under **Rules now active**; `--dry-run` instead shows the rules already in that file.
+
+### Weekly paper board
+
+```powershell
+python run_strategy_board.py            # prints the board, writes research/strategy_board.md
+python run_strategy_board.py --database PATH --output PATH --date YYYY-MM-DD
+```
+
+The top lines give, per book (`bond_book`, `price_target_book`, `copy_book`), settled count, win rate, total PnL, and worst single loss. The table then compares `bond_book` overall and by slice, `price_target_no_book`, and each `copy_<wallet>` on settled/open counts, win rate, average entry price, and average PnL per position after fees with its 95% bootstrap interval. Status is `collecting` below 100 settled, `positive`/`negative` when that interval is entirely above/below zero, and `unclear` when it spans zero. A trailing `review: <name>` line flags a negative status or a worst loss over 10x the average win — start there, then use the loss review to see what drove it.
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
