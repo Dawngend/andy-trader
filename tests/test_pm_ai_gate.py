@@ -56,14 +56,13 @@ def test_drift_test_on_llm_agent():
     llm_agent_path = REPO_ROOT / "andy_trader" / "llm_agent.py"
     text = llm_agent_path.read_text(encoding="utf-8")
 
-    # Locate the agy entry in commands dictionary
-    assert '"agy":' in text
-    agy_start = text.index('"agy":')
-    agy_entry = text[agy_start:text.index("]", agy_start) + 1]
-
-    assert pm_ai_gate.AGY_MODEL in agy_entry
-    assert "--sandbox" in agy_entry
-    assert "-p" in agy_entry
+    ask_model_start = text.index("def ask_model")
+    ask_model_block = text[ask_model_start:text.index("def ask_with_timeout", ask_model_start)]
+    assert 'shutil.which("agy")' in ask_model_block
+    assert '"--model"' in ask_model_block
+    assert '"--sandbox"' in ask_model_block
+    assert '"-p"' in ask_model_block
+    assert "timeout=timeout" in ask_model_block
 
     # Locate ask_cli definition and verify timeout value
     ask_cli_start = text.index("def ask_cli")

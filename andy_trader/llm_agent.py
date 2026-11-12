@@ -151,7 +151,7 @@ def ask_model(context: str, *, model: str | None = None, runner=subprocess.run, 
     prompt = json.dumps(_messages(context), ensure_ascii=False)
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as cwd:
         result = runner([executable, "--model", model or os.environ["LLM_MODEL"], "--sandbox", "-p", prompt],
-                        capture_output=True, text=True, timeout=timeout, check=True, cwd=cwd)
+                        capture_output=True, text=True, timeout=timeout, cwd=cwd)
     result.check_returncode()
     return {"choices": [{"message": {"content": _unwrap_json(result.stdout)}}]}
 
@@ -369,7 +369,7 @@ class LlmPredictor:
                 request_count += 1
                 retry_response = ((ask_model(retry_context) if self.request_timeout is None
                                    else ask_with_timeout(retry_context, self.request_timeout))
-                                   if provider == "agy" else ask_cli(retry_context, provider))
+                                  if provider == "agy" else ask_cli(retry_context, provider))
                 retry_raw = json.dumps(retry_response, sort_keys=True)
                 calls.update(_parse(retry_response, missing_names))
             except Exception:

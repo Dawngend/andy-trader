@@ -158,7 +158,7 @@ def test_agy_request_uses_one_print_prompt(monkeypatch):
     assert len(seen) == 1
     assert args == ["C:/bin/agy.cmd", "--model", "fake-model", "--sandbox", "-p",
                     json.dumps(_messages("context"), ensure_ascii=False)]
-    assert kwargs["timeout"] == 120 and kwargs["check"] is True
+    assert kwargs["timeout"] == 120 and "check" not in kwargs
     assert kwargs["cwd"] != str(Path.cwd())
 
 
