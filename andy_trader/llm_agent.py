@@ -16,7 +16,6 @@ import threading
 import sqlite3
 import statistics
 from typing import Sequence
-import urllib.request
 import uuid
 
 from andy_trader.baselines import MAX_CONFIDENCE, MIN_CONFIDENCE, PredictionContext, default_baselines
@@ -145,16 +144,16 @@ def _messages(context: str) -> list[dict[str, str]]:
     ]
 
 
-def ask_model(context: str, *, model: str | None = None, opener=urllib.request.urlopen, timeout: float = 120) -> dict:
-    body = {"model": model or os.environ["LLM_MODEL"], "messages": _messages(context)}
-    request = urllib.request.Request(
-        os.environ["LLM_BASE_URL"].rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Authorization": "Bearer " + os.environ["LLM_API_KEY"], "Content-Type": "application/json"},
-        method="POST",
-    )
-    with opener(request, timeout=timeout) as response:
-        return json.loads(response.read())
+def ask_model(context: str, *, model: str | None = None, runner=subprocess.run, timeout: float = 120) -> dict:
+    executable = shutil.which("agy")
+    if not executable:
+        raise FileNotFoundError("agy CLI not found")
+    prompt = json.dumps(_messages(context), ensure_ascii=False)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as cwd:
+        result = runner([executable, "--model", model or os.environ["LLM_MODEL"], "--sandbox", "-p", prompt],
+                        capture_output=True, text=True, timeout=timeout, check=True, cwd=cwd)
+    result.check_returncode()
+    return {"choices": [{"message": {"content": _unwrap_json(result.stdout)}}]}
 
 
 def ask_with_timeout(context: str, timeout: float) -> dict:
@@ -175,14 +174,7 @@ def ask_with_timeout(context: str, timeout: float) -> dict:
     return response
 
 
-# 40 s was too tight: agy sometimes needs 40 to 60 s and the batch was lost (about 5% of batches).
-# Budget: 25 s gateway + two CLI fallbacks at 70 s = 165 s, still under the 180 s stale-lock rule.
 CLI_TIMEOUT_SECONDS = 70
-
-# A 429 means the gateway is rate-limiting us; hammering it again next batch just burns
-# requests, so skip it for a while and go straight to the fallbacks. Each probe run is a
-# new process, so the 429 is remembered in the ledger (gateway_status), not in memory.
-GATEWAY_COOLDOWN_MINUTES = 60
 
 
 def _unwrap_json(text: str) -> str:
@@ -203,10 +195,6 @@ def _unwrap_json(text: str) -> str:
 
 def ask_cli(context: str, provider: str) -> dict:
     commands = {
-        # agy's -p takes the next word as the prompt, so the prompt must follow -p directly.
-        # Do not add --mode plan: with a real batch prompt it silences agy entirely in
-        # headless mode (a tool needs the command permission that headless mode cannot prompt for).
-        "agy": ["--model", "gemini-3.8-flash-high", "--sandbox", "-p"],
         "codex": ["exec", "-m", "gpt-6-astra", "--sandbox", "read-only"],
         # Without these flags `claude -p` starts a full session, so Dawn's SessionStart
         # hooks (an omni_cli sync + brief) run on every fallback call.
@@ -265,7 +253,7 @@ class LlmPredictor:
 
     def __call__(self, closes: Sequence[float], *, context: PredictionContext) -> float:
         del closes
-        if not all(os.environ.get(key) for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")):
+        if not os.environ.get("LLM_MODEL"):
             return 0.5
         if self._batch is None:
             self._batch = self._load_batch(context.connection, context.at_or_before)
@@ -332,15 +320,11 @@ class LlmPredictor:
         raw = None
         error = None
         status = "ok"
-        provider = "gateway"
+        provider = "agy"
         request_count = 0
-        gateway_status = None
-        fallbacks = [name.strip().lower() for name in os.environ.get("LLM_FALLBACKS", "agy,codex,claude").split(",") if name.strip()]
-        cooldown_since = (datetime.fromisoformat(now_iso) - timedelta(minutes=GATEWAY_COOLDOWN_MINUTES)).isoformat()
-        gateway_cooling = connection.execute("""
-            SELECT 1 FROM llm_decisions WHERE gateway_status = 429 AND created_at > ? AND created_at <= ? LIMIT 1
-        """, (cooldown_since, now_iso)).fetchone()
-        candidates = tuple(fallbacks) if gateway_cooling else ("gateway", *fallbacks)
+        fallbacks = [name.strip().lower() for name in os.environ.get("LLM_FALLBACKS", "").split(",")
+                     if name.strip().lower() in ("codex", "claude")]
+        candidates = ("agy", *fallbacks)
         if used >= daily_calls:
             status = "capped"
         else:
@@ -351,7 +335,7 @@ class LlmPredictor:
                     break
                 request_count += 1
                 try:
-                    candidate_response = (ask_model(rendered) if self.request_timeout is None else ask_with_timeout(rendered, self.request_timeout)) if candidate == "gateway" else ask_cli(rendered, candidate)
+                    candidate_response = (ask_model(rendered) if self.request_timeout is None else ask_with_timeout(rendered, self.request_timeout)) if candidate == "agy" else ask_cli(rendered, candidate)
                     candidate_calls = _parse(candidate_response, self.instruments)
                     response = candidate_response
                     raw = json.dumps(response, sort_keys=True)
@@ -359,13 +343,7 @@ class LlmPredictor:
                     provider = candidate
                     break
                 except Exception as exc:
-                    # HTTP status for gateway errors; Windows error number for OS errors
-                    # (32 = file in use, 5 = access denied).
-                    code = getattr(exc, "code", None)
-                    if code is None:
-                        code = getattr(exc, "winerror", None)
-                    if candidate == "gateway" and code == 429:
-                        gateway_status = 429
+                    code = getattr(exc, "winerror", None)
                     label = f"{type(exc).__name__} {code}" if code is not None else type(exc).__name__
                     errors.append(f"{candidate}: {label}")
             if response is None:
@@ -378,8 +356,7 @@ class LlmPredictor:
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=None,
                             model=model, template_rev=TEMPLATE_REV, config_rev=config_rev,
                             list_arm=list_arm, list_seed=list_seed, rendered_context=rendered,
-                            p_up=None, reason=error, status="error", request_count=request_count,
-                            gateway_status=gateway_status)
+                            p_up=None, reason=error, status="error", request_count=request_count)
             return {}
         retry_response = None
         retry_raw = None
@@ -392,7 +369,7 @@ class LlmPredictor:
                 request_count += 1
                 retry_response = ((ask_model(retry_context) if self.request_timeout is None
                                    else ask_with_timeout(retry_context, self.request_timeout))
-                                  if provider == "gateway" else ask_cli(retry_context, provider))
+                                   if provider == "agy" else ask_cli(retry_context, provider))
                 retry_raw = json.dumps(retry_response, sort_keys=True)
                 calls.update(_parse(retry_response, missing_names))
             except Exception:
@@ -406,19 +383,18 @@ class LlmPredictor:
             row_response = retry_response if retried else response
             row_usage = row_response.get("usage", {}) if isinstance(row_response, dict) else {}
             record_decision(connection, created_at=now_iso, batch_id=batch_id, instrument=instrument,
-                            model=model if provider == "gateway" else f"fallback/{provider}", template_rev=TEMPLATE_REV, config_rev=config_rev,
+                            model=model if provider == "agy" else f"fallback/{provider}", template_rev=TEMPLATE_REV, config_rev=config_rev,
                             list_arm=list_arm, list_seed=list_seed, list_position=position,
                             rendered_context=retry_context if retried else rendered,
                             raw_response=retry_raw if retried else raw,
                             p_up=probability, reason=error or reason, status=row_status,
                             prompt_tokens=row_usage.get("prompt_tokens"), completion_tokens=row_usage.get("completion_tokens"),
-                            cost=row_usage.get("cost"), request_count=request_count,
-                            gateway_status=gateway_status)
+                            cost=row_usage.get("cost"), request_count=request_count)
         return probabilities
 
 
 def build_predictors(instruments: Sequence[str]):
     baselines = default_baselines()
-    if all(os.environ.get(key) for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")):
+    if os.environ.get("LLM_MODEL"):
         return (*baselines, LlmPredictor(instruments))
     return baselines

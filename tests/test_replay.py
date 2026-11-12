@@ -92,8 +92,6 @@ def test_replay_same_model_keeps_original_and_replay_totals(tmp_path):
 def test_trading_does_not_reuse_replay_batch(tmp_path, monkeypatch):
     now = datetime.now(UTC).isoformat()
     monkeypatch.setenv("LLM_MODEL", "cheap")
-    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid")
-    monkeypatch.setenv("LLM_API_KEY", "fake")
     monkeypatch.setenv("LLM_LIST_ORDER", "ranked")
     monkeypatch.delenv("LLM_MIN_MINUTES", raising=False)
     monkeypatch.delenv("LLM_DAILY_CALLS", raising=False)

@@ -135,7 +135,7 @@ def run_pass(connection, *, now=None):
             return
         if time.monotonic() - started >= 20 or not prices:
             return
-        if not all(os.environ.get(key) for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL")):
+        if not os.environ.get("LLM_MODEL"):
             return
         model = LlmPredictor(INSTRUMENTS, request_timeout=25)
         predict_once(connection, instruments=tuple(prices), horizons=("1h",), interval="1m",

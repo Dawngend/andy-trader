@@ -4,7 +4,6 @@ from pathlib import Path
 import random
 import sqlite3
 import subprocess
-from urllib.error import HTTPError
 from uuid import UUID
 
 import pytest
@@ -42,8 +41,6 @@ def _reply(*calls):
 
 
 def _configured(monkeypatch):
-    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
-    monkeypatch.setenv("LLM_API_KEY", "fake")
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("LLM_MIN_MINUTES", raising=False)
     monkeypatch.delenv("LLM_DAILY_CALLS", raising=False)
@@ -148,27 +145,46 @@ def test_ledger_is_append_only_and_filters_replays(tmp_path):
     assert "DELETE " not in source.read_text()
 
 
-def test_http_request_is_one_post_with_only_model_and_messages(monkeypatch):
+def test_agy_request_uses_one_print_prompt(monkeypatch):
     _configured(monkeypatch)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: "C:/bin/agy.cmd" if name == "agy" else None)
     seen = []
+    def runner(args, **kwargs):
+        seen.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": []}), "")
 
-    class Response:
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def read(self): return json.dumps(_reply()).encode()
+    assert ask_model("context", runner=runner) == {"choices": [{"message": {"content": '{"calls": []}'}}]}
+    args, kwargs = seen[0]
+    assert len(seen) == 1
+    assert args == ["C:/bin/agy.cmd", "--model", "fake-model", "--sandbox", "-p",
+                    json.dumps(_messages("context"), ensure_ascii=False)]
+    assert kwargs["timeout"] == 120 and kwargs["check"] is True
+    assert kwargs["cwd"] != str(Path.cwd())
 
-    def opener(request, timeout):
-        seen.append((request, timeout))
-        return Response()
 
-    assert ask_model("context", opener=opener) == _reply()
-    request, timeout = seen[0]
-    assert len(seen) == 1 and timeout == 120
-    assert request.get_method() == "POST"
-    assert request.full_url == "https://example.invalid/v1/chat/completions"
-    assert request.get_header("Authorization") == "Bearer fake"
-    body = json.loads(request.data)
-    assert set(body) == {"model", "messages"}
+def test_agy_request_uses_explicit_model_and_timeout(monkeypatch):
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: "/agy")
+    seen = []
+    def runner(args, **kwargs):
+        seen.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, '{"calls": []}', "")
+    ask_model("context", model="other-model", runner=runner, timeout=25)
+    assert seen[0][0][2] == "other-model"
+    assert seen[0][1]["timeout"] == 25
+
+
+def test_agy_request_missing_cli_and_nonzero_exit(monkeypatch):
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: None)
+    with pytest.raises(FileNotFoundError):
+        ask_model("context", runner=lambda *_args, **_kwargs: pytest.fail("unexpected run"))
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: "/agy")
+    def failing(args, **kwargs):
+        raise subprocess.CalledProcessError(1, args)
+    with pytest.raises(subprocess.CalledProcessError):
+        ask_model("context", model="fake-model", runner=failing)
+    with pytest.raises(subprocess.CalledProcessError):
+        ask_model("context", model="fake-model",
+                  runner=lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "failed"))
 
 
 def test_batch_clamps_missing_and_reuses(monkeypatch, tmp_path):
@@ -347,8 +363,7 @@ def test_transport_failure_and_daily_cap(monkeypatch, tmp_path):
 
 
 def test_disabled_predictor_matches_baselines(monkeypatch, tmp_path):
-    for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
     assert [p.prediction_name for p in build_predictors(INSTRUMENTS)] == [p.prediction_name for p in default_baselines()]
     with _db(tmp_path) as connection:
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
@@ -420,12 +435,10 @@ def test_ledger_migration_runs_twice():
         assert connection.execute("SELECT status FROM llm_decisions").fetchone()[0] == "ok"
 
 
-def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
+def test_agy_failure_falls_to_codex_when_opted_in(monkeypatch, tmp_path):
     _configured(monkeypatch)
-    monkeypatch.delenv("LLM_FALLBACKS")
-    def gateway(_):
-        raise HTTPError("https://example.invalid", 402, "credits", {}, None)
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setenv("LLM_FALLBACKS", "codex")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("agy")))
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
     seen = []
     def run(args, **kwargs):
@@ -436,11 +449,10 @@ def test_gateway_402_falls_to_agy_and_records_provider(monkeypatch, tmp_path):
     with _db(tmp_path) as connection:
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.6
         rows = fetch_decisions(connection, 10)
-        assert {row["model"] for row in rows} == {"fallback/agy"}
+        assert {row["model"] for row in rows} == {"fallback/codex"}
         assert {row["request_count"] for row in rows} == {2}
     args, kwargs = seen[0]
-    assert args[:5] == ["/agy", "--model", "gemini-3.8-flash-high", "--sandbox", "-p"]
-    assert len(args) == 6 and json.loads(args[-1])[1]["content"].startswith("## SECTION: prices")
+    assert args[:6] == ["/codex", "exec", "-m", "gpt-6-astra", "--sandbox", "read-only"]
     assert kwargs["timeout"] == CLI_TIMEOUT_SECONDS
     assert kwargs["cwd"] is not None and Path(kwargs["cwd"]) != Path.cwd()
 
@@ -467,9 +479,9 @@ def test_ask_cli_unwraps_fenced_and_surrounded_json(monkeypatch, stdout, expecte
 
 def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
     _configured(monkeypatch)
-    monkeypatch.setenv("LLM_FALLBACKS", "agy,codex")
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
-    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: None if name == "agy" else f"/{name}")
+    monkeypatch.setenv("LLM_FALLBACKS", "codex")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(FileNotFoundError("agy")))
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
     seen = []
     def run(args, **kwargs):
         seen.append(args)
@@ -479,19 +491,16 @@ def test_missing_agy_falls_to_codex(monkeypatch, tmp_path):
     with _db(tmp_path) as connection:
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.65
         assert {row["model"] for row in fetch_decisions(connection, 10)} == {"fallback/codex"}
-        assert {row["request_count"] for row in fetch_decisions(connection, 10)} == {3}
+        assert {row["request_count"] for row in fetch_decisions(connection, 10)} == {2}
     assert seen[0][:6] == ["/codex", "exec", "-m", "gpt-6-astra", "--sandbox", "read-only"]
-    assert len(seen[0]) == 7
 
 
 def test_all_providers_fail_one_error_row(monkeypatch, tmp_path):
     _configured(monkeypatch)
-    monkeypatch.delenv("LLM_FALLBACKS")
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
+    monkeypatch.setenv("LLM_FALLBACKS", "codex,claude")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("agy")))
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
     def run(args, **kwargs):
-        if args[0] == "/agy":
-            return subprocess.CompletedProcess(args, 0, "bad JSON", "")
         raise subprocess.CalledProcessError(1, args)
     monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
     with _db(tmp_path) as connection:
@@ -499,98 +508,35 @@ def test_all_providers_fail_one_error_row(monkeypatch, tmp_path):
         rows = fetch_decisions(connection, 10)
         assert len(rows) == 1
         assert rows[0]["status"] == "error" and rows[0]["p_up"] is None
-        assert rows[0]["request_count"] == 4
-        assert all(name in rows[0]["reason"] for name in ("gateway", "agy", "codex", "claude"))
+        assert rows[0]["request_count"] == 3
+        assert all(name in rows[0]["reason"] for name in ("agy", "codex", "claude"))
 
 
-def test_gateway_http_error_reports_status_code(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", ["nonzero", "timeout"])
+def test_failed_agy_is_neutral_without_retry(monkeypatch, tmp_path, failure):
     _configured(monkeypatch)
-    monkeypatch.setenv("LLM_FALLBACKS", "")
-    def gateway(_):
-        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: "/agy")
+    monkeypatch.setattr("andy_trader.llm_agent.tempfile.tempdir", str(tmp_path))
+    seen = []
+    def run(args, **kwargs):
+        seen.append(args)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        raise subprocess.CalledProcessError(1, args)
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda context: ask_model(context, runner=run))
     with _db(tmp_path) as connection:
         assert _predict(LlmPredictor(INSTRUMENTS), connection) == 0.5
         rows = fetch_decisions(connection, 10)
-        assert rows[0]["reason"] == "gateway: HTTPError 429"
-        assert "https://example.invalid" not in rows[0]["reason"]
-
-
-def test_gateway_429_skips_gateway_for_sixty_minutes(monkeypatch, tmp_path):
-    _configured(monkeypatch)
-    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
-    monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    gateway_calls = 0
-    def gateway(_):
-        nonlocal gateway_calls
-        gateway_calls += 1
-        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
-    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
-    def run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
-            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
-    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
-    with _db(tmp_path) as connection:
-        _predict(LlmPredictor(INSTRUMENTS), connection)
-        assert gateway_calls == 1
-        assert {row["request_count"] for row in fetch_decisions(connection, 2)} == {2}
-
-        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=30))
-        assert gateway_calls == 1
-        assert {row["request_count"] for row in fetch_decisions(connection, 2)} == {1}
-
-
-def test_gateway_retried_after_sixty_minutes(monkeypatch, tmp_path):
-    _configured(monkeypatch)
-    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
-    monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    gateway_calls = 0
-    def gateway(_):
-        nonlocal gateway_calls
-        gateway_calls += 1
-        raise HTTPError("https://example.invalid", 429, "rate limited", {}, None)
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
-    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
-    def run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
-            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
-    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
-    with _db(tmp_path) as connection:
-        _predict(LlmPredictor(INSTRUMENTS), connection)
-        assert gateway_calls == 1
-        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=30))
-        assert gateway_calls == 1
-        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=60))
-        assert gateway_calls == 2
-
-
-def test_non_429_gateway_error_does_not_skip_gateway(monkeypatch, tmp_path):
-    _configured(monkeypatch)
-    monkeypatch.setenv("LLM_MIN_MINUTES", "0")
-    monkeypatch.setenv("LLM_FALLBACKS", "agy")
-    gateway_calls = 0
-    def gateway(_):
-        nonlocal gateway_calls
-        gateway_calls += 1
-        raise HTTPError("https://example.invalid", 500, "server error", {}, None)
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
-    monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
-    def run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
-            {"instrument": name, "p_up": 0.6} for name in INSTRUMENTS]}), "")
-    monkeypatch.setattr("andy_trader.llm_agent.subprocess.run", run)
-    with _db(tmp_path) as connection:
-        _predict(LlmPredictor(INSTRUMENTS), connection)
-        assert gateway_calls == 1
-        _predict(LlmPredictor(INSTRUMENTS), connection, at=NOW + timedelta(minutes=1))
-        assert gateway_calls == 2
+        assert len(rows) == 1 and rows[0]["status"] == "error"
+        assert rows[0]["request_count"] == 1
+        assert rows[0]["reason"].startswith("agy: ")
+    assert len(seen) == 1
 
 
 def test_error_row_omits_prompt_and_cli_flags(monkeypatch, tmp_path):
     _configured(monkeypatch)
     monkeypatch.delenv("LLM_FALLBACKS")
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("gateway")))
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", lambda _: (_ for _ in ()).throw(TimeoutError("agy")))
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
     def run(args, **kwargs):
         raise subprocess.CalledProcessError(1, args)
@@ -609,11 +555,11 @@ def test_subscription_fallback_waits_fifteen_minutes(monkeypatch, tmp_path, prov
     monkeypatch.setenv("LLM_MIN_MINUTES", "0")
     monkeypatch.setenv("LLM_FALLBACKS", provider)
     count = 0
-    def gateway(_):
+    def agy(_):
         nonlocal count
         count += 1
-        raise TimeoutError("gateway")
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+        raise TimeoutError("agy")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", agy)
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda name: f"/{name}")
     def run(args, **kwargs):
         return subprocess.CompletedProcess(args, 0, json.dumps({"calls": [
@@ -629,15 +575,15 @@ def test_subscription_fallback_waits_fifteen_minutes(monkeypatch, tmp_path, prov
 
 def test_fallback_attempts_respect_daily_cap(monkeypatch, tmp_path):
     _configured(monkeypatch)
-    monkeypatch.setenv("LLM_FALLBACKS", "agy,codex,claude")
+    monkeypatch.setenv("LLM_FALLBACKS", "codex,claude")
     monkeypatch.setenv("LLM_DAILY_CALLS", "2")
     monkeypatch.setenv("LLM_MIN_MINUTES", "0")
     count = 0
-    def gateway(_):
+    def agy(_):
         nonlocal count
         count += 1
-        raise TimeoutError("gateway")
-    monkeypatch.setattr("andy_trader.llm_agent.ask_model", gateway)
+        raise TimeoutError("agy")
+    monkeypatch.setattr("andy_trader.llm_agent.ask_model", agy)
     monkeypatch.setattr("andy_trader.llm_agent.shutil.which", lambda _: None)
     with _db(tmp_path) as connection:
         _predict(LlmPredictor(INSTRUMENTS), connection)

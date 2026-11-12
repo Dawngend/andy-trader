@@ -26,8 +26,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(watch, 'LOCK_PATH', tmp_path / 'watch.lock')
     monkeypatch.setattr(watch, 'INSTRUMENTS', ('BTC-USD', 'ETH-USD'))
     monkeypatch.setattr(watch, 'fetch_binance', lambda instrument, interval, settings: [bar(instrument)])
-    for key in ('LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL'):
-        monkeypatch.setenv(key, 'fake')
+    monkeypatch.setenv('LLM_MODEL', 'fake')
     monkeypatch.setenv('LLM_LIST_ORDER', 'ranked')
     monkeypatch.setenv('LLM_MIN_MINUTES', '60')
     monkeypatch.setenv('LLM_DAILY_CALLS', '100')

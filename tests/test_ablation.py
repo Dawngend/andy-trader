@@ -92,8 +92,6 @@ def test_default_ask_uses_original_model(monkeypatch):
 
 def test_ablation_rows_never_enter_trading_cache(monkeypatch):
     monkeypatch.setenv("LLM_MODEL", "fake-model")
-    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid")
-    monkeypatch.setenv("LLM_API_KEY", "fake")
     monkeypatch.setenv("LLM_LIST_ORDER", "ranked")
     with _connection() as connection:
         original = _original(connection)

@@ -22,8 +22,7 @@ def test_cycle_falls_back_only_when_the_primary_reference_is_degraded(
     monkeypatch, tmp_path: Path,
 ) -> None:
     calls: list[tuple[str, ...]] = []
-    for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
 
     def fake_collect(*, instruments, intervals, venues, settings):
         del settings
@@ -397,8 +396,7 @@ def test_cycle_leaves_probe_trades_and_ai_to_watcher(monkeypatch, tmp_path: Path
     journal = _base_env(monkeypatch, tmp_path)
     def unexpected(*args, **kwargs):
         raise AssertionError("The watcher owns probe trades and model requests")
-    for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.setenv(key, "configured")
+    monkeypatch.setenv("LLM_MODEL", "configured")
     monkeypatch.setattr(llm_agent, "ask_model", unexpected)
     monkeypatch.setattr(probe_book, "probe_trade_once", unexpected)
     monkeypatch.setattr(probe_book, "probe_x10_trade_once", unexpected)
