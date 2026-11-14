@@ -1,4 +1,4 @@
-"""Simulated copy book for top Polymarket accounts (paper only)."""
+"""Paper-only Polymarket v2 copy book; ignore trades over ten minutes old."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ SHARES = 100
 MIN_FILL = 0.05
 MAX_FILL = 0.98
 MAX_OPEN = 60
+MAX_DELAY_SECONDS = 600  # Do not copy stale trades at current order book prices.
 VERDICT_THRESHOLD = 100
 SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open")
 WALLET_HEADER = SLICE_HEADER.replace("Slice |", "Wallet |", 1)
@@ -164,9 +165,10 @@ def copy_wallet_trades(
     clock: Callable[[], datetime] | None = None,
 ) -> None:
     global REQUEST_COUNT
+    pass_timestamp = (now or _utc_now()).timestamp()
     reader = reader or PublicReader()
     REQUEST_COUNT += 1
-    activity = reader.get("activity", user=address, limit=500)
+    activity = reader.get("v2/activity", user=address, limit=500)
     if not isinstance(activity, list):
         return
 
@@ -197,7 +199,9 @@ def copy_wallet_trades(
             continue
         if int(row.get("timestamp") or 0) <= starting_timestamp:
             continue
-        key = (str(row.get("transactionHash", "")), str(row.get("asset", "")))
+        if pass_timestamp - int(row["timestamp"]) > MAX_DELAY_SECONDS:
+            continue
+        key = (str(row.get("transaction_hash", "")), str(row.get("token_id", "")))
         if all(key) and key not in seen:
             new_trades.append((key, row))
     new_trades.sort(key=lambda item: int(item[1]["timestamp"]))
@@ -251,7 +255,7 @@ def copy_wallet_trades(
                     their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                wallet_name, address, tx_hash, token_id, str(trade.get("conditionId", "")),
+                wallet_name, address, tx_hash, token_id, str(trade.get("condition_id", "")),
                 str(trade.get("title", "")), str(trade.get("outcome", "")),
                 float(trade["price"]), their_timestamp, fill_price, fill.fee_cost, SHARES,
                 fill_time.isoformat(), float(fill_time.timestamp() - their_timestamp),

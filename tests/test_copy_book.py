@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from unittest.mock import Mock
@@ -11,7 +11,7 @@ from andy_trader.complete_set import taker_fee
 from andy_trader.store import connect
 import run_copy_book as runner
 
-NOW = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+NOW = datetime.fromtimestamp(1300, UTC)
 
 
 def make_trade(
@@ -29,9 +29,9 @@ def make_trade(
     return {
         "type": trade_type,
         "side": side,
-        "transactionHash": tx,
-        "asset": asset,
-        "conditionId": cid,
+        "transaction_hash": tx,
+        "token_id": asset,
+        "condition_id": cid,
         "price": price,
         "timestamp": ts,
         "title": title,
@@ -63,14 +63,14 @@ def network(monkeypatch):
         "markets": {},
     }
 
-    class MockPublicReader:
-        def get(self, path, **params):
-            user = params.get("user")
-            return state["activity"].get(user, [])
-
     def mock_http(url, timeout):
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
+        if parsed.netloc == "data-api.polymarket.com" and parsed.path == "/v2/activity":
+            return {
+                "data": state["activity"].get(params["user"][0], []),
+                "pagination": {"limit": 500, "offset": 0, "has_more": False, "next_cursor": None},
+            }
         if url.startswith(copy.CLOB_BOOK_URL):
             tok = params["token_id"][0]
             return state["books"].get(tok, make_book(0.90, 100))
@@ -79,7 +79,8 @@ def network(monkeypatch):
             return state["markets"].get(cids, [])
         raise AssertionError(f"Unexpected url: {url}")
 
-    monkeypatch.setattr(copy, "PublicReader", MockPublicReader)
+    monkeypatch.setattr("andy_trader.wallet_scout._http_json", mock_http)
+    monkeypatch.setattr("andy_trader.wallet_scout.REQUEST_DELAY", 0)
     monkeypatch.setattr(copy, "_http_json", mock_http)
     return state
 
@@ -133,11 +134,41 @@ def test_parsing_activity_and_no_duplicates(db, network):
     rows = positions(db)
     assert len(rows) == 1
     assert rows[0]["tx_hash"] == "tx_buy"
-
+    assert rows[0]["token_id"] == "tok1"
+    assert rows[0]["condition_id"] == "0xc1"
+    seen = {tuple(row) for row in db.execute("SELECT tx_hash, token_id FROM copy_book_seen")}
+    assert seen == {("tx_buy", "tok1")}
     # Pass 3: same activity list again; repeated trade must not be copied twice
     copy.run_once(db, now=NOW)
     rows2 = positions(db)
     assert len(rows2) == 1
+
+
+@pytest.mark.parametrize("delay", [599, 600, 601])
+def test_trade_freshness_limit(db, network, delay):
+    with db:
+        db.execute(
+            "INSERT INTO copy_book_cursor (wallet_name, newest_timestamp) VALUES (?, ?)",
+            ("sharky6999", int(NOW.timestamp()) - 10_000),
+        )
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_delay", asset="tok_delay", ts=int(NOW.timestamp()) - delay),
+    ]
+
+    errors = copy.run_once(db, now=NOW)
+
+    assert errors == []
+    assert db.execute("SELECT * FROM copy_book_skips").fetchall() == []
+    seen = {tuple(row) for row in db.execute("SELECT tx_hash, token_id FROM copy_book_seen")}
+    if delay > 600:
+        assert positions(db) == []
+        assert seen == set()
+        assert copy.BOOK_READS == 0
+    else:
+        row, = positions(db)
+        assert row["tx_hash"] == "tx_delay"
+        assert row["delay_seconds"] == delay
+        assert seen == {("tx_delay", "tok_delay")}
 
 
 def test_fill_rules_fee_and_delay(db, network):
@@ -589,7 +620,7 @@ def test_opened_at_and_delay_capture_after_order_book_read(db, network):
     network["books"]["tok_timed"] = make_book(price=0.90, size=100)
 
     # Time progresses: pass starts at NOW, but order book read finishes 8 seconds later
-    fill_time = datetime(2026, 10, 28, 12, 0, 8, tzinfo=UTC)
+    fill_time = NOW + timedelta(seconds=8)
     copy.run_once(db, now=NOW, clock=lambda: fill_time)
 
     rows = positions(db)
