@@ -110,7 +110,7 @@ def fetch_book(token_id: str) -> dict:
 def fetch_markets(condition_id: str) -> list[dict]:
     global REQUEST_COUNT
     REQUEST_COUNT += 1
-    result = _http_json(f"{GAMMA_MARKETS_URL}?{urlencode({'condition_ids': condition_id})}", TIMEOUT_SECONDS)
+    result = _http_json(f"{GAMMA_MARKETS_URL}?{urlencode({'condition_ids': condition_id, 'closed': 'true'})}", TIMEOUT_SECONDS)
     if not isinstance(result, list):
         raise ValueError("Expected a list of Gamma markets")
     return result

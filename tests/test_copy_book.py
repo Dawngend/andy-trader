@@ -226,6 +226,18 @@ def test_61st_open_position_skipped(db, network):
     assert skips.get("max_open") == 1
 
 
+def test_fetch_markets_requests_closed_markets(monkeypatch):
+    cid = "0x51b660c5af128e515194be6da1d857f9a1ec758d0094956462c5d32d868e1096"
+    http = Mock(wraps=copy._http_json)
+    monkeypatch.setattr(copy, "_http_json", http)
+
+    copy.fetch_markets(cid)
+
+    params = parse_qs(urlparse(http.call_args.args[0]).query)
+    assert params["condition_ids"] == [cid]
+    assert params["closed"] == ["true"]
+
+
 def test_settlement_win_and_loss(db, network):
     # Insert two open positions: one buying Yes, one buying No on cid1
     cid = "0xcid_settle"
@@ -273,6 +285,70 @@ def test_settlement_win_and_loss(db, network):
     # pnl = 100 * (0 - 0.10) - 0.63 = -10.63
     assert loss_row["pnl"] == pytest.approx(-10.63)
     assert loss_row["settled_at"] is not None
+
+
+@pytest.mark.parametrize("outcome, win, pnl", [
+    ("No", 1, 9.37),
+    ("Yes", 0, -90.63),
+])
+def test_settle_positions_with_resolved_gamma_market(db, network, outcome, win, pnl):
+    cid = "0xcid_resolved"
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "sharky6999", copy.WALLETS["sharky6999"], "tx_resolved", "tok1", cid,
+            "Will BTC dip to 78k?", outcome, 0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
+        ))
+    network["markets"][cid] = [{
+        "conditionId": cid,
+        "closed": True,
+        "umaResolutionStatus": "resolved",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0", "1"]',
+    }]
+    errors = []
+
+    copy.settle_positions(db, NOW, errors)
+
+    row = positions(db)[0]
+    assert errors == []
+    assert row["settled_at"] == NOW.isoformat()
+    assert row["win"] == win
+    assert row["pnl"] == pytest.approx(pnl)
+
+
+@pytest.mark.parametrize("closed", [None, False, True], ids=["empty", "open", "closed-tied"])
+def test_settle_positions_leaves_unresolved_positions_open(db, network, closed):
+    cid = "0xcid_unresolved"
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "sharky6999", copy.WALLETS["sharky6999"], "tx_unresolved", "tok1", cid,
+            "Will BTC dip to 78k?", "Yes", 0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
+        ))
+    network["markets"][cid] = [] if closed is None else [{
+        "conditionId": cid,
+        "closed": closed,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.5", "0.5"]',
+    }]
+    errors = []
+
+    copy.settle_positions(db, NOW, errors)
+
+    row = positions(db)[0]
+    assert errors == []
+    assert row["settled_at"] is None
+    assert row["win"] is None
+    assert row["pnl"] is None
 
 
 def test_format_report(db):
