@@ -228,7 +228,7 @@ def test_61st_open_position_skipped(db, network):
 
 def test_fetch_markets_requests_closed_markets(monkeypatch):
     cid = "0x51b660c5af128e515194be6da1d857f9a1ec758d0094956462c5d32d868e1096"
-    http = Mock(wraps=copy._http_json)
+    http = Mock(return_value=[])
     monkeypatch.setattr(copy, "_http_json", http)
 
     copy.fetch_markets(cid)
@@ -321,8 +321,22 @@ def test_settle_positions_with_resolved_gamma_market(db, network, outcome, win, 
     assert row["pnl"] == pytest.approx(pnl)
 
 
-@pytest.mark.parametrize("closed", [None, False, True], ids=["empty", "open", "closed-tied"])
-def test_settle_positions_leaves_unresolved_positions_open(db, network, closed):
+@pytest.mark.parametrize("markets", [
+    [],
+    [{
+        "conditionId": "0xcid_unresolved",
+        "closed": False,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.5", "0.5"]',
+    }],
+    [{
+        "conditionId": "0xcid_unresolved",
+        "closed": True,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.5", "0.5"]',
+    }],
+], ids=["empty", "open", "closed-tied"])
+def test_settle_positions_leaves_unresolved_positions_open(db, network, markets):
     cid = "0xcid_unresolved"
     with db:
         db.execute("""
@@ -334,12 +348,7 @@ def test_settle_positions_leaves_unresolved_positions_open(db, network, closed):
             "sharky6999", copy.WALLETS["sharky6999"], "tx_unresolved", "tok1", cid,
             "Will BTC dip to 78k?", "Yes", 0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
         ))
-    network["markets"][cid] = [] if closed is None else [{
-        "conditionId": cid,
-        "closed": closed,
-        "outcomes": '["Yes", "No"]',
-        "outcomePrices": '["0.5", "0.5"]',
-    }]
+    network["markets"][cid] = markets
     errors = []
 
     copy.settle_positions(db, NOW, errors)
