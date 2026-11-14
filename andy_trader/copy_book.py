@@ -19,6 +19,8 @@ from andy_trader.wallet_scout import PublicReader
 WALLETS = {
     "sharky6999": "0x751a2b86cab503496efd325c8344e10159349ea1",
     "dromedaryy": "0x6575759174ad221bba9947bc3f18750ec769b198",
+    # Forward test candidate from the 2026-11-15 scout run; drop if no edge after VERDICT_THRESHOLD settled positions.
+    "lpgb": "0x1f5f9fa318fbda8350ac143b4df657287df850fa",
 }
 
 # 2026-11-15: sharky6999 has 60 settled, 85% wins, average entry 0.83,

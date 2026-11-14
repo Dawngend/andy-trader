@@ -251,8 +251,7 @@ def test_board_with_copy_book_positions(tmp_path):
             parts = [p.strip() for p in line.split("|")]
             rows_by_strat[parts[0]] = parts
 
-    assert "copy_sharky6999" in rows_by_strat
-    assert "copy_dromedaryy" in rows_by_strat
+    assert set(rows_by_strat) == {"copy_sharky6999", "copy_dromedaryy", "copy_lpgb"}
 
     sharky = rows_by_strat["copy_sharky6999"]
     assert sharky[1] == "1"  # settled
@@ -262,7 +261,8 @@ def test_board_with_copy_book_positions(tmp_path):
     assert sharky[5] == "0.9000"
     assert sharky[8] == "collecting"
 
-    dromedaryy = rows_by_strat["copy_dromedaryy"]
-    assert dromedaryy[1] == "0"
-    assert dromedaryy[2] == "0"
-    assert dromedaryy[8] == "collecting"
+    for wallet_name in ("dromedaryy", "lpgb"):
+        wallet = rows_by_strat[f"copy_{wallet_name}"]
+        assert wallet[1] == "0"
+        assert wallet[2] == "0"
+        assert wallet[8] == "collecting"

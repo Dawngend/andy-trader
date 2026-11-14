@@ -55,10 +55,7 @@ def db(tmp_path):
 @pytest.fixture(autouse=True)
 def network(monkeypatch):
     state = {
-        "activity": {
-            copy.WALLETS["sharky6999"]: [],
-            copy.WALLETS["dromedaryy"]: [],
-        },
+        "activity": {address: [] for address in copy.WALLETS.values()},
         "books": {},
         "markets": {},
     }
@@ -90,6 +87,7 @@ def positions(db):
 
 
 def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
+    assert copy.WALLETS["lpgb"] == "0x1f5f9fa318fbda8350ac143b4df657287df850fa"
     network["activity"][copy.WALLETS["sharky6999"]] = [
         make_trade(tx="tx1", ts=1000),
         make_trade(tx="tx2", ts=900),
@@ -97,19 +95,17 @@ def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
     network["activity"][copy.WALLETS["dromedaryy"]] = [
         make_trade(tx="tx3", ts=800),
     ]
+    network["activity"][copy.WALLETS["lpgb"]] = [
+        make_trade(tx="tx4", ts=1100),
+        make_trade(tx="tx5", ts=1200),
+    ]
 
     errors = copy.run_once(db, now=NOW)
     assert errors == []
     assert positions(db) == []
 
-    cursor_sharky = db.execute(
-        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'sharky6999'"
-    ).fetchone()[0]
-    cursor_drom = db.execute(
-        "SELECT newest_timestamp FROM copy_book_cursor WHERE wallet_name = 'dromedaryy'"
-    ).fetchone()[0]
-    assert cursor_sharky == 1000
-    assert cursor_drom == 800
+    cursors = dict(db.execute("SELECT wallet_name, newest_timestamp FROM copy_book_cursor"))
+    assert cursors == {"sharky6999": 1000, "dromedaryy": 800, "lpgb": 1200}
 
 
 def test_parsing_activity_and_no_duplicates(db, network, monkeypatch):
@@ -425,7 +421,9 @@ def test_format_report(db):
 
     rep = copy.format_report(db)
     assert "Copy Book (paper only)" in rep
-    assert "Wallet: sharky6999" in rep
+    assert {line for line in rep.splitlines() if line.startswith("Wallet: ")} == {
+        "Wallet: sharky6999", "Wallet: dromedaryy", "Wallet: lpgb",
+    }
     assert "Open positions: 0" in rep
     assert "Settled positions: 2" in rep
     assert "thin_book: 1" in rep
