@@ -1,4 +1,4 @@
-"""Paper-only Polymarket v2 copy book; ignore trades over ten minutes old."""
+"""Paper-only Polymarket copy book."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
