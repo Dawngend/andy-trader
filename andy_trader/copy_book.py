@@ -21,6 +21,14 @@ WALLETS = {
     "dromedaryy": "0x6575759174ad221bba9947bc3f18750ec769b198",
 }
 
+# 2026-11-15: sharky6999 has 60 settled, 85% wins, average entry 0.83,
+# average win +$9 / loss -$42, +$1 per position, bootstrap 95% CI [-$5.28, +$6.56].
+# Its near-certain price-target-NO pattern also lost money in the bond book.
+# dromedaryy stays: 52 settled, 48% wins, average win +$60 / loss -$30,
+# +$13 per position, bootstrap 95% CI [+$1.27, +$25.30] excludes zero.
+# Settlement and reporting continue; empty this set to resume.
+PAUSED_WALLETS = {"sharky6999"}
+
 SHARES = 100
 MIN_FILL = 0.05
 MAX_FILL = 0.98
@@ -206,12 +214,15 @@ def copy_wallet_trades(
             new_trades.append((key, row))
     new_trades.sort(key=lambda item: int(item[1]["timestamp"]))
 
-    # A trade is marked seen once it was copied or skipped for a counted reason. A failed
-    # order book read is not marked, so the trade is tried again on the next pass.
+    # Copied or skipped trades (including paused wallets) are marked seen.
+    # A failed order book read is not marked, so it is tried again on the next pass.
     for (tx_hash, token_id), trade in new_trades:
         if (tx_hash, token_id) in seen:
             continue
         seen.add((tx_hash, token_id))
+        if wallet_name in PAUSED_WALLETS:
+            mark_seen(connection, wallet_name, tx_hash, token_id)
+            continue
 
         open_count = connection.execute(
             "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",

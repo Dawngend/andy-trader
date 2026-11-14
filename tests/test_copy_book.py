@@ -112,7 +112,8 @@ def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
     assert cursor_drom == 800
 
 
-def test_parsing_activity_and_no_duplicates(db, network):
+def test_parsing_activity_and_no_duplicates(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # Pass 1: establishes starting point at 1000
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
@@ -145,7 +146,8 @@ def test_parsing_activity_and_no_duplicates(db, network):
 
 
 @pytest.mark.parametrize("delay", [599, 600, 601])
-def test_trade_freshness_limit(db, network, delay):
+def test_trade_freshness_limit(db, network, delay, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     with db:
         db.execute(
             "INSERT INTO copy_book_cursor (wallet_name, newest_timestamp) VALUES (?, ?)",
@@ -171,7 +173,8 @@ def test_trade_freshness_limit(db, network, delay):
         assert seen == {("tx_delay", "tok_delay")}
 
 
-def test_fill_rules_fee_and_delay(db, network):
+def test_fill_rules_fee_and_delay(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # First pass
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
@@ -192,7 +195,8 @@ def test_fill_rules_fee_and_delay(db, network):
     assert row["delay_seconds"] == pytest.approx(15.0)
 
 
-def test_fill_rules_skips(db, network):
+def test_fill_rules_skips(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # Pass 1
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
@@ -226,7 +230,8 @@ def test_fill_rules_skips(db, network):
     assert skips.get("thin_book") == 1
 
 
-def test_61st_open_position_skipped(db, network):
+def test_61st_open_position_skipped(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # Insert 60 open positions for sharky6999
     with db:
         for i in range(60):
@@ -462,6 +467,7 @@ def test_runner_journal_and_lock(db, network, tmp_path, monkeypatch, capsys):
 
 
 def test_cursor_advancement_on_transient_order_book_error(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     import urllib.error
 
     # Pass 1: establishes starting point at 1000
@@ -515,7 +521,8 @@ def test_cursor_advancement_on_transient_order_book_error(db, network, monkeypat
     assert seen_after == {("tx1", "tok1"), ("tx2", "tok2")}
 
 
-def test_late_trade_with_older_timestamp_is_copied(db, network):
+def test_late_trade_with_older_timestamp_is_copied(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
 
@@ -531,7 +538,8 @@ def test_late_trade_with_older_timestamp_is_copied(db, network):
     assert {r["tx_hash"] for r in positions(db)} == {"tx_a", "tx_b"}
 
 
-def test_skipped_trade_is_not_counted_twice(db, network):
+def test_skipped_trade_is_not_counted_twice(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
 
@@ -608,7 +616,8 @@ def test_format_report_price_difference(db):
     assert "Average price difference (fill - their): +0.0200" in rep
 
 
-def test_opened_at_and_delay_capture_after_order_book_read(db, network):
+def test_opened_at_and_delay_capture_after_order_book_read(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # Establish starting point
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
@@ -630,7 +639,8 @@ def test_opened_at_and_delay_capture_after_order_book_read(db, network):
     assert row["delay_seconds"] == pytest.approx(8.0)
 
 
-def test_unseen_trades_at_cursor_timestamp_accepted(db, network):
+def test_unseen_trades_at_cursor_timestamp_accepted(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     # Pass 1: establishes starting point at 1000
     network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
     copy.run_once(db, now=NOW)
@@ -663,3 +673,68 @@ def test_unseen_trades_at_cursor_timestamp_accepted(db, network):
     copy.run_once(db, now=NOW)
     rows_final = positions(db)
     assert len(rows_final) == 2
+
+
+@pytest.mark.parametrize("resume_delay", [0, copy.MAX_DELAY_SECONDS + 1])
+def test_paused_wallet_skips_fresh_buy_and_resumes_without_backfill(
+    db, network, monkeypatch, resume_delay,
+):
+    address = copy.WALLETS["sharky6999"]
+    network["activity"][address] = [make_trade(tx="tx_start", ts=1)]
+    copy.run_once(db, now=NOW)
+    network["activity"][address] = [make_trade(tx="tx_paused", ts=int(NOW.timestamp()))]
+
+    assert copy.run_once(db, now=NOW) == []
+    assert positions(db) == []
+    assert copy.BOOK_READS == 0
+
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    resumed_at = NOW + timedelta(seconds=resume_delay)
+    network["activity"][address].extend([
+        make_trade(tx="tx_stale", asset="tok_stale", ts=int(NOW.timestamp()) - copy.MAX_DELAY_SECONDS - 1),
+        make_trade(tx="tx_resumed", asset="tok_resumed", ts=int(resumed_at.timestamp())),
+    ])
+    assert copy.run_once(db, now=resumed_at) == []
+    row, = positions(db)
+    assert row["tx_hash"] == "tx_resumed"
+    assert row["wallet_name"] == "sharky6999"
+
+
+def test_paused_wallet_still_settles_and_reports(db, network):
+    cid = "0xcid_paused"
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "sharky6999", copy.WALLETS["sharky6999"], "tx_open", "tok_open", cid,
+            "Will BTC reach 150k?", "No", 0.90, 1000, 0.90, 0.63, 100, NOW.isoformat(), 5.0,
+        ))
+    network["markets"][cid] = [{
+        "conditionId": cid,
+        "closed": True,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0", "1"]',
+    }]
+
+    assert copy.run_once(db, now=NOW) == []
+    row, = positions(db)
+    assert row["settled_at"] == NOW.isoformat()
+    assert row["win"] == 1
+    assert row["pnl"] == pytest.approx(9.37)
+    assert "Wallet: sharky6999\nOpen positions: 0\nSettled positions: 1" in copy.format_report(db)
+
+
+def test_unpaused_wallet_still_copies(db, network):
+    address = copy.WALLETS["dromedaryy"]
+    network["activity"][address] = [make_trade(tx="tx_start", ts=1000)]
+    copy.run_once(db, now=NOW)
+    network["activity"][address] = [make_trade(tx="tx_active", ts=int(NOW.timestamp()))]
+
+    assert copy.run_once(db, now=NOW) == []
+    row, = positions(db)
+    assert row["wallet_name"] == "dromedaryy"
+    assert row["tx_hash"] == "tx_active"
+    assert row["fill_price"] == pytest.approx(0.90)
