@@ -175,3 +175,4 @@ def test_risk_interlock_closes_open_position_and_opens_nothing(db, monkeypatch, 
     assert state.position_qty == 0
     trades = db.execute("SELECT side, reason FROM paper_trades WHERE predictor=? ORDER BY id", (book,)).fetchall()
     assert [row["side"] for row in trades] == ["short", "flat"]
+    assert trades[-1]["reason"].startswith(f"{book} RISK INTERLOCK forced exit:")
