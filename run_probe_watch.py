@@ -24,9 +24,9 @@ from andy_trader.store import connect, default_database_path, record_observation
 
 INSTRUMENTS = tuple(f"{coin}-USD" for coin in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"))
 BOOKS = (("probe", 1, probe_trade_once), ("probe_x10", 10, probe_x10_trade_once))
-# The 10x book lost $1,180 in 29 round trips with no edge, so it opens nothing new (all its positions were flat
-# on 2026-10-23). It still runs the risk and mark steps. Empty this set to bring it back.
-PAUSED_BOOKS = {"probe_x10"}
+# Both books lost money with no edge: probe -$1,283 since Oct 16 (2026-11-14 totals),
+# probe_x10 -$1,180 in 29 round trips. Risk and marks still run; empty this set to resume both.
+PAUSED_BOOKS = {"probe", "probe_x10"}
 LOCK_PATH = REPO_ROOT / ".probe-watch.lock"
 JOURNAL_PATH = REPO_ROOT / ".probe-watch.jsonl"
 
@@ -129,6 +129,8 @@ def run_pass(connection, *, now=None):
         # Commit and journal exits before any network request to the model.
         journal_closes(connection, after_id)
         after_id = connection.execute("SELECT COALESCE(MAX(id), 0) FROM paper_trades").fetchone()[0]
+        if all(book in PAUSED_BOOKS for book, _, _ in BOOKS):
+            return
         latest = connection.execute("SELECT created_at FROM llm_decisions WHERE status NOT IN "
                                     "('replay', 'ablation', 'capped') ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()
         if latest and (moment - datetime.fromisoformat(latest[0])).total_seconds() <= float(os.environ.get("LLM_MIN_MINUTES", "60")) * 60:

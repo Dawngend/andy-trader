@@ -22,6 +22,7 @@ def bar(instrument='BTC-USD', age=1, price=100, low=None):
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch, 'PAUSED_BOOKS', {'probe_x10'})
     monkeypatch.setattr(watch, 'JOURNAL_PATH', tmp_path / 'journal.jsonl')
     monkeypatch.setattr(watch, 'LOCK_PATH', tmp_path / 'watch.lock')
     monkeypatch.setattr(watch, 'INSTRUMENTS', ('BTC-USD', 'ETH-USD'))
@@ -228,7 +229,27 @@ def test_existing_claim_blocks_repeated_batch(setup, monkeypatch):
     assert setup.execute('SELECT count(*) FROM probe_batch_claims').fetchone()[0] == 1
 
 
-def test_paused_x10_book_opens_nothing_new(setup):
+@pytest.mark.parametrize('book', ['probe', 'probe_x10'])
+def test_paused_book_opens_nothing_new(setup, monkeypatch, book):
+    monkeypatch.setattr(watch, 'PAUSED_BOOKS', {book})
     watch.run_pass(setup, now=NOW)
-    assert 'probe_x10' in watch.PAUSED_BOOKS
-    assert setup.execute("SELECT count(*) FROM paper_trades WHERE predictor = 'probe_x10'").fetchone()[0] == 0
+    assert setup.execute("SELECT count(*) FROM paper_trades WHERE predictor = ?", (book,)).fetchone()[0] == 0
+    active_book = 'probe_x10' if book == 'probe' else 'probe'
+    assert get_or_create_state(setup, predictor=active_book, instrument='BTC-USD', now_iso=NOW.isoformat()).position_qty > 0
+
+
+def test_all_paused_books_still_close_and_mark_without_predictions(setup, monkeypatch):
+    monkeypatch.setattr(watch, 'PAUSED_BOOKS', {'probe', 'probe_x10'})
+    for book in ('probe', 'probe_x10'):
+        open_position(setup, book)
+    monkeypatch.setattr(watch, 'fetch_binance', lambda i, *a: [bar(i, low=97)])
+    monkeypatch.setattr(watch, 'predict_once', lambda *a, **k: pytest.fail('paused books must not predict'))
+    watch.run_pass(setup, now=NOW)
+    for book in ('probe', 'probe_x10'):
+        assert get_or_create_state(setup, predictor=book, instrument='BTC-USD', now_iso=NOW.isoformat()).position_qty == 0
+    assert setup.execute('SELECT count(*) FROM paper_trades').fetchone()[0] == 4
+    assert setup.execute('SELECT count(*) FROM paper_equity_curve').fetchone()[0] == 4
+    assert setup.execute('SELECT count(*) FROM llm_decisions').fetchone()[0] == 0
+    closed = [json.loads(line) for line in watch.JOURNAL_PATH.read_text().splitlines()
+              if json.loads(line)['event'] == 'closed_trade']
+    assert {row['book'] for row in closed} == {'probe', 'probe_x10'}

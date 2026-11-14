@@ -41,6 +41,7 @@ def db(tmp_path):
 
 @pytest.fixture(autouse=True)
 def network(monkeypatch):
+    monkeypatch.setattr(bond, "PAUSED", False)
     state = {"events": [event()], "books": {}, "closed": {}, "book_calls": []}
 
     def http(url, timeout):
@@ -65,6 +66,29 @@ def network(monkeypatch):
 
 def positions(db):
     return db.execute("SELECT * FROM bond_book_positions").fetchall()
+
+
+def test_paused_book_opens_nothing_new(db, network, monkeypatch):
+    monkeypatch.setattr(bond, "PAUSED", True)
+    assert bond.run_once(db, now=NOW) == []
+    assert positions(db) == []
+    assert network["book_calls"] == []
+
+
+@pytest.mark.parametrize("win", [0, 1])
+def test_paused_book_still_settles(db, network, monkeypatch, win):
+    bond.open_position(db, "held", market("held"), "Yes", 0.9, 0.63, NOW)
+    network["closed"]["held"] = [event("held", [
+        market("held", closed=True, outcomePrices=json.dumps([win, 1 - win])),
+    ])]
+    monkeypatch.setattr(bond, "PAUSED", True)
+    assert bond.run_once(db, now=NOW + timedelta(hours=1)) == []
+    row, = positions(db)
+    assert row["market_id"] == "held"
+    assert row["win"] == win
+    assert row["settled_at"] == (NOW + timedelta(hours=1)).isoformat()
+    assert row["pnl"] == pytest.approx(100 * (win - 0.9) - 0.63)
+    assert network["book_calls"] == []
 
 
 def test_open_fee_and_no_duplicate(db):

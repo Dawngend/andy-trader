@@ -16,6 +16,9 @@ from andy_trader.complete_set import (
 )
 from andy_trader.loss_rules import blocking_rule, load_rules
 
+# Paused after 2026-11-14 totals: -$3,126 over 679 settled positions, with no edge.
+# Wins pay about $9, losses cost about $90: 91% wins needed, 86% achieved. Set False to resume.
+PAUSED = True
 SHARES = 100
 MIN_ASK = 0.90  # raised from 0.80 on 2026-10-30: the 0.80 to 0.90 band had a 24 percent loss rate and -$455 over 45 settled positions
 MAX_ASK = 0.95  # cut from 0.98 on 2026-10-28: the 0.95 to 0.98 band lost money over 18 settled positions
@@ -310,6 +313,8 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
     errors = []
     settle_positions(connection, now, errors)
+    if PAUSED:
+        return errors
     try:
         for event in active_events(now, errors):
             if not event.get("active") or event.get("closed"):

@@ -51,6 +51,7 @@ def db(tmp_path):
 
 @pytest.fixture(autouse=True)
 def network(monkeypatch):
+    monkeypatch.setattr(pt, "PAUSED", False)
     state = {"events": [event()], "books": {}, "closed": {}, "book_calls": []}
 
     def http(url, timeout):
@@ -100,6 +101,29 @@ def test_market_filter_rejects_non_qualifying(question, days):
 def test_market_filter_accepts_dip_and_hit(title):
     m = market(question=title, endDate=(NOW + timedelta(days=10)).isoformat())
     assert pt.eligible_market(m, NOW) is True
+
+
+def test_paused_book_opens_nothing_new(db, network, monkeypatch):
+    monkeypatch.setattr(pt, "PAUSED", True)
+    assert pt.run_once(db, now=NOW) == []
+    assert positions(db) == []
+    assert network["book_calls"] == []
+
+
+@pytest.mark.parametrize("win", [0, 1])
+def test_paused_book_still_settles(db, network, monkeypatch, win):
+    pt.open_position(db, "held", market("held"), "No", 0.9, 0.63, NOW)
+    network["closed"]["held"] = [event("held", [
+        market("held", closed=True, outcomePrices=json.dumps([1 - win, win])),
+    ])]
+    monkeypatch.setattr(pt, "PAUSED", True)
+    assert pt.run_once(db, now=NOW + timedelta(hours=1)) == []
+    row, = positions(db)
+    assert row["market_id"] == "held"
+    assert row["win"] == win
+    assert row["settled_at"] == (NOW + timedelta(hours=1)).isoformat()
+    assert row["pnl"] == pytest.approx(100 * (win - 0.9) - 0.63)
+    assert network["book_calls"] == []
 
 
 def test_open_position_at_090_with_fee_and_side(db):

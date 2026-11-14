@@ -21,6 +21,8 @@ from andy_trader.bond_book import (
 def _http_json(url: str, timeout: int):
     return bond_book._http_json(url, timeout)
 
+# Paused after 2026-11-14 totals: -$255 over 29 settled positions, with no edge. Set False to resume.
+PAUSED = True
 SHARES = 100
 MIN_ASK = 0.85
 MAX_ASK = 0.96
@@ -135,6 +137,8 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
     errors = []
     settle_positions(connection, now, errors)
+    if PAUSED:
+        return errors
     try:
         for event in active_events(now, errors, min_days=MIN_DAYS, max_days=MAX_DAYS):
             if not event.get("active") or event.get("closed"):
