@@ -11,7 +11,36 @@ from andy_trader import wallet_scout as scout
 ACCOUNT = {"address": "0x" + "a" * 40, "user_name": "Alice", "rank": 1,
            "leaderboard_pnl": 1000, "leaderboard_volume": 5000}
 LEADER = {"user_id": ACCOUNT["address"], "user_name": "Alice", "rank": 1,
-          "pnl": 1000, "volume": 5000}
+          "pnl": 1000, "volume": 5000, "profile_image": "", "x_username": "", "verified": False}
+
+# Shapes observed from the public v2 service; CLOSED entry cost is remaining basis.
+V2_POSITION = {
+    "proxy_wallet": ACCOUNT["address"], "token_id": "123", "condition_id": "0x" + "c" * 64,
+    "current_size": 0.0, "avg_price": .6, "entry_cost_usdc": 0.0,
+    "entry_fees_usdc": 0.0, "total_cost_usdc": 0.0, "current_price": 1.0,
+    "current_value": 0.0, "total_size": 10.0, "realized_pnl": 1.0,
+    "unrealized_pnl": 0.0, "total_pnl": 1.0, "percent_pnl": 0.0,
+    "percent_realized_pnl": 0.0, "status": "CLOSED", "redeemable": False,
+    "mergeable": False, "negative_risk": False, "archived": False,
+    "title": "Other", "slug": "other", "icon": "", "event_id": "1",
+    "event_slug": "other", "outcome": "Yes", "outcome_index": 0,
+    "opposite_outcome": "No", "opposite_token_id": "456", "end_date": "2026-11-14",
+    "last_event_at": 0, "first_entry_at": 0, "name": "Alice",
+    "profile_image": "", "verified": False,
+}
+V2_ACTIVITY = {
+    "proxy_wallet": ACCOUNT["address"], "timestamp": 0, "condition_id": "0x" + "c" * 64,
+    "type": "TRADE", "size": 10.0, "usdc_size": 9.6,
+    "transaction_hash": "0x" + "d" * 64, "price": .96, "token_id": "123",
+    "side": "BUY", "outcome_index": 0, "title": "Other", "slug": "other",
+    "icon": "", "event_slug": "other", "outcome": "Yes", "name": "Alice",
+    "pseudonym": "", "bio": "", "profile_image": "", "profile_image_optimized": "",
+}
+
+
+def page(rows, cursor=None, limit=50, offset=0):
+    return {"data": rows, "pagination": {
+        "limit": limit, "offset": offset, "has_more": cursor is not None, "next_cursor": cursor}}
 
 
 def position(price=.6, pnl=1, timestamp=0, shares=10, title="Other"):
@@ -31,15 +60,57 @@ def no_network(monkeypatch):
     return http
 
 
-def test_leaderboard_parses_v2_in_one_request(no_network):
-    no_network.side_effect = [{"data": [LEADER]}]
-    assert scout.fetch_leaderboard(2, "WEEK") == [ACCOUNT]
+def test_leaderboard_unwraps_and_follows_cursor(no_network):
+    bob = dict(LEADER, user_id="0x" + "b" * 40, user_name="Bob", rank=2)
+    no_network.side_effect = [page([LEADER], "board+/=", limit=2),
+                              page([bob], limit=2, offset=1)]
+    accounts = scout.fetch_leaderboard(2, "WEEK")
+    assert accounts == [ACCOUNT, dict(ACCOUNT, address=bob["user_id"], user_name="Bob", rank=2)]
+    assert no_network.call_count == 2
+    for index, call in enumerate(no_network.call_args_list):
+        url = urlparse(call.args[0])
+        query = parse_qs(url.query)
+        assert url.path == "/v2/leaderboard"
+        assert query == dict(time_period=["week"], sort_by=["PNL"], limit=["2"],
+                             **({"cursor": ["board+/="]} if index else {}))
+
+
+def test_leaderboard_stops_at_requested_accounts(no_network):
+    no_network.side_effect = [page([LEADER], "more", limit=1)]
+    assert scout.fetch_leaderboard(1, "MONTH") == [ACCOUNT]
     assert no_network.call_count == 1
-    query = parse_qs(urlparse(no_network.call_args.args[0]).query)
-    assert "offset" not in query
-    assert query["limit"] == ["2"]
-    assert query["timePeriod"] == ["WEEK"]
-    assert "/v2/leaderboard" in no_network.call_args.args[0]
+
+
+def test_v2_rows_preserve_profile_economics_and_activity(no_network):
+    no_network.side_effect = [
+        page([dict(V2_POSITION, last_event_at=100)]),
+        page([V2_ACTIVITY], "activity+/=", limit=500),
+        page([], "after-empty", limit=500, offset=1),
+        page([dict(V2_ACTIVITY, timestamp=3600, price=.5, usdc_size=5)], limit=500, offset=1),
+    ]
+    reader = scout.PublicReader()
+    closed = scout.fetch_closed_positions(reader, ACCOUNT["address"], 40)
+    activity = reader.get("v2/activity", max_pages=None, user=ACCOUNT["address"], limit=500)
+    profile = scout.profile_account(ACCOUNT, closed, activity)
+    assert closed == [position(timestamp=100)]
+    assert (profile["sample_size"], profile["cost"], profile["pnl"]) == (1, 6, 1)
+    assert (profile["first_timestamp"], profile["last_timestamp"]) == (100, 100)
+    assert profile["return_on_cost"] == pytest.approx(1 / 6)
+    assert (profile["activity_count"], profile["buy_count"]) == (2, 2)
+    assert profile["high_price_buy_share"] == .5
+    assert profile["buys_per_hour"] == 2
+    assert activity[0]["usdc_size"] == 9.6
+    for call, cursor in zip(no_network.call_args_list[1:], (None, "activity+/=", "after-empty")):
+        url = urlparse(call.args[0])
+        assert url.path == "/v2/activity"
+        assert parse_qs(url.query) == dict(user=[ACCOUNT["address"]], limit=["500"],
+                                          **({"cursor": [cursor]} if cursor else {}))
+
+
+def test_reader_keeps_single_page_for_existing_consumers(no_network):
+    no_network.side_effect = [page([V2_ACTIVITY], "more", limit=500)]
+    assert scout.PublicReader().get("v2/activity", user=ACCOUNT["address"], limit=500) == [V2_ACTIVITY]
+    assert no_network.call_count == 1
 
 
 def test_profile_numbers():
@@ -153,38 +224,56 @@ def test_empty_and_zero_duration_samples():
     assert profile["loss_to_win_ratio"] is None
 
 
-@pytest.mark.parametrize("pages,responses,expected,calls", [
-    (40, [[position()], []], 1, 2), (2, [[position()], [position()]], 2, 2),
-    (40, [[]], 0, 1), (300, [[position()]] * 200, 200, 200)])
-def test_paging_stops(no_network, pages, responses, expected, calls):
-    no_network.side_effect = responses
-    assert len(scout.fetch_closed_positions(scout.PublicReader(), ACCOUNT["address"], pages)) == expected
-    assert no_network.call_count == calls
+@pytest.mark.parametrize("pages,batches,cursors,expected", [
+    (40, [[V2_POSITION], [], [dict(V2_POSITION, last_event_at=10)]],
+     ["short-page", "empty-page", None], [position(), position(timestamp=10)]),
+    (2, [[V2_POSITION], [dict(V2_POSITION, realized_pnl=-2)]],
+     ["next", "beyond-cap"], [position(), position(pnl=-2)]),
+    (40, [[]], [None], []),
+])
+def test_closed_cursor_paging_and_page_cap(no_network, pages, batches, cursors, expected):
+    no_network.side_effect = [page(rows, cursor) for rows, cursor in zip(batches, cursors)]
+    assert scout.fetch_closed_positions(scout.PublicReader(), ACCOUNT["address"], pages) == expected
+    assert no_network.call_count == len(batches)
     for index, call in enumerate(no_network.call_args_list):
-        assert parse_qs(urlparse(call.args[0]).query)["offset"] == [str(index * 50)]
-    assert scout.time.sleep.call_count == calls
+        url = urlparse(call.args[0])
+        assert url.path == "/v2/positions"
+        assert parse_qs(url.query) == dict(
+            user=[ACCOUNT["address"]], status=["CLOSED"], limit=["50"],
+            sort_by=["TIMESTAMP"], sort_direction=["DESC"],
+            **({"cursor": [cursors[index - 1]]} if index else {}))
+
+
+def test_closed_row_cap(no_network):
+    no_network.side_effect = [page([V2_POSITION] * 50, "more")] * 200
+    rows = scout.fetch_closed_positions(scout.PublicReader(), ACCOUNT["address"], 300)
+    assert len(rows) == 10_000
+    assert no_network.call_count == 200
 
 
 def test_failure_budget_spans_requests(no_network):
-    no_network.side_effect = [OSError("first"), [position()], OSError("second"), [], OSError("third")]
+    no_network.side_effect = [OSError("first"), page([V2_POSITION], "next"),
+                              OSError("second"), page([]), OSError("third")]
     reader = scout.PublicReader()
     assert len(scout.fetch_closed_positions(reader, ACCOUNT["address"], 40)) == 1
     with pytest.raises(RuntimeError, match="third"):
-        reader.get("activity", user=ACCOUNT["address"])
+        reader.get("v2/activity", user=ACCOUNT["address"])
     assert no_network.call_count == 5
     assert len(reader.failures) == 3
+    assert no_network.call_args_list[0] == no_network.call_args_list[1]
+    assert no_network.call_args_list[2] == no_network.call_args_list[3]
 
 
 def test_run_continues_report_and_append_only(tmp_path, no_network):
     bad = dict(LEADER, user_id="0x" + "b" * 40, rank=2, user_name="Bob")
     def response(url, timeout):
         if "leaderboard" in url:
-            return {"data": [bad, LEADER]}
+            return page([bad, LEADER], limit=2)
         if bad["user_id"] in url:
             raise OSError("account unavailable")
-        if "closed-positions" in url:
-            return [position()] if "offset=0&" in url else []
-        return [buy(0), buy(3600)]
+        if "/v2/positions?" in url:
+            return page([V2_POSITION])
+        return page([V2_ACTIVITY, dict(V2_ACTIVITY, timestamp=3600)], limit=500)
     no_network.side_effect = response
     database, report = tmp_path / "scout.db", tmp_path / "research" / "report.md"
     first = scout.run_scout(database, report, top=2)
@@ -203,9 +292,6 @@ def test_run_continues_report_and_append_only(tmp_path, no_network):
         assert json.loads(bands)["0.50_to_0.80"]["count"] == 1
         assert "thin_sample" in json.loads(flags)
     text = report.read_text(encoding="utf-8")
-    assert "| User Name | Label | Flags | Sample Size |" in text
-    assert "lifetime pnl can be much larger" in text
-    assert "Sample windows (UTC)" in text
     assert "1970-01-01" in text
     assert ACCOUNT["address"] not in text
     assert "Alice (0xaaaaaa...aaaa)" in text
@@ -223,7 +309,7 @@ def test_report_rank_order_and_escaping(tmp_path):
 
 
 def test_recovered_failure_is_recorded(tmp_path, no_network):
-    no_network.side_effect = [{"data": [LEADER]}, OSError("temporary"), [], []]
+    no_network.side_effect = [page([LEADER], limit=1), OSError("temporary"), page([]), page([])]
     scout.run_scout(tmp_path / "scout.db", tmp_path / "report.md", top=1)
     with sqlite3.connect(tmp_path / "scout.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0] == 1

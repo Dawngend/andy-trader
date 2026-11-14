@@ -1,4 +1,9 @@
-"""Read-only public Polymarket account profiles."""
+"""Read-only public Polymarket account profiles.
+
+Scout reads use Data API v2 cursor pages. Closed-position fields are translated
+at the fetch boundary; lifetime bought shares, not current holdings or remaining
+entry cost, preserve the profile's historical cost calculation.
+"""
 
 from datetime import UTC, datetime
 import json
@@ -43,38 +48,48 @@ class PublicReader:
     def __init__(self):
         self.failures = []
 
-    def get(self, path, **params):
-        url = f"{API}/{path}?{urlencode(params)}"
-        while len(self.failures) < MAX_FAILURES:
-            time.sleep(REQUEST_DELAY)
-            try:
-                result = _http_json(url, 30)
-                rows = result.get("data") if isinstance(result, dict) else result
-                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                    raise ValueError("Expected a list of public data rows")
-                return rows
-            except Exception as exc:
-                self.failures.append(f"{path}: {exc}")
-        raise RuntimeError("; ".join(self.failures))
+    def get(self, path, max_pages=1, max_rows=None, **params):
+        """Read v2 pages; default to one page for recent-activity consumers."""
+        rows = []
+        page = 0
+        while max_pages is None or page < max_pages:
+            url = f"{API}/{path}?{urlencode(params)}"
+            while len(self.failures) < MAX_FAILURES:
+                time.sleep(REQUEST_DELAY)
+                try:
+                    result = _http_json(url, 30)
+                    batch = result["data"]
+                    cursor = result["pagination"]["next_cursor"]
+                    if not isinstance(batch, list) or any(not isinstance(row, dict) for row in batch):
+                        raise ValueError("Expected a list of public data rows")
+                    break
+                except Exception as exc:
+                    self.failures.append(f"{path}: {exc}")
+            else:
+                raise RuntimeError("; ".join(self.failures))
+            rows.extend(batch)
+            page += 1
+            if cursor is None or (max_rows is not None and len(rows) >= max_rows):
+                break
+            params["cursor"] = cursor
+        return rows if max_rows is None else rows[:max_rows]
 
 
 def fetch_leaderboard(top, period):
-    # The v2 leaderboard pages by cursor only (no offset), so ask for everything in one request.
-    rows = PublicReader().get("v2/leaderboard", timePeriod=period, orderBy="PNL", limit=top)
+    rows = PublicReader().get("v2/leaderboard", max_pages=None, max_rows=top,
+                              time_period=period.lower(), sort_by="PNL", limit=min(top, 1000))
     return [{"address": row["user_id"], "user_name": row.get("user_name", ""),
              "rank": int(row["rank"]), "leaderboard_pnl": float(row["pnl"]),
              "leaderboard_volume": float(row["volume"])} for row in rows[:top]]
 
 
 def fetch_closed_positions(reader, address, max_pages):
-    rows = []
-    for page in range(min(max_pages, MAX_CLOSED_ROWS // PAGE_SIZE)):
-        batch = reader.get("closed-positions", user=address, limit=PAGE_SIZE,
-                           offset=page * PAGE_SIZE, sortBy="TIMESTAMP", sortDirection="DESC")
-        if not batch:
-            break
-        rows.extend(batch)
-    return rows
+    rows = reader.get("v2/positions", max_pages=min(max_pages, MAX_CLOSED_ROWS // PAGE_SIZE),
+                      user=address, status="CLOSED", limit=PAGE_SIZE,
+                      sort_by="TIMESTAMP", sort_direction="DESC")
+    return [{"avgPrice": row["avg_price"], "totalBought": row["total_size"],
+             "realizedPnl": row["realized_pnl"], "timestamp": row["last_event_at"],
+             "title": row["title"]} for row in rows]
 
 
 def divide(value, total):
@@ -253,7 +268,7 @@ def run_scout(database, report, top=50, period="MONTH", max_pages=40):
             reader = PublicReader()
             try:
                 closed = fetch_closed_positions(reader, account["address"], max_pages)
-                activity = reader.get("activity", user=account["address"], limit=500)
+                activity = reader.get("v2/activity", max_pages=None, user=account["address"], limit=500)
                 profile = profile_account(account, closed, activity)
             except Exception as exc:
                 reason = "; ".join(reader.failures) if reader.failures else str(exc)
