@@ -253,6 +253,35 @@ def test_group_sums_and_total_row(tmp_path):
     assert total.open_count == 2
 
 
+def test_report_includes_both_trend_books_with_separate_pnl(tmp_path):
+    with connect(tmp_path / "trend_books.db") as conn:
+        setup_test_database(conn)
+        conn.execute(
+            "INSERT INTO paper_portfolio_state VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("trend_vote", "BTC-USD", 1000.0, 1125.0, 0.0, None, NOW.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO paper_equity_curve "
+            "(predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("trend_vote", "BTC-USD", 1125.0, 0.0, 100.0, 0.0, 1125.0, NOW.isoformat()),
+        )
+        groups = collect_all_groups(conn)
+        by_name = {group.name: group for group in groups}
+        assert by_name["trend40"].pnl == -50.0
+        assert by_name["trend_vote"].starting_cash == 1000.0
+        assert by_name["trend_vote"].value == 1125.0
+        assert by_name["trend_vote"].pnl == 125.0
+        assert by_name["TOTAL"].pnl == 195.0
+        report = format_report(conn, groups=groups, recorded_at=NOW.isoformat(), current_time=NOW)
+        rows = [line for line in report.splitlines() if line.startswith("| trend")]
+        assert len(rows) == 2
+        assert rows[0].startswith("| trend40 |")
+        assert rows[1].startswith("| trend_vote |")
+        assert "$450.00" in rows[0] and "-$50.00" in rows[0]
+        assert "$1,125.00" in rows[1] and "+$125.00" in rows[1]
+
+
 def test_percent_return_uses_only_groups_with_starting_cash(tmp_path):
     db_path = tmp_path / "test_ret_pct.db"
     with connect(db_path) as conn:

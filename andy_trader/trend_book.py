@@ -1,4 +1,4 @@
-"""The trend40 book: a slow, once-a-day, paper-only trend-following rule.
+"""Slow, once-a-day, paper-only trend-following books.
 
 Every other book in this project trades the AI's direction calls many times
 a day. Measured on the ledger, those calls have no edge over the next 15 to
@@ -7,6 +7,10 @@ slippage per leg), so the churn loses money. An offline test on 18 months of
 daily Bybit candles found that a 40-day momentum rule at 1x was net positive
 after the same costs in both halves of the data, with very low turnover.
 This book trades that rule forward, on paper, to see if it holds up live.
+
+`trend_vote` runs alongside trend40, voting on the signs of 20-, 40- and
+60-day close changes. It needs 61 completed daily closes and is a forward
+paper test, not a replacement for trend40.
 
 It reuses `andy_trader.portfolio` exactly as the probe books do: same
 `get_or_create_state`, same `execute_paper_trade`, same `mark_to_market`, same
@@ -78,6 +82,17 @@ def _target_side(closes: list[float]) -> tuple[str, float] | None:
     return ("long" if latest > earlier else "short"), change
 
 
+def _vote_target_side(closes: list[float]) -> tuple[str, int] | None:
+    if len(closes) < 61:
+        return None
+    latest = closes[-1]
+    votes = sum(
+        (latest > closes[-1 - days]) - (latest < closes[-1 - days])
+        for days in (20, 40, 60)
+    )
+    return ("long" if votes > 0 else "short"), votes
+
+
 def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> None:
     initialize_trend_book(connection)
     moment = now or datetime.now(UTC)
@@ -100,41 +115,47 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
             continue
         price = float(price_row["close"])
 
-        state = get_or_create_state(connection, predictor=TREND_BOOK, instrument=instrument,
-                                     starting_cash=STARTING_CASH, leverage=LEVERAGE, now_iso=moment_iso)
-        decision = check_and_enforce(connection, predictor=TREND_BOOK, instrument=instrument,
-                                      starting_cash=state.starting_cash, now_iso=moment_iso,
-                                      current_equity=max(0.0, state.cash + state.position_qty * price))
-        if not decision.allowed:
-            if state.position_qty:
-                execute_paper_trade(connection, predictor=TREND_BOOK, instrument=instrument,
-                                     target_side="flat", price=price, now_iso=moment_iso,
-                                     reason=f"trend40 RISK INTERLOCK forced exit: {decision.reason}")
-        elif not claimed_today:
-            evaluated = True
-            closes = _completed_daily_closes(connection, instrument, today=today)
-            target = _target_side(closes)
-            if target is not None:
-                side, change = target
-                current_side = ("long" if state.position_qty > 0
-                                 else "short" if state.position_qty < 0 else "flat")
-                if side != current_side:
-                    if current_side != "flat":
-                        # A position can't jump straight from long to short or
-                        # back; execute_paper_trade requires passing through flat.
-                        execute_paper_trade(
-                            connection, predictor=TREND_BOOK, instrument=instrument,
-                            target_side="flat", price=price, now_iso=moment_iso,
-                            reason=f"trend40: {LOOKBACK_DAYS}d return {change * 100:+.1f}% -> {side}",
+        for book, target_side in ((TREND_BOOK, _target_side), ("trend_vote", _vote_target_side)):
+            state = get_or_create_state(connection, predictor=book, instrument=instrument,
+                                         starting_cash=STARTING_CASH, leverage=LEVERAGE, now_iso=moment_iso)
+            decision = check_and_enforce(connection, predictor=book, instrument=instrument,
+                                          starting_cash=state.starting_cash, now_iso=moment_iso,
+                                          current_equity=max(0.0, state.cash + state.position_qty * price))
+            if not decision.allowed:
+                if state.position_qty:
+                    execute_paper_trade(connection, predictor=book, instrument=instrument,
+                                         target_side="flat", price=price, now_iso=moment_iso,
+                                         reason=f"{book} RISK INTERLOCK forced exit: {decision.reason}")
+            elif not claimed_today:
+                evaluated = True
+                closes = _completed_daily_closes(connection, instrument, today=today)
+                target = target_side(closes)
+                if target is not None:
+                    side, change = target
+                    current_side = ("long" if state.position_qty > 0
+                                     else "short" if state.position_qty < 0 else "flat")
+                    if side != current_side:
+                        reason = (
+                            f"{book}: {LOOKBACK_DAYS}d return {change * 100:+.1f}% -> {side}"
+                            if book == TREND_BOOK
+                            else f"{book}: 20/40/60d vote {change:+.0f} -> {side}"
                         )
-                    execute_paper_trade(
-                        connection, predictor=TREND_BOOK, instrument=instrument,
-                        target_side=side, price=price, now_iso=moment_iso,
-                        reason=f"trend40: {LOOKBACK_DAYS}d return {change * 100:+.1f}% -> {side}",
-                    )
+                        if current_side != "flat":
+                            # A position can't jump straight from long to short or
+                            # back; execute_paper_trade requires passing through flat.
+                            execute_paper_trade(
+                                connection, predictor=book, instrument=instrument,
+                                target_side="flat", price=price, now_iso=moment_iso,
+                                reason=reason,
+                            )
+                        execute_paper_trade(
+                            connection, predictor=book, instrument=instrument,
+                            target_side=side, price=price, now_iso=moment_iso,
+                            reason=reason,
+                        )
 
-        mark_to_market(connection, predictor=TREND_BOOK, instrument=instrument, price=price,
-                        now_iso=moment_iso, starting_cash=STARTING_CASH)
+            mark_to_market(connection, predictor=book, instrument=instrument, price=price,
+                            now_iso=moment_iso, starting_cash=STARTING_CASH)
 
     if evaluated and not claimed_today:
         connection.execute(

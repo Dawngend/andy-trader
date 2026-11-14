@@ -1,4 +1,4 @@
-"""Total Paper P&L Report Across All Books."""
+"""Total Paper P&L Report Across All Books, including trend40 and trend_vote."""
 from __future__ import annotations
 
 from dataclasses import dataclass
