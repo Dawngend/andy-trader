@@ -113,6 +113,18 @@ def test_reader_keeps_single_page_for_existing_consumers(no_network):
     assert no_network.call_count == 1
 
 
+@pytest.mark.parametrize("cursors", [("next", "next"), ("first", "second", "first")])
+def test_reader_stops_when_cursor_repeats(no_network, cursors):
+    no_network.side_effect = [
+        page([dict(V2_ACTIVITY, timestamp=index)], cursor, limit=500)
+        for index, cursor in enumerate(cursors)
+    ]
+    activity = scout.PublicReader().get("v2/activity", max_pages=None,
+                                      user=ACCOUNT["address"], limit=500)
+    assert [row["timestamp"] for row in activity] == list(range(len(cursors)))
+    assert no_network.call_count == len(cursors)
+
+
 def test_profile_numbers():
     closed = [position(.2, 8, 0, title="Will X hit 10?"),
               position(.5, -5, 10, title="X vs. Y"),
@@ -235,6 +247,8 @@ def test_closed_cursor_paging_and_page_cap(no_network, pages, batches, cursors, 
     no_network.side_effect = [page(rows, cursor) for rows, cursor in zip(batches, cursors)]
     assert scout.fetch_closed_positions(scout.PublicReader(), ACCOUNT["address"], pages) == expected
     assert no_network.call_count == len(batches)
+    assert scout.time.sleep.call_count == len(batches)
+    scout.time.sleep.assert_called_with(scout.REQUEST_DELAY)
     for index, call in enumerate(no_network.call_args_list):
         url = urlparse(call.args[0])
         assert url.path == "/v2/positions"
@@ -245,7 +259,7 @@ def test_closed_cursor_paging_and_page_cap(no_network, pages, batches, cursors, 
 
 
 def test_closed_row_cap(no_network):
-    no_network.side_effect = [page([V2_POSITION] * 50, "more")] * 200
+    no_network.side_effect = [page([V2_POSITION] * 50, str(index)) for index in range(200)]
     rows = scout.fetch_closed_positions(scout.PublicReader(), ACCOUNT["address"], 300)
     assert len(rows) == 10_000
     assert no_network.call_count == 200
@@ -273,7 +287,7 @@ def test_run_continues_report_and_append_only(tmp_path, no_network):
             raise OSError("account unavailable")
         if "/v2/positions?" in url:
             return page([V2_POSITION])
-        return page([V2_ACTIVITY, dict(V2_ACTIVITY, timestamp=3600)], limit=500)
+        return page([V2_ACTIVITY, dict(V2_ACTIVITY, timestamp=3600)], "older-activity", limit=500)
     no_network.side_effect = response
     database, report = tmp_path / "scout.db", tmp_path / "research" / "report.md"
     first = scout.run_scout(database, report, top=2)
@@ -288,6 +302,7 @@ def test_run_continues_report_and_append_only(tmp_path, no_network):
         assert connection.execute("SELECT * FROM wallet_profiles WHERE run_id=?", (first,)).fetchall() == before
         assert connection.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM wallet_scout_failures").fetchone()[0] == 2
+        assert connection.execute("SELECT activity_count, buy_count, buys_per_hour FROM wallet_profiles LIMIT 1").fetchone() == (2, 2, 2)
         bands, flags = connection.execute("SELECT price_bands, flags FROM wallet_profiles LIMIT 1").fetchone()
         assert json.loads(bands)["0.50_to_0.80"]["count"] == 1
         assert "thin_sample" in json.loads(flags)
@@ -295,6 +310,9 @@ def test_run_continues_report_and_append_only(tmp_path, no_network):
     assert "1970-01-01" in text
     assert ACCOUNT["address"] not in text
     assert "Alice (0xaaaaaa...aaaa)" in text
+    assert "| User Name | Label | Flags | Sample Size |" in text
+    assert "lifetime pnl can be much larger" in text
+    assert "Sample windows (UTC)" in text
 
 
 def test_report_rank_order_and_escaping(tmp_path):

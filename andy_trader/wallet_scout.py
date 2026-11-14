@@ -1,8 +1,8 @@
 """Read-only public Polymarket account profiles.
 
-Scout reads use Data API v2 cursor pages. Closed-position fields are translated
-at the fetch boundary; lifetime bought shares, not current holdings or remaining
-entry cost, preserve the profile's historical cost calculation.
+Scout reads use Data API v2 cursor pages, with activity limited to the latest
+500 rows. Closed-position total_size supplies totalBought, not remaining entry
+cost; last_event_at approximates the v1 timestamp.
 """
 
 from datetime import UTC, datetime
@@ -49,9 +49,10 @@ class PublicReader:
         self.failures = []
 
     def get(self, path, max_pages=1, max_rows=None, **params):
-        """Read v2 pages; default to one page for recent-activity consumers."""
+        """Read cursor pages, including empty ones; default to one activity page."""
         rows = []
         page = 0
+        cursors = set()
         while max_pages is None or page < max_pages:
             url = f"{API}/{path}?{urlencode(params)}"
             while len(self.failures) < MAX_FAILURES:
@@ -69,8 +70,9 @@ class PublicReader:
                 raise RuntimeError("; ".join(self.failures))
             rows.extend(batch)
             page += 1
-            if cursor is None or (max_rows is not None and len(rows) >= max_rows):
+            if cursor is None or cursor in cursors or (max_rows is not None and len(rows) >= max_rows):
                 break
+            cursors.add(cursor)
             params["cursor"] = cursor
         return rows if max_rows is None else rows[:max_rows]
 
@@ -80,7 +82,7 @@ def fetch_leaderboard(top, period):
                               time_period=period.lower(), sort_by="PNL", limit=min(top, 1000))
     return [{"address": row["user_id"], "user_name": row.get("user_name", ""),
              "rank": int(row["rank"]), "leaderboard_pnl": float(row["pnl"]),
-             "leaderboard_volume": float(row["volume"])} for row in rows[:top]]
+             "leaderboard_volume": float(row["volume"])} for row in rows]
 
 
 def fetch_closed_positions(reader, address, max_pages):
@@ -268,7 +270,7 @@ def run_scout(database, report, top=50, period="MONTH", max_pages=40):
             reader = PublicReader()
             try:
                 closed = fetch_closed_positions(reader, account["address"], max_pages)
-                activity = reader.get("v2/activity", max_pages=None, user=account["address"], limit=500)
+                activity = reader.get("v2/activity", user=account["address"], limit=500)
                 profile = profile_account(account, closed, activity)
             except Exception as exc:
                 reason = "; ".join(reader.failures) if reader.failures else str(exc)
