@@ -219,7 +219,7 @@ def copy_wallet_trades(
             new_trades.append((key, row))
     new_trades.sort(key=lambda item: int(item[1]["timestamp"]))
 
-    # Copied or skipped trades (including paused wallets) are marked seen, except stale ones.
+    # Copied or skipped trades (including stale ones and paused wallets) are marked seen.
     # A failed order book read is not marked, so it is tried again on the next pass.
     for (tx_hash, token_id), trade in new_trades:
         if (tx_hash, token_id) in seen:
@@ -227,6 +227,7 @@ def copy_wallet_trades(
         seen.add((tx_hash, token_id))
         if pass_timestamp - int(trade["timestamp"]) > MAX_DELAY_SECONDS:
             record_skip(connection, now or _utc_now(), wallet_name, "stale")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
         if wallet_name in PAUSED_WALLETS:
             mark_seen(connection, wallet_name, tx_hash, token_id)

@@ -165,7 +165,7 @@ def test_trade_freshness_limit(db, network, delay, monkeypatch):
     if delay > copy.MAX_DELAY_SECONDS:
         assert positions(db) == []
         assert skips == {"stale": 1}
-        assert seen == set()
+        assert seen == {("tx_delay", "tok_delay")}
         assert copy.BOOK_READS == 0
     else:
         row, = positions(db)
@@ -173,6 +173,25 @@ def test_trade_freshness_limit(db, network, delay, monkeypatch):
         assert row["delay_seconds"] == delay
         assert skips == {}
         assert seen == {("tx_delay", "tok_delay")}
+
+
+def test_stale_trade_counted_once_across_passes(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    with db:
+        db.execute(
+            "INSERT INTO copy_book_cursor (wallet_name, newest_timestamp) VALUES (?, ?)",
+            ("sharky6999", int(NOW.timestamp()) - 10_000),
+        )
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_stale", asset="tok_stale", ts=int(NOW.timestamp()) - 40 * 60),
+    ]
+
+    copy.run_once(db, now=NOW)
+    copy.run_once(db, now=NOW)
+
+    skips = dict(db.execute("SELECT reason, count FROM copy_book_skips WHERE wallet_name='sharky6999'"))
+    assert skips == {"stale": 1}
+    assert positions(db) == []
 
 
 def test_fill_rules_fee_and_delay(db, network, monkeypatch):
