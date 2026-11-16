@@ -1,0 +1,5 @@
+{
+  "promote_min_settled": 100,
+  "demote_min_settled": 50,
+  "demote_window_days": 30
+}
