@@ -37,9 +37,12 @@ SHARES = 100
 MIN_FILL = 0.05
 MAX_FILL = 0.98
 MAX_OPEN = 60
-MAX_DELAY_SECONDS = 600  # Do not copy stale trades at current order book prices.
+POLL_SECONDS = 1800  # The copy book runs every 30 minutes.
+# Do not copy stale trades at current order book prices.
+# One poll interval plus slack, so a trade made just after a pass is still fresh on the next.
+MAX_DELAY_SECONDS = POLL_SECONDS + 300
 VERDICT_THRESHOLD = 100
-SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open")
+SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale")
 WALLET_HEADER = SLICE_HEADER.replace("Slice |", "Wallet |", 1)
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
@@ -211,19 +214,21 @@ def copy_wallet_trades(
             continue
         if int(row.get("timestamp") or 0) <= starting_timestamp:
             continue
-        if pass_timestamp - int(row["timestamp"]) > MAX_DELAY_SECONDS:
-            continue
         key = (str(row.get("transaction_hash", "")), str(row.get("token_id", "")))
         if all(key) and key not in seen:
             new_trades.append((key, row))
     new_trades.sort(key=lambda item: int(item[1]["timestamp"]))
 
-    # Copied or skipped trades (including paused wallets) are marked seen.
+    # Copied or skipped trades (including paused wallets) are marked seen, except stale ones.
     # A failed order book read is not marked, so it is tried again on the next pass.
     for (tx_hash, token_id), trade in new_trades:
         if (tx_hash, token_id) in seen:
             continue
         seen.add((tx_hash, token_id))
+        if pass_timestamp - int(trade["timestamp"]) > MAX_DELAY_SECONDS:
+            if wallet_name not in PAUSED_WALLETS:
+                record_skip(connection, now or _utc_now(), wallet_name, "stale")
+            continue
         if wallet_name in PAUSED_WALLETS:
             mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
