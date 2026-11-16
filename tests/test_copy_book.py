@@ -145,7 +145,7 @@ def test_parsing_activity_and_no_duplicates(db, network, monkeypatch):
     assert len(rows2) == 1
 
 
-@pytest.mark.parametrize("delay", [599, 600, 601])
+@pytest.mark.parametrize("delay", [25 * 60, 40 * 60])
 def test_trade_freshness_limit(db, network, delay, monkeypatch):
     monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
     with db:
@@ -160,16 +160,18 @@ def test_trade_freshness_limit(db, network, delay, monkeypatch):
     errors = copy.run_once(db, now=NOW)
 
     assert errors == []
-    assert db.execute("SELECT * FROM copy_book_skips").fetchall() == []
+    skips = dict(db.execute("SELECT reason, count FROM copy_book_skips WHERE wallet_name='sharky6999'"))
     seen = {tuple(row) for row in db.execute("SELECT tx_hash, token_id FROM copy_book_seen")}
-    if delay > 600:
+    if delay > copy.MAX_DELAY_SECONDS:
         assert positions(db) == []
+        assert skips == {"stale": 1}
         assert seen == set()
         assert copy.BOOK_READS == 0
     else:
         row, = positions(db)
         assert row["tx_hash"] == "tx_delay"
         assert row["delay_seconds"] == delay
+        assert skips == {}
         assert seen == {("tx_delay", "tok_delay")}
 
 
@@ -422,6 +424,7 @@ def test_format_report(db):
             NOW.isoformat(), 0, -90.63,
         ))
         copy.record_skip(db, NOW, "sharky6999", "thin_book")
+        copy.record_skip(db, NOW, "sharky6999", "stale")
 
     rep = copy.format_report(db)
     assert "Copy Book (paper only)" in rep
@@ -431,6 +434,7 @@ def test_format_report(db):
     assert "Open positions: 0" in rep
     assert "Settled positions: 2" in rep
     assert "thin_book: 1" in rep
+    assert "stale: 1" in rep
     assert "Worst loss: $-90.63" in rep
     assert "Worst loss: $0.00" not in rep
     assert "Worst loss: n/a" in rep
