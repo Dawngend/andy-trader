@@ -88,6 +88,7 @@ def positions(db):
 
 def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
     assert copy.WALLETS["lpgb"] == "0x1f5f9fa318fbda8350ac143b4df657287df850fa"
+    assert copy.WALLETS["bigggggggg"] == "0x511f9c771449162349795d17becf8b37031acbe1"
     network["activity"][copy.WALLETS["sharky6999"]] = [
         make_trade(tx="tx1", ts=1000),
         make_trade(tx="tx2", ts=900),
@@ -99,13 +100,16 @@ def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
         make_trade(tx="tx4", ts=1100),
         make_trade(tx="tx5", ts=1200),
     ]
+    network["activity"][copy.WALLETS["bigggggggg"]] = [
+        make_trade(tx="tx6", ts=1300),
+    ]
 
     errors = copy.run_once(db, now=NOW)
     assert errors == []
     assert positions(db) == []
 
     cursors = dict(db.execute("SELECT wallet_name, newest_timestamp FROM copy_book_cursor"))
-    assert cursors == {"sharky6999": 1000, "dromedaryy": 800, "lpgb": 1200}
+    assert cursors == {"sharky6999": 1000, "dromedaryy": 800, "lpgb": 1200, "bigggggggg": 1300}
 
 
 def test_parsing_activity_and_no_duplicates(db, network, monkeypatch):
@@ -422,7 +426,7 @@ def test_format_report(db):
     rep = copy.format_report(db)
     assert "Copy Book (paper only)" in rep
     assert {line for line in rep.splitlines() if line.startswith("Wallet: ")} == {
-        "Wallet: sharky6999", "Wallet: dromedaryy", "Wallet: lpgb",
+        "Wallet: sharky6999", "Wallet: dromedaryy", "Wallet: lpgb", "Wallet: bigggggggg",
     }
     assert "Open positions: 0" in rep
     assert "Settled positions: 2" in rep
