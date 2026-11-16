@@ -224,6 +224,42 @@ def test_label_thresholds_and_first_match(changes, label):
     assert scout.strategy_label(profile) == label
 
 
+@pytest.fixture
+def candidate_profile():
+    closed = [position(.6, 2 if index % 25 < 12 else -1, index) for index in range(200)]
+    return scout.profile_account(ACCOUNT, closed, [])
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({}, True),
+    ({"label": "market_maker"}, False),
+    ({"label": "bond"}, False),
+    ({"flags": ["bot_like"]}, False),
+    ({"flags": ["inventory_heavy"]}, False),
+    ({"flags": ["thin_sample"]}, False),
+    ({"flags": ["one_sided_period"]}, False),
+    ({"return_on_cost": -.01}, False),
+    ({"return_on_cost": 0}, False),
+    ({"return_on_cost": None}, False),
+    ({"loss_to_win_ratio": None}, False),
+    ({"loss_to_win_ratio": 1}, False),
+    ({"loss_to_win_ratio": 1.1}, False),
+    ({"win_rate": .349}, False),
+    ({"win_rate": .35}, True),
+    ({"win_rate": .65}, True),
+    ({"win_rate": .651}, False),
+    ({"win_rate": None}, False),
+])
+def test_copy_candidate_filters(candidate_profile, changes, expected):
+    candidate_profile.update(changes)
+    assert scout.copy_candidates([candidate_profile]) == ([candidate_profile] if expected else [])
+
+
+def test_copy_candidates_rank_order(candidate_profile):
+    later = dict(candidate_profile, user_name="Bob", rank=2)
+    assert scout.copy_candidates([later, candidate_profile]) == [candidate_profile, later]
+
+
 def test_empty_and_zero_duration_samples():
     empty = scout.profile_account(ACCOUNT, [], [])
     for field in ("win_rate", "return_on_cost", "loss_to_win_ratio", "buys_per_hour", "first_timestamp", "median_position_size"):
@@ -324,6 +360,25 @@ def test_report_rank_order_and_escaping(tmp_path):
     assert text.index("Alice") < text.index("Bob")
     assert "&#124;&lt;x&gt;" in text
     assert ACCOUNT["address"] not in text
+
+
+def test_report_copy_candidates(tmp_path, candidate_profile):
+    rejected = scout.profile_account(dict(ACCOUNT, user_name="Rejected"), [], [])
+    report = tmp_path / "report.md"
+    scout.write_report(report, [rejected, candidate_profile], "run", "now", "MONTH", 0)
+    text = report.read_text(encoding="utf-8")
+    section = text.split("## Copy Candidates\n\n")[1].split("\n\n")[0]
+    assert section == (
+        "- Alice (0xaaaaaa...aaaa): win rate 48.0%, return on cost 7.3%, "
+        "loss to win ratio 0.50, sample size 200.")
+    assert text.index("| Rejected") < text.index("## Copy Candidates") < text.index("How to read this:")
+
+
+@pytest.mark.parametrize("profiles", [[], [scout.profile_account(ACCOUNT, [], [])]])
+def test_report_no_copy_candidates(tmp_path, profiles):
+    report = tmp_path / "report.md"
+    scout.write_report(report, profiles, "run", "now", "MONTH", 0)
+    assert "## Copy Candidates\n\nNone passed the filters.\n" in report.read_text(encoding="utf-8")
 
 
 def test_recovered_failure_is_recorded(tmp_path, no_network):

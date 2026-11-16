@@ -42,6 +42,12 @@ HIGH_ENTRY = .80
 LONGSHOT_ENTRY = .30
 STRATEGY_SHARE = .40
 RECENT_HIGH_ENTRY = .95
+CANDIDATE_MIN_WIN_RATE = .35
+CANDIDATE_MAX_WIN_RATE = .65
+CANDIDATE_MIN_RETURN_ON_COST = 0
+CANDIDATE_MAX_LOSS_TO_WIN_RATIO = 1
+CANDIDATE_EXCLUDED_LABELS = ("market_maker", "bond")
+CANDIDATE_EXCLUDED_FLAGS = ("bot_like", "inventory_heavy", "thin_sample", "one_sided_period")
 
 
 class PublicReader:
@@ -193,6 +199,22 @@ def profile_flags(profile):
     return [name for name, enabled in rules.items() if enabled]
 
 
+def copy_candidates(profiles):
+    """Select human-paced, profitable profiles with balanced wins and smaller losses."""
+    candidates = [
+        profile for profile in profiles
+        if profile["label"] not in CANDIDATE_EXCLUDED_LABELS
+        and not any(flag in profile["flags"] for flag in CANDIDATE_EXCLUDED_FLAGS)
+        and profile["return_on_cost"] is not None
+        and profile["return_on_cost"] > CANDIDATE_MIN_RETURN_ON_COST
+        and profile["loss_to_win_ratio"] is not None
+        and profile["loss_to_win_ratio"] < CANDIDATE_MAX_LOSS_TO_WIN_RATIO
+        and profile["win_rate"] is not None
+        and CANDIDATE_MIN_WIN_RATE <= profile["win_rate"] <= CANDIDATE_MAX_WIN_RATE
+    ]
+    return sorted(candidates, key=lambda row: row["rank"])
+
+
 def create_tables(connection):
     connection.execute("""CREATE TABLE IF NOT EXISTS wallet_profiles (
         run_id TEXT, run_time TEXT, period TEXT, address TEXT, user_name TEXT, rank INTEGER,
@@ -245,6 +267,15 @@ def write_report(path, profiles, run_id, run_time, period, failure_count):
         cells += [display_number(profile[key], key in ("win_rate", "return_on_cost")) for key in
                   ("win_rate", "return_on_cost", "loss_to_win_ratio", "worst_loss", "first_half_pnl", "second_half_pnl")]
         lines.append("| " + " | ".join(cells) + " |")
+    lines += ["", "## Copy Candidates", ""]
+    candidates = copy_candidates(profiles)
+    for profile in candidates:
+        lines.append(f"- {public_name(profile)}: win rate {display_number(profile['win_rate'], True)}, "
+                     f"return on cost {display_number(profile['return_on_cost'], True)}, "
+                     f"loss to win ratio {display_number(profile['loss_to_win_ratio'])}, "
+                     f"sample size {profile['sample_size']}.")
+    if not candidates:
+        lines.append("None passed the filters.")
     lines += ["", "How to read this: compare returns with loss size and the flags. Loss to win ratio is how many average wins one average loss wipes out. N/A means the sample cannot define the number. Labels are rule-based descriptions, not recommendations.", "",
               "Sample-window caveat: closed positions are only the latest rows, so lifetime pnl can be much larger than the sample's. The leaderboard period does not filter these rows. Halves divide elapsed sample time at its midpoint; ties go in the second half. Activity is the latest 500 rows, with its own window.", "",
               f"Accounts with recorded failures: {failure_count}. Exhausted or invalid accounts are omitted; see wallet_scout_failures.", "", "Sample windows (UTC):"]
