@@ -62,3 +62,14 @@ desktop.ini
 .trade-watch-state.json
 .trade-watch.jsonl
 .local-test-temp/
+
+# Per-book run logs and regenerated reports. They change every run, so left
+# untracked they made `andy run` stop for Dawn instead of auto merging.
+.*-book.jsonl
+.tmp_pytest*/
+research/loss_review.md
+research/pm_ai_gate.md
+research/strategy_manager.md
+research/total_pnl.md
+research/wallet_scout_report.md
+research/watch_alert.md
