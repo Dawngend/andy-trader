@@ -226,8 +226,7 @@ def copy_wallet_trades(
             continue
         seen.add((tx_hash, token_id))
         if pass_timestamp - int(trade["timestamp"]) > MAX_DELAY_SECONDS:
-            if wallet_name not in PAUSED_WALLETS:
-                record_skip(connection, now or _utc_now(), wallet_name, "stale")
+            record_skip(connection, now or _utc_now(), wallet_name, "stale")
             continue
         if wallet_name in PAUSED_WALLETS:
             mark_seen(connection, wallet_name, tx_hash, token_id)
