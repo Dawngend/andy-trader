@@ -309,12 +309,13 @@ def evaluate_strategy(
     lifetime_low, lifetime_high = (
         compute_bootstrap_interval(lifetime_pnls) if lifetime_count > 0 else (0.0, 0.0)
     )
+    meets_promote_rule = lifetime_count >= promote_min_settled and lifetime_low > 0
 
     one_day_ago = now - timedelta(hours=24)
 
     # First appearance: seen for the first time
     if existing is None:
-        if lifetime_count >= promote_min_settled and lifetime_low > 0:
+        if meets_promote_rule:
             return StrategyDecision(
                 strategy_key=key,
                 current_status=None,
@@ -354,7 +355,7 @@ def evaluate_strategy(
 
     # Candidate: promotion is never blocked by the 24-hour rule
     if current_status == "candidate":
-        if lifetime_count >= promote_min_settled and lifetime_low > 0:
+        if meets_promote_rule:
             return StrategyDecision(
                 strategy_key=key,
                 current_status="candidate",
@@ -424,6 +425,24 @@ def evaluate_strategy(
                     ),
                     is_change=True,
                 )
+
+        # Revalidation: a promotion is taken back when its evidence fails the promote rule
+        if not meets_promote_rule:
+            return StrategyDecision(
+                strategy_key=key,
+                current_status="live",
+                new_status="candidate",
+                action="demote",
+                settled=lifetime_count,
+                avg_pnl=lifetime_avg if lifetime_count > 0 else None,
+                interval_low=lifetime_low if lifetime_count > 0 else None,
+                interval_high=lifetime_high if lifetime_count > 0 else None,
+                reason=(
+                    f"Evidence no longer meets the promotion rule: {count_text(positions)}, "
+                    f"95% bootstrap CI [${lifetime_low:+.4f}, ${lifetime_high:+.4f}]"
+                ),
+                is_change=True,
+            )
 
         return StrategyDecision(
             strategy_key=key,

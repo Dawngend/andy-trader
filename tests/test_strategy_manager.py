@@ -19,6 +19,7 @@ from andy_trader.strategy_manager import (
     DEFAULT_CONFIG,
     DEFAULT_TIMEOUT,
     evaluate_strategy,
+    initialize_manager_tables,
     load_config,
     parse_timestamp,
     read_positions,
@@ -880,3 +881,66 @@ def test_strategy_without_condition_id_still_counts_positions(tmp_path: Path):
     d = decisions[0]
     assert d.settled == 3
     assert "3 settled positions" in d.reason
+
+
+def mark_wallet_live(conn: sqlite3.Connection) -> None:
+    """Store wallet_alpha as live since T0, as an earlier pass would have."""
+    initialize_manager_tables(conn)
+    conn.execute(
+        "INSERT INTO live_strategy_list (strategy_key, status, since, reason) "
+        "VALUES ('copy:wallet_alpha', 'live', ?, 'Promoted: 100 settled positions')",
+        (T0.isoformat(),),
+    )
+
+
+def test_live_wallet_with_100_positions_on_13_events_moves_to_candidate(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_copy_table(conn)
+    for i in range(100):
+        insert_copy_position(conn, i, f"c{i % 13}", 10.0)
+    mark_wallet_live(conn)
+    conn.close()
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0 + timedelta(days=2))
+    d = decisions[0]
+    assert d.current_status == "live"
+    assert d.new_status == "candidate"
+    assert d.action == "demote"
+    assert d.reason.startswith(
+        "Evidence no longer meets the promotion rule: 13 events (100 positions), 95% bootstrap CI ["
+    )
+
+
+def test_live_wallet_with_100_events_and_positive_lower_bound_stays_live(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_copy_table(conn)
+    for i in range(100):
+        insert_copy_position(conn, i, f"c{i}", 10.0)
+    mark_wallet_live(conn)
+    conn.close()
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0 + timedelta(days=2))
+    d = decisions[0]
+    assert d.settled == 100
+    assert d.interval_low > 0
+    assert d.new_status == "live"
+    assert not d.is_change
+
+
+def test_move_to_candidate_writes_one_journal_row_and_second_run_writes_none(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_copy_table(conn)
+    for i in range(100):
+        insert_copy_position(conn, i, f"c{i % 13}", 10.0)
+    mark_wallet_live(conn)
+
+    run_strategy_manager_pass(db_path, now=T0 + timedelta(days=2))
+    rows = conn.execute("SELECT strategy_key, action FROM strategy_journal").fetchall()
+    assert rows == [("copy:wallet_alpha", "demote")]
+
+    run_strategy_manager_pass(db_path, now=T0 + timedelta(days=2, hours=1))
+    assert conn.execute("SELECT COUNT(*) FROM strategy_journal").fetchone()[0] == 1
+    conn.close()
