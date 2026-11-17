@@ -269,6 +269,13 @@ python -m andy_trader.backtest --instrument BTC-USD --horizon 1h
 python -m andy_trader.backtest --instrument BTC-USD --horizon 1h --include-model
 ```
 
+The notebook `research/pytorch_mlp_evaluation.ipynb` walks through the PyTorch part step by step.
+I build and train a small MLP with PyTorch, temperature scale it on a chronological calibration
+slice, and judge it by Brier skill on 362 later test bars. Its Brier score was 0.2505 against 0.2472
+for the base rate, a skill of -0.0132. It was right 51.1% of the time, while always calling down
+would have been right 55.2% of the time. This agrees with the 120 window walk-forward result above:
+no PyTorch model here has beaten the base rate.
+
 ## Signal predictor result
 
 Signal predictors use a rolling percentile over their own instrument and abstain
