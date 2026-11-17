@@ -47,6 +47,9 @@ SOURCES = (
     ("copy_book_positions", lambda r: f"copy:{r['wallet_name']}" if r.get("wallet_name") else None),
 )
 
+# (settled_dt, pnl, condition_id). condition_id is None when the source has no such column.
+Position = tuple[datetime, float, str | None]
+
 
 @dataclass(frozen=True)
 class StrategyDecision:
@@ -129,15 +132,15 @@ def parse_timestamp(val: object) -> datetime | None:
 
 def read_positions(
     connection: sqlite3.Connection,
-) -> tuple[dict[str, list[tuple[datetime, float]]], set[str], int]:
+) -> tuple[dict[str, list[Position]], set[str], int]:
     """Read positions from all book sources.
 
     Returns:
-      - positions_by_strategy: mapping strategy_key -> list of (settled_dt, pnl)
+      - positions_by_strategy: mapping strategy_key -> list of (settled_dt, pnl, condition_id)
       - discovered_keys: set of strategy keys with at least one position (open or settled)
       - ignored_count: count of settled positions with unparseable/empty settled_at or invalid/null pnl
     """
-    positions_by_strategy: dict[str, list[tuple[datetime, float]]] = {}
+    positions_by_strategy: dict[str, list[Position]] = {}
     discovered_keys: set[str] = set()
     ignored_count = 0
 
@@ -173,9 +176,32 @@ def read_positions(
             except (ValueError, TypeError):
                 ignored_count += 1
                 continue
-            positions_by_strategy.setdefault(key, []).append((settled_dt, pnl))
+            condition_id = r.get("condition_id") or None
+            positions_by_strategy.setdefault(key, []).append((settled_dt, pnl, condition_id))
 
     return positions_by_strategy, discovered_keys, ignored_count
+
+
+def sample_pnls(positions: list[Position]) -> list[float]:
+    """One pnl per independent sample.
+
+    Positions that share a condition_id settle together, so they are summed into
+    one event. A position without a condition_id is its own sample.
+    """
+    pnls = [pnl for _, pnl, condition_id in positions if condition_id is None]
+    event_totals: dict[str, float] = {}
+    for _, pnl, condition_id in positions:
+        if condition_id is not None:
+            event_totals[condition_id] = event_totals.get(condition_id, 0.0) + pnl
+    # Sorted because the seeded bootstrap gives a different interval for a different order.
+    return pnls + [event_totals[condition_id] for condition_id in sorted(event_totals)]
+
+
+def count_text(positions: list[Position]) -> str:
+    """Describe the sample count for reason texts."""
+    if all(condition_id is None for _, _, condition_id in positions):
+        return f"{len(positions)} settled positions"
+    return f"{len(sample_pnls(positions))} events ({len(positions)} positions)"
 
 
 def initialize_manager_tables(connection: sqlite3.Connection) -> None:
@@ -270,14 +296,14 @@ def read_recent_changes(connection: sqlite3.Connection, since_dt: datetime) -> l
 def evaluate_strategy(
     key: str,
     existing: dict | None,
-    positions: list[tuple[datetime, float]],
+    positions: list[Position],
     now: datetime,
     promote_min_settled: int,
     demote_min_settled: int,
     demote_window_days: int,
 ) -> StrategyDecision:
     """Evaluate scoring and state transitions for a single strategy."""
-    lifetime_pnls = [pnl for _, pnl in positions]
+    lifetime_pnls = sample_pnls(positions)
     lifetime_count = len(lifetime_pnls)
     lifetime_avg = sum(lifetime_pnls) / lifetime_count if lifetime_count > 0 else 0.0
     lifetime_low, lifetime_high = (
@@ -299,7 +325,7 @@ def evaluate_strategy(
                 interval_low=lifetime_low,
                 interval_high=lifetime_high,
                 reason=(
-                    f"Promoted: {lifetime_count} settled positions, avg pnl "
+                    f"Promoted: {count_text(positions)}, avg pnl "
                     f"${lifetime_avg:+.4f}, 95% bootstrap CI [${lifetime_low:+.4f}, ${lifetime_high:+.4f}]"
                 ),
                 is_change=True,
@@ -315,7 +341,7 @@ def evaluate_strategy(
                 interval_low=lifetime_low if lifetime_count > 0 else None,
                 interval_high=lifetime_high if lifetime_count > 0 else None,
                 reason=(
-                    f"New candidate: {lifetime_count} settled positions, avg pnl "
+                    f"New candidate: {count_text(positions)}, avg pnl "
                     f"${lifetime_avg:+.4f}, 95% bootstrap CI [${lifetime_low:+.4f}, ${lifetime_high:+.4f}]"
                     if lifetime_count > 0
                     else "New candidate: 0 settled positions"
@@ -339,7 +365,7 @@ def evaluate_strategy(
                 interval_low=lifetime_low,
                 interval_high=lifetime_high,
                 reason=(
-                    f"Promoted: {lifetime_count} settled positions, avg pnl "
+                    f"Promoted: {count_text(positions)}, avg pnl "
                     f"${lifetime_avg:+.4f}, 95% bootstrap CI [${lifetime_low:+.4f}, ${lifetime_high:+.4f}]"
                 ),
                 is_change=True,
@@ -376,7 +402,8 @@ def evaluate_strategy(
 
         # 30-day window: positions with settled_at strictly later than now minus 30 days
         cutoff_30d = now - timedelta(days=demote_window_days)
-        window_pnls = [pnl for dt, pnl in positions if dt > cutoff_30d]
+        window_positions = [p for p in positions if p[0] > cutoff_30d]
+        window_pnls = sample_pnls(window_positions)
         window_count = len(window_pnls)
         if window_count >= demote_min_settled:
             window_avg = sum(window_pnls) / window_count
@@ -392,7 +419,7 @@ def evaluate_strategy(
                     interval_low=window_low,
                     interval_high=window_high,
                     reason=(
-                        f"Demoted: {window_count} settled positions in last {demote_window_days}d, "
+                        f"Demoted: {count_text(window_positions)} in last {demote_window_days}d, "
                         f"avg pnl ${window_avg:+.4f}, 95% bootstrap CI [${window_low:+.4f}, ${window_high:+.4f}]"
                     ),
                     is_change=True,
@@ -430,7 +457,8 @@ def evaluate_strategy(
 
         # Fresh evidence: positions settled strictly after removal time `since`
         if stored_since_dt is not None:
-            fresh_pnls = [pnl for dt, pnl in positions if dt > stored_since_dt]
+            fresh_positions = [p for p in positions if p[0] > stored_since_dt]
+            fresh_pnls = sample_pnls(fresh_positions)
             fresh_count = len(fresh_pnls)
             if fresh_count >= promote_min_settled:
                 fresh_avg = sum(fresh_pnls) / fresh_count
@@ -446,7 +474,7 @@ def evaluate_strategy(
                         interval_low=fresh_low,
                         interval_high=fresh_high,
                         reason=(
-                            f"Promoted: {fresh_count} settled positions since removal, "
+                            f"Promoted: {count_text(fresh_positions)} since removal, "
                             f"avg pnl ${fresh_avg:+.4f}, 95% bootstrap CI [${fresh_low:+.4f}, ${fresh_high:+.4f}]"
                         ),
                         is_change=True,
@@ -526,7 +554,7 @@ def format_report(
     config_notes: list[str],
     ignored_count: int,
     live_strategies: dict[str, dict],
-    positions_by_strategy: dict[str, list[tuple[datetime, float]]],
+    positions_by_strategy: dict[str, list[Position]],
     journal_20: list[dict],
     changes_24h: list[dict],
 ) -> str:
@@ -566,7 +594,7 @@ def format_report(
     for key, info in sorted(live_strategies.items()):
         if info["status"] == "live":
             pos = positions_by_strategy.get(key, [])
-            count_30d = sum(1 for dt, _ in pos if dt > cutoff_30d)
+            count_30d = sum(1 for dt, _, _ in pos if dt > cutoff_30d)
             if count_30d == 0:
                 inactive_live.append(key)
 
@@ -603,9 +631,8 @@ def format_report(
             positions = positions_by_strategy.get(key, [])
             if info["status"] == "removed":
                 stored_since = parse_timestamp(info.get("since"))
-                relevant = [pnl for dt, pnl in positions if stored_since and dt > stored_since]
-            else:
-                relevant = [pnl for _, pnl in positions]
+                positions = [p for p in positions if stored_since and p[0] > stored_since]
+            relevant = sample_pnls(positions)
             cnt = len(relevant)
             if cnt >= min_close_count:
                 avg_pnl = sum(relevant) / cnt if cnt > 0 else 0.0
@@ -623,7 +650,8 @@ def format_report(
     lines.extend([
         "## Strategies Close to Promotion",
         "",
-        f"Strategies not currently live with at least {min_close_count} settled positions (half of promote_min_settled):",
+        f"Strategies not currently live with at least {min_close_count} settled positions, "
+        "or events for copy wallets (half of promote_min_settled):",
         "",
         "| Strategy | Status | Settled | Avg PnL | 95% Bootstrap CI |",
         "|---|---|---|---|---|",

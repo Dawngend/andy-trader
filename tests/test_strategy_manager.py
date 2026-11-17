@@ -811,3 +811,72 @@ def test_copy_book_positions_discovery(tmp_path: Path):
     assert len(decisions) == 1
     assert decisions[0].strategy_key == "copy:wallet_alpha"
     assert decisions[0].new_status == "candidate"
+
+
+def insert_copy_position(
+    conn: sqlite3.Connection, number: int, condition_id: str, pnl: float
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO copy_book_positions
+        (wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome, their_price,
+         their_timestamp, fill_price, fee, shares, opened_at, delay_seconds, settled_at, win, pnl)
+        VALUES ('wallet_alpha', '0x123', ?, 'tok1', ?, 'Title', 'Yes', 0.5, 1000, 0.5, 0.0, 100,
+                '2026-01-01', 1.0, ?, ?, ?)
+        """,
+        (f"0xtx{number}", condition_id, T0.isoformat(), 1 if pnl > 0 else 0, pnl),
+    )
+
+
+def test_positions_sharing_condition_id_count_as_one_event(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_copy_table(conn)
+    insert_copy_position(conn, 1, "c1", 10.0)
+    insert_copy_position(conn, 2, "c1", 20.0)
+    insert_copy_position(conn, 3, "c1", -5.0)
+    insert_copy_position(conn, 4, "c2", 7.0)
+    conn.close()
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0)
+    d = decisions[0]
+    assert d.settled == 2
+    # Event totals are 25 and 7.
+    assert d.avg_pnl == pytest.approx(16.0)
+    assert "2 events (4 positions)" in d.reason
+
+
+def test_100_positions_on_13_events_do_not_promote(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_copy_table(conn)
+    for i in range(100):
+        insert_copy_position(conn, i, f"c{i % 13}", 10.0)
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0)
+    d = decisions[0]
+    assert d.settled == 13
+    assert d.new_status == "candidate"
+
+    # The same wallet does promote once it has 100 separate events.
+    for i in range(100, 187):
+        insert_copy_position(conn, i, f"c{i}", 10.0)
+    conn.close()
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0 + timedelta(hours=1))
+    d = decisions[0]
+    assert d.settled == 100
+    assert d.new_status == "live"
+
+
+def test_strategy_without_condition_id_still_counts_positions(tmp_path: Path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    create_price_target_table(conn)
+    insert_pt_positions(conn, 3, 10.0, T0)
+    conn.close()
+
+    decisions, _ = run_strategy_manager_pass(db_path, now=T0)
+    d = decisions[0]
+    assert d.settled == 3
+    assert "3 settled positions" in d.reason
