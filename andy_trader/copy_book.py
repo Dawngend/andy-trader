@@ -33,8 +33,11 @@ WALLETS = {
 # 2026-11-17: bigggggggg was picked as `longshot` (scout longshot_share 0.504),
 # but 0.691 of its latest 162 buys are priced 0.80 or higher, the bond book pattern.
 # See research/bigggggggg_profile_check.md.
+# 2026-11-17: lpgb was picked as `longshot` (scout longshot_share 0.797),
+# but 0.500 of its latest 2 buys are priced 0.80 or higher (1 of 2, a very small sample).
+# See research/lpgb_profile_check.md.
 # Settlement and reporting continue; remove a wallet from this set to resume it.
-PAUSED_WALLETS = {"sharky6999", "bigggggggg"}
+PAUSED_WALLETS = {"sharky6999", "bigggggggg", "lpgb"}
 
 SHARES = 100
 MIN_FILL = 0.05

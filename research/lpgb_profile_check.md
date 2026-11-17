@@ -2,23 +2,23 @@
 
 Paper only. Wallet `lpgb`, address `0x1f5f9fa318fbda8350ac143b4df657287df850fa`.
 
-## Verdict: UNCLEAR
+## Verdict: CHANGED
 
-The two numbers of the rule fixed in advance:
+The rule fixed in advance fires:
 
 - 50.0% of the recent buys are priced 0.80 or higher (1 of 2). The limit is 40%.
 - The scout's `longshot_share` was 0.797. The limit is 0.40.
 
-Read to the letter, both limits are met. The rule is not applied, and this needs a decision from the owner: the first
-number is one buy out of two. With two buys the share can only be 0%, 50% or 100%, so it says nothing about what the
-wallet buys. The last check had 162 buys. The same count over the latest 5000 rows (811 buys, see "Trend") gives 39.2%,
-just under the limit.
+`lpgb` is added to `PAUSED_WALLETS` in `andy_trader/copy_book.py`. It has no open copies.
 
-No code was changed. `lpgb` is not in `PAUSED_WALLETS`. To apply the rule to the letter anyway, add `"lpgb"` to that set.
+One caution on the word CHANGED: the first number is one buy out of two. With two buys the share can only be 0%, 50%
+or 100%, so it is weak evidence about what the wallet buys. The last check had 162 buys. The rule has no minimum
+sample, so it is applied as written. The same count over the latest 5000 rows (811 buys, see "Trend") gives 39.2%,
+just under the limit; that window is outside the rule.
 
-What the data does show is a different problem: `lpgb` stopped buying on 2026-11-08 17:25 UTC. It made 809 buys from
-2026-11-06 18:57 to then, and 2 buys in the 8.4 days since. It was added to the copy book on 2026-11-15, a week after it
-stopped. The copy book copies buys only, so paused or not there is nothing to copy.
+The high-volume buying period ended on 2026-11-08 17:25 UTC: 809 buys from 2026-11-06 18:57 to then. After it the
+data shows two buys on 2026-11-14 and none from then to the fetch on 2026-11-17. `lpgb` was added to the copy book on
+2026-11-15, a week after the busy period ended.
 
 ## Data
 
@@ -70,8 +70,8 @@ Buys by day in the wider 5000-row window:
 | 2026-11-15 to 2026-11-17 | 220 | 0 | 0 | 0 | 0 |
 | All | 5000 | 811 | 18.2% (148) | 42.5% (345) | 39.2% (318) |
 
-The last buy of the busy period is 2026-11-08 17:25 UTC. Since then the wallet only sells and redeems: 296 sells in the
-500-row window, 290 of them priced under 0.05, $63 in total.
+The last buy of the busy period is 2026-11-08 17:25 UTC. After it there are the two buys on 2026-11-14 and no other
+buy up to the fetch. The 500-row window has 296 sells, 290 of them priced under 0.05, $63 in total.
 
 When it was buying, 46.9% of its buy dollars went in at 0.80 or higher ($24,314 of $51,814), average buy price 0.63,
 65 buys at 0.95 or higher, 9 at 0.98 or higher.
@@ -117,9 +117,11 @@ From `copy_book_positions` and `copy_book_skips`, read 2026-11-17 04:08 UTC.
 
 ## What the data cannot show
 
-- Two buys cannot give a share of buys by price. The 50.0% is one trade.
+- Two buys cannot give a reliable share of buys by price. The 50.0% is one trade. The rule fires on it only because it
+  sets no minimum sample.
 - No copy was opened, so there is no live result for this wallet at all.
-- Whether `lpgb` will buy again. It bought 457 and 255 times on its two full days in the window, then stopped.
+- Whether `lpgb` will buy again. It bought 457 and 255 times on its two full days in the window, then twice in the
+  8.4 days up to the fetch.
 - The wider window has 1.9 days of buying (2026-11-06 18:57 to 2026-11-08 17:25 UTC). It says nothing about earlier
   days or about whether those days are typical. Its 39.2% is so close to the 40% limit that a few trades either way
   would move it across.
@@ -133,4 +135,6 @@ From `copy_book_positions` and `copy_book_skips`, read 2026-11-17 04:08 UTC.
 
 ## Code change
 
-None. `PAUSED_WALLETS` is still `{"sharky6999", "bigggggggg"}`. No wallet, sizing, or fill limit was touched.
+`PAUSED_WALLETS = {"sharky6999", "bigggggggg", "lpgb"}` in `andy_trader/copy_book.py`, with a dated comment. No other
+wallet, sizing, or fill limit was touched. No test pins the contents of `PAUSED_WALLETS`, so no test was changed. To
+resume, remove the name from the set.
