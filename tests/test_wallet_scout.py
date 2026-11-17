@@ -227,7 +227,7 @@ def test_label_thresholds_and_first_match(changes, label):
 @pytest.fixture
 def candidate_profile():
     closed = [position(.6, 2 if index % 25 < 12 else -1, index) for index in range(200)]
-    return scout.profile_account(ACCOUNT, closed, [])
+    return scout.profile_account(ACCOUNT, closed, [buy(0, .5)])
 
 
 @pytest.mark.parametrize("changes,expected", [
@@ -249,6 +249,14 @@ def candidate_profile():
     ({"win_rate": .65}, True),
     ({"win_rate": .651}, False),
     ({"win_rate": None}, False),
+    ({"high_entry_cost_share": .499}, True),
+    ({"high_entry_cost_share": .5}, False),
+    ({"high_entry_cost_share": .51}, False),
+    ({"high_entry_cost_share": None}, False),
+    ({"high_price_buy_share": .249}, True),
+    ({"high_price_buy_share": .25}, False),
+    ({"high_price_buy_share": .26}, False),
+    ({"high_price_buy_share": None}, False),
 ])
 def test_copy_candidate_filters(candidate_profile, changes, expected):
     candidate_profile.update(changes)

@@ -48,6 +48,8 @@ CANDIDATE_MIN_RETURN_ON_COST = 0
 CANDIDATE_MAX_LOSS_TO_WIN_RATIO = 1
 CANDIDATE_EXCLUDED_LABELS = ("market_maker", "bond")
 CANDIDATE_EXCLUDED_FLAGS = ("bot_like", "inventory_heavy", "thin_sample", "one_sided_period")
+CANDIDATE_MAX_HIGH_ENTRY_COST_SHARE = .50
+CANDIDATE_MAX_HIGH_PRICE_BUY_SHARE = .25
 
 
 class PublicReader:
@@ -200,7 +202,7 @@ def profile_flags(profile):
 
 
 def copy_candidates(profiles):
-    """Select human-paced, profitable profiles with balanced wins and smaller losses."""
+    """Select human-paced, profitable profiles with balanced wins, smaller losses and few high-price entries."""
     candidates = [
         profile for profile in profiles
         if profile["label"] not in CANDIDATE_EXCLUDED_LABELS
@@ -211,6 +213,10 @@ def copy_candidates(profiles):
         and profile["loss_to_win_ratio"] < CANDIDATE_MAX_LOSS_TO_WIN_RATIO
         and profile["win_rate"] is not None
         and CANDIDATE_MIN_WIN_RATE <= profile["win_rate"] <= CANDIDATE_MAX_WIN_RATE
+        and profile["high_entry_cost_share"] is not None
+        and profile["high_entry_cost_share"] < CANDIDATE_MAX_HIGH_ENTRY_COST_SHARE
+        and profile["high_price_buy_share"] is not None
+        and profile["high_price_buy_share"] < CANDIDATE_MAX_HIGH_PRICE_BUY_SHARE
     ]
     return sorted(candidates, key=lambda row: row["rank"])
 
