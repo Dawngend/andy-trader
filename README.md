@@ -846,8 +846,9 @@ of the profit came after 2026-11-01, when all eight positions were short and pri
 rule did turn the book short in time, but that is one correct call on one move, not yet an edge
 ([note](research/trend_concentration_check.md)).
 
-**The copy book profit is a few large positions.** The copy book opens 100 paper shares for each
-buy made by a chosen Polymarket wallet and holds them to settlement. `dromedaryy` showed +$3,193
+**The copy book profit is a few large positions.** The copy book copies buys made by a chosen
+Polymarket wallet and holds them to settlement. It previously opened 100 paper shares for each
+buy. `dromedaryy` showed +$3,193
 on 104 settled copies, but those are 13 tokens, and 51 of the copies (+$2,536) are on one esports
 game. Counted per event, the bootstrap interval includes zero, and the first copy on each token
 adds up to -$71. All of the profit is in later copies on two events, which fits a wallet that adds
