@@ -865,3 +865,23 @@ def test_unpaused_wallet_still_copies(db, network):
     assert row["wallet_name"] == "dromedaryy"
     assert row["tx_hash"] == "tx_active"
     assert row["fill_price"] == pytest.approx(0.90)
+
+
+def test_reader_error_for_first_wallet_does_not_stop_the_pass(db, network):
+    failing_address = copy.WALLETS["sharky6999"]
+    address = copy.WALLETS["dromedaryy"]
+    network["activity"][address] = [make_trade(tx="tx_start", ts=1000)]
+    copy.run_once(db, now=NOW)
+    network["activity"][address] = [make_trade(tx="tx_after_error", ts=int(NOW.timestamp()))]
+
+    class FailingReader(copy.PublicReader):
+        def get(self, path, **params):
+            if params["user"] == failing_address:
+                raise RuntimeError("v2/activity: getaddrinfo failed")
+            return super().get(path, **params)
+
+    errors = copy.run_once(db, now=NOW, reader=FailingReader())
+    assert errors == [{"wallet_name": "sharky6999", "error": "v2/activity: getaddrinfo failed"}]
+    row, = positions(db)
+    assert row["wallet_name"] == "dromedaryy"
+    assert row["tx_hash"] == "tx_after_error"

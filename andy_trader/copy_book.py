@@ -16,6 +16,10 @@ from andy_trader.bond_book import (
 )
 from andy_trader.wallet_scout import PublicReader
 
+# PublicReader raises RuntimeError when a request fails after its retries;
+# one wallet's failure must not end the pass for the wallets after it.
+WALLET_ERRORS = DATA_ERRORS + (RuntimeError,)
+
 WALLETS = {
     "sharky6999": "0x751a2b86cab503496efd325c8344e10159349ea1",
     "dromedaryy": "0x6575759174ad221bba9947bc3f18750ec769b198",
@@ -328,13 +332,15 @@ def run_once(
     pass_now = pass_now.replace(tzinfo=UTC) if pass_now.tzinfo is None else pass_now.astimezone(UTC)
     errors: list[dict] = []
     settle_positions(connection, pass_now, errors)
+    # Paused wallets are still fetched: their stale trades are counted as skips in the report,
+    # and their fresh trades are marked seen so they are not copied when the wallet is resumed.
     for wallet_name, address in WALLETS.items():
         try:
             copy_wallet_trades(
                 connection, wallet_name, address, now, errors,
                 reader=reader, clock=clock,
             )
-        except DATA_ERRORS as exc:
+        except WALLET_ERRORS as exc:
             errors.append({"wallet_name": wallet_name, "error": str(exc)})
     return errors
 
