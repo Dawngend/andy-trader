@@ -47,7 +47,8 @@ CANDIDATE_MAX_WIN_RATE = .65
 CANDIDATE_MIN_RETURN_ON_COST = 0
 CANDIDATE_MAX_LOSS_TO_WIN_RATIO = 1
 CANDIDATE_EXCLUDED_LABELS = ("market_maker", "bond")
-CANDIDATE_EXCLUDED_FLAGS = ("bot_like", "inventory_heavy", "thin_sample", "one_sided_period")
+CANDIDATE_EXCLUDED_FLAGS = ("bot_like", "inventory_heavy", "one_sided_period")
+CANDIDATE_MIN_SAMPLE = 50
 CANDIDATE_MAX_HIGH_ENTRY_COST_SHARE = .50
 CANDIDATE_MAX_HIGH_PRICE_BUY_SHARE = .25
 
@@ -207,6 +208,7 @@ def copy_candidates(profiles):
         profile for profile in profiles
         if profile["label"] not in CANDIDATE_EXCLUDED_LABELS
         and not any(flag in profile["flags"] for flag in CANDIDATE_EXCLUDED_FLAGS)
+        and profile["sample_size"] >= CANDIDATE_MIN_SAMPLE
         and profile["return_on_cost"] is not None
         and profile["return_on_cost"] > CANDIDATE_MIN_RETURN_ON_COST
         and profile["loss_to_win_ratio"] is not None
