@@ -1,9 +1,15 @@
-"""Total Paper P&L Report Across All Books, including trend40 and trend_vote."""
+"""Total Paper P&L Report Across All Books, including trend40 and trend_vote.
+
+The acct500 book is a separate 500 dollar test account: it gets its own row
+but is left out of the TOTAL row so the existing totals do not change.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import sqlite3
+
+from andy_trader.trend_book import ACCOUNT_BOOK
 
 POLYMARKET_BOOKS = [
     ("bond_book", "bond_book_positions"),
@@ -34,6 +40,10 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     )
     return cursor.fetchone() is not None
+
+
+def _counts_toward_total(group: GroupResult) -> bool:
+    return group.name not in ("TOTAL", ACCOUNT_BOOK)
 
 
 def create_snapshot_table(connection: sqlite3.Connection) -> None:
@@ -125,6 +135,8 @@ def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResul
         "SELECT DISTINCT predictor FROM paper_portfolio_state ORDER BY predictor"
     )
     predictors = [row[0] for row in cursor.fetchall()]
+    # Show the separate test account after the other books (sort is stable).
+    predictors.sort(key=lambda predictor: predictor == ACCOUNT_BOOK)
     if not predictors:
         return []
 
@@ -174,6 +186,8 @@ def collect_crypto_portfolios(connection: sqlite3.Connection) -> list[GroupResul
                 note = "no equity row yet"
             else:
                 note = f"no equity row yet: {', '.join(missing)}"
+        if predictor == ACCOUNT_BOOK:
+            note = "separate 500 dollar test account" + (f"; {note}" if note else "")
 
         results.append(
             GroupResult(
@@ -331,7 +345,7 @@ def compute_return_pct(groups: list[GroupResult]) -> float | None:
     covered = [
         g
         for g in groups
-        if g.name != "TOTAL" and g.starting_cash is not None and g.starting_cash > 0
+        if _counts_toward_total(g) and g.starting_cash is not None and g.starting_cash > 0
     ]
     total_start = sum(g.starting_cash for g in covered)
     if not total_start:
@@ -341,7 +355,7 @@ def compute_return_pct(groups: list[GroupResult]) -> float | None:
 
 
 def collect_total(groups: list[GroupResult]) -> GroupResult:
-    individual_groups = [g for g in groups if g.name != "TOTAL"]
+    individual_groups = [g for g in groups if _counts_toward_total(g)]
     covered = [
         g
         for g in individual_groups

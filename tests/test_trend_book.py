@@ -75,10 +75,8 @@ def test_vote_uses_three_lookbacks_without_changing_trend40(db, earlier_closes, 
     record_observations(db, list(closes.values()) + [price_bar()])
     trend_book.run_once(db, now=NOW)
     sides = dict(db.execute("SELECT predictor, side FROM paper_trades").fetchall())
-    assert sides == {
-        "trend_vote": vote_side,
-        "trend40": "long" if 100 > earlier_closes[1] else "short",
-    }
+    trend40_side = "long" if 100 > earlier_closes[1] else "short"
+    assert sides == {"trend_vote": vote_side, "trend40": trend40_side, "acct500": trend40_side}
 
 
 @pytest.mark.parametrize("count", [0, 40, 41, 60])
@@ -139,15 +137,15 @@ def test_second_run_same_day_makes_no_new_trades(db):
     record_observations(db, [price_bar()])
     trend_book.run_once(db, now=NOW)
     count = db.execute("SELECT count(*) FROM paper_trades").fetchone()[0]
-    assert count == 2
+    assert count == 3
     record_observations(db, [daily(1, 1.0), price_bar(price=101, age_seconds=5)])
     trend_book.run_once(db, now=NOW + timedelta(minutes=1))
     assert db.execute("SELECT count(*) FROM paper_trades").fetchone()[0] == count
     assert db.execute("SELECT count(*) FROM trend_rebalance_claims").fetchone()[0] == 1
     marks = db.execute(
-        "SELECT predictor, mark_price FROM paper_equity_curve ORDER BY id DESC LIMIT 2"
+        "SELECT predictor, mark_price FROM paper_equity_curve ORDER BY id DESC LIMIT 3"
     ).fetchall()
-    assert dict(marks) == {"trend40": 101.0, "trend_vote": 101.0}
+    assert dict(marks) == {"trend40": 101.0, "trend_vote": 101.0, "acct500": 101.0}
 
 
 @pytest.mark.parametrize("book", ["trend40", "trend_vote"])
@@ -161,7 +159,7 @@ def test_stale_price_skips_instrument(db, book):
     assert db.execute("SELECT count(*) FROM paper_equity_curve").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("book", ["trend40", "trend_vote"])
+@pytest.mark.parametrize("book", ["trend40", "trend_vote", "acct500"])
 def test_risk_interlock_closes_open_position_and_opens_nothing(db, monkeypatch, book):
     record_observations(db, rising_closes(count=61))
     record_observations(db, [price_bar()])
@@ -176,3 +174,25 @@ def test_risk_interlock_closes_open_position_and_opens_nothing(db, monkeypatch, 
     trades = db.execute("SELECT side, reason FROM paper_trades WHERE predictor=? ORDER BY id", (book,)).fetchall()
     assert [row["side"] for row in trades] == ["short", "flat"]
     assert trades[-1]["reason"].startswith(f"{book} RISK INTERLOCK forced exit:")
+
+
+def test_account_book_starts_with_its_own_cash(db):
+    record_observations(db, [price_bar()])
+    trend_book.run_once(db, now=NOW)
+    cash = dict(db.execute("SELECT predictor, starting_cash FROM paper_portfolio_state").fetchall())
+    assert cash == {"trend40": 1000.0, "trend_vote": 1000.0, "acct500": 62.5}
+
+
+def test_account_book_opens_first_position_on_a_claimed_day(db):
+    record_observations(db, rising_closes(count=61) + [price_bar()])
+    trend_book.initialize_trend_book(db)
+    db.execute("INSERT INTO trend_rebalance_claims VALUES (?, ?)", (NOW.date().isoformat(), NOW.isoformat()))
+    trend_book.run_once(db, now=NOW)
+    trades = db.execute("SELECT predictor, side, reason FROM paper_trades").fetchall()
+    assert [(row["predictor"], row["side"]) for row in trades] == [("acct500", "long")]
+    assert trades[0]["reason"].startswith("acct500: 40d return +")
+
+    # Once it has traded, it waits for the next day like the other books.
+    record_observations(db, [daily(1, 1.0), price_bar(price=101, age_seconds=5)])
+    trend_book.run_once(db, now=NOW + timedelta(minutes=1))
+    assert db.execute("SELECT count(*) FROM paper_trades").fetchone()[0] == 1

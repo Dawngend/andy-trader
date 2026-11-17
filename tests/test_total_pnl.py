@@ -282,6 +282,36 @@ def test_report_includes_both_trend_books_with_separate_pnl(tmp_path):
         assert "$1,125.00" in rows[1] and "+$125.00" in rows[1]
 
 
+def test_account_book_has_own_row_and_leaves_total_unchanged(tmp_path):
+    with connect(tmp_path / "acct500.db") as conn:
+        setup_test_database(conn)
+        old_total = next(g for g in collect_all_groups(conn) if g.name == "TOTAL")
+        for coin in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"):
+            conn.execute(
+                "INSERT INTO paper_portfolio_state VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("acct500", f"{coin}-USD", 62.5, 65.0, 0.0, None, NOW.isoformat()),
+            )
+            conn.execute(
+                "INSERT INTO paper_equity_curve "
+                "(predictor, instrument, cash, position_qty, mark_price, position_value, equity, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("acct500", f"{coin}-USD", 65.0, 0.0, 100.0, 0.0, 65.0, NOW.isoformat()),
+            )
+        groups = collect_all_groups(conn)
+        account = next(g for g in groups if g.name == "acct500")
+        assert account.starting_cash == 500.0
+        assert account.pnl == 20.0
+        assert account.note == "separate 500 dollar test account"
+
+        total = next(g for g in groups if g.name == "TOTAL")
+        assert total == old_total
+        assert "acct500" not in total.note
+
+        report = format_report(conn, groups=groups, recorded_at=NOW.isoformat(), current_time=NOW)
+        names = [line.split("|")[1].strip() for line in report.splitlines() if line.startswith("| ")]
+        assert names.index("trend40") < names.index("acct500")
+
+
 def test_percent_return_uses_only_groups_with_starting_cash(tmp_path):
     db_path = tmp_path / "test_ret_pct.db"
     with connect(db_path) as conn:

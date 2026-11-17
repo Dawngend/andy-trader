@@ -12,6 +12,10 @@ This book trades that rule forward, on paper, to see if it holds up live.
 60-day close changes. It needs 61 completed daily closes and is a forward
 paper test, not a replacement for trend40.
 
+`acct500` is a separate 500 dollar paper account running the trend40 rule,
+split evenly across the instruments. Unlike the other two books it opens its
+first position as soon as it can, even on a day already claimed.
+
 It reuses `andy_trader.portfolio` exactly as the probe books do: same
 `get_or_create_state`, same `execute_paper_trade`, same `mark_to_market`, same
 costs. It also runs the same `check_and_enforce` risk interlock the probe
@@ -37,6 +41,14 @@ STALE_PRICE_SECONDS = 150
 # Same universe as run_probe_watch.INSTRUMENTS, duplicated rather than
 # imported so this paper-only module never depends on the probe watch script.
 INSTRUMENTS = tuple(f"{coin}-USD" for coin in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK"))
+
+ACCOUNT_BOOK = "acct500"
+ACCOUNT_STARTING_CASH = 500.0
+BOOK_STARTING_CASH = {
+    TREND_BOOK: STARTING_CASH,
+    "trend_vote": STARTING_CASH,
+    ACCOUNT_BOOK: ACCOUNT_STARTING_CASH / len(INSTRUMENTS),
+}
 
 
 def initialize_trend_book(connection: sqlite3.Connection) -> None:
@@ -93,6 +105,12 @@ def _vote_target_side(closes: list[float]) -> tuple[str, int] | None:
     return ("long" if votes > 0 else "short"), votes
 
 
+def _has_traded(connection: sqlite3.Connection, book: str, instrument: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM paper_trades WHERE predictor = ? AND instrument = ? LIMIT 1", (book, instrument)
+    ).fetchone() is not None
+
+
 def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> None:
     initialize_trend_book(connection)
     moment = now or datetime.now(UTC)
@@ -115,18 +133,23 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
             continue
         price = float(price_row["close"])
 
-        for book, target_side in ((TREND_BOOK, _target_side), ("trend_vote", _vote_target_side)):
+        for book, target_side in (
+            (TREND_BOOK, _target_side),
+            ("trend_vote", _vote_target_side),
+            (ACCOUNT_BOOK, _target_side),
+        ):
+            starting_cash = BOOK_STARTING_CASH[book]
             state = get_or_create_state(connection, predictor=book, instrument=instrument,
-                                         starting_cash=STARTING_CASH, leverage=LEVERAGE, now_iso=moment_iso)
+                                         starting_cash=starting_cash, leverage=LEVERAGE, now_iso=moment_iso)
             decision = check_and_enforce(connection, predictor=book, instrument=instrument,
-                                          starting_cash=state.starting_cash, now_iso=moment_iso,
+                                          starting_cash=starting_cash, now_iso=moment_iso,
                                           current_equity=max(0.0, state.cash + state.position_qty * price))
             if not decision.allowed:
                 if state.position_qty:
                     execute_paper_trade(connection, predictor=book, instrument=instrument,
                                          target_side="flat", price=price, now_iso=moment_iso,
                                          reason=f"{book} RISK INTERLOCK forced exit: {decision.reason}")
-            elif not claimed_today:
+            elif not claimed_today or (book == ACCOUNT_BOOK and not _has_traded(connection, book, instrument)):
                 evaluated = True
                 closes = _completed_daily_closes(connection, instrument, today=today)
                 target = target_side(closes)
@@ -137,7 +160,7 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
                     if side != current_side:
                         reason = (
                             f"{book}: {LOOKBACK_DAYS}d return {change * 100:+.1f}% -> {side}"
-                            if book == TREND_BOOK
+                            if book in (TREND_BOOK, ACCOUNT_BOOK)
                             else f"{book}: 20/40/60d vote {change:+.0f} -> {side}"
                         )
                         if current_side != "flat":
@@ -155,7 +178,7 @@ def run_once(connection: sqlite3.Connection, *, now: datetime | None = None) -> 
                         )
 
             mark_to_market(connection, predictor=book, instrument=instrument, price=price,
-                            now_iso=moment_iso, starting_cash=STARTING_CASH)
+                            now_iso=moment_iso, starting_cash=starting_cash)
 
     if evaluated and not claimed_today:
         connection.execute(
