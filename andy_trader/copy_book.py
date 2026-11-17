@@ -30,8 +30,11 @@ WALLETS = {
 # Its near-certain price-target-NO pattern also lost money in the bond book.
 # dromedaryy stays: 52 settled, 48% wins, average win +$60 / loss -$30,
 # +$13 per position, bootstrap 95% CI [+$1.27, +$25.30] excludes zero.
-# Settlement and reporting continue; empty this set to resume.
-PAUSED_WALLETS = {"sharky6999"}
+# 2026-11-17: bigggggggg was picked as `longshot` (scout longshot_share 0.504),
+# but 0.691 of its latest 162 buys are priced 0.80 or higher, the bond book pattern.
+# See research/bigggggggg_profile_check.md.
+# Settlement and reporting continue; remove a wallet from this set to resume it.
+PAUSED_WALLETS = {"sharky6999", "bigggggggg"}
 
 SHARES = 100
 MIN_FILL = 0.05
