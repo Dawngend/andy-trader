@@ -294,6 +294,42 @@ def test_61st_open_position_skipped(db, network, monkeypatch):
     assert skips.get("max_open") == 1
 
 
+def test_second_buy_on_same_token_skipped_as_token_cap(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx_first", asset="tok1", ts=1050)]
+    copy.run_once(db, now=NOW)
+    row, = positions(db)
+    assert row["tx_hash"] == "tx_first"
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx_second", asset="tok1", ts=1100)]
+    copy.run_once(db, now=NOW)
+    assert copy.BOOK_READS == 0
+    copy.run_once(db, now=NOW)
+
+    row, = positions(db)
+    assert row["tx_hash"] == "tx_first"
+    skips = dict(db.execute("SELECT reason, count FROM copy_book_skips WHERE wallet_name='sharky6999'").fetchall())
+    assert skips == {"token_cap": 1}
+
+
+def test_same_token_for_different_wallet_is_still_copied(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    for wallet_name in ("sharky6999", "dromedaryy"):
+        network["activity"][copy.WALLETS[wallet_name]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx_sharky", asset="tok1", ts=1050)]
+    network["activity"][copy.WALLETS["dromedaryy"]] = [make_trade(tx="tx_dromedaryy", asset="tok1", ts=1060)]
+    copy.run_once(db, now=NOW)
+
+    copied = {(row["wallet_name"], row["token_id"]) for row in positions(db)}
+    assert copied == {("sharky6999", "tok1"), ("dromedaryy", "tok1")}
+    assert db.execute("SELECT COUNT(*) FROM copy_book_skips").fetchone()[0] == 0
+
+
 def test_fetch_markets_requests_closed_markets(monkeypatch):
     cid = "0x51b660c5af128e515194be6da1d857f9a1ec758d0094956462c5d32d868e1096"
     http = Mock(return_value=[])
@@ -455,6 +491,7 @@ def test_format_report(db):
         ))
         copy.record_skip(db, NOW, "sharky6999", "thin_book")
         copy.record_skip(db, NOW, "sharky6999", "stale")
+        copy.record_skip(db, NOW, "sharky6999", "token_cap")
 
     rep = copy.format_report(db)
     assert "Copy Book (paper only)" in rep
@@ -466,6 +503,7 @@ def test_format_report(db):
     assert "Settled positions: 2" in rep
     assert "thin_book: 1" in rep
     assert "stale: 1" in rep
+    assert "token_cap: 1" in rep
     assert "Worst loss: $-90.63" in rep
     assert "Worst loss: $0.00" not in rep
     assert "Worst loss: n/a" in rep

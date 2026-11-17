@@ -48,12 +48,15 @@ SHARES = 100
 MIN_FILL = 0.05
 MAX_FILL = 0.98
 MAX_OPEN = 60
+# 2026-11-17: wallets scale into a token with many buys, so copying every buy makes one
+# large position out of one idea. See research/copy_book_token_concentration.md.
+MAX_COPIES_PER_TOKEN = 1
 POLL_SECONDS = 1800  # The copy book runs every 30 minutes.
 # Do not copy stale trades at current order book prices.
 # One poll interval plus slack, so a trade made just after a pass is still fresh on the next.
 MAX_DELAY_SECONDS = POLL_SECONDS + 300
 VERDICT_THRESHOLD = 100
-SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale")
+SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale", "token_cap")
 WALLET_HEADER = (SLICE_HEADER.replace("Slice |", "Wallet |", 1)
                  + " | Events | Bootstrap 95 percent interval for average pnl per event")
 EVENTS_NOTE = ("Note: Events group positions that settled on the same market, "
@@ -184,6 +187,15 @@ def mark_seen(connection: sqlite3.Connection, wallet_name: str, tx_hash: str, to
         )
 
 
+def already_copied_token(connection: sqlite3.Connection, wallet_name: str, token_id: str) -> bool:
+    """True when the wallet's copies on this token, open or settled, have reached the limit."""
+    copies = connection.execute(
+        "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND token_id = ?",
+        (wallet_name, token_id),
+    ).fetchone()[0]
+    return copies >= MAX_COPIES_PER_TOKEN
+
+
 def copy_wallet_trades(
     connection: sqlite3.Connection,
     wallet_name: str,
@@ -244,6 +256,10 @@ def copy_wallet_trades(
             mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
         if wallet_name in PAUSED_WALLETS:
+            mark_seen(connection, wallet_name, tx_hash, token_id)
+            continue
+        if already_copied_token(connection, wallet_name, token_id):
+            record_skip(connection, now or _utc_now(), wallet_name, "token_cap")
             mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
 
