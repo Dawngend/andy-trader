@@ -229,6 +229,9 @@ columns filled in. Any other update to that table is a bug.
 | CT-11 complete-set detector | built; fee-aware, depth-aware, paper-only |
 | Re-quote shadow trials | built; settled separately and never debits simulated capital |
 | Live-money readiness gate | built; currently **NOT READY** and exits nonzero |
+| Trend book `trend40` | paper; profit is one market move, no edge shown |
+| Copy book | paper; one copy per wallet per token, no edge shown per event |
+| Wallet scout | built; rebate label rule removed, `bigggggggg` and `lpgb` paused |
 
 337 tests. `python -m pytest tests/ -q`.
 
@@ -830,11 +833,49 @@ again. A verdict waits for 100 settlements, states the loss count, and shows
 positive edge only if the entire bootstrap 95 percent interval for average profit
 per position is above zero. Otherwise it says "no edge shown".
 
+## November 17 checks: where the paper profit comes from
+
+Two paper books were showing a profit, so I checked how many separate bets stood behind each
+number. Everything here is paper only.
+
+**The trend book profit is one market move.** `trend40` holds eight coins long or short at $1,000
+each on a 40-day rule, once a day. On 2026-11-17 it was up $1,608 on $8,000. The eight coins' daily
+returns have an average correlation of 0.875, which is about 1.1 independent bets, not eight. 92%
+of the profit came after 2026-11-01, when all eight positions were short and prices fell about
+20%. Shorting all eight once at the first fill, with no rule at all, would have made $2,014. The
+rule did turn the book short in time, but that is one correct call on one move, not yet an edge
+([note](research/trend_concentration_check.md)).
+
+**The copy book profit is a few large positions.** The copy book opens 100 paper shares for each
+buy made by a chosen Polymarket wallet and holds them to settlement. `dromedaryy` showed +$3,193
+on 104 settled copies, but those are 13 tokens, and 51 of the copies (+$2,536) are on one esports
+game. Counted per event, the bootstrap interval includes zero, and the first copy on each token
+adds up to -$71. All of the profit is in later copies on two events, which fits a wallet that adds
+to its best ideas and equally fits two results going its way. The copy book now takes one copy
+per wallet per token, and the strategy manager counts events, not positions
+([note](research/copy_book_token_concentration.md)).
+
+**The wallet scout made two bad picks and had one wrong label rule.** The scout profiles
+leaderboard wallets and labels how each one trades. It picked `bigggggggg` and `lpgb` as
+`longshot` wallets, but their recent buys did not match that history: 69% of 162 recent
+`bigggggggg` buys were priced 0.80 or higher, and `lpgb` had stopped buying a week before it was
+added (two buys in its latest 500 rows, one at 0.985). Both are paused. Separately, 25 of the 35
+`market_maker` labels in the newest run came only from the rule "any maker rebate row", and the
+rebate count follows how long the activity window is, not market making. That rule is removed
+(notes: [bigggggggg](research/bigggggggg_profile_check.md),
+[lpgb](research/lpgb_profile_check.md), [maker label](research/scout_maker_label_check.md)).
+
+**What this means.** No strategy here has proven an edge in paper trading yet. The useful part is
+the tooling that measures how many independent bets a result rests on.
+
 ## Honest expectations
 
 CT-05 did **not** beat the base rate net of costs, and neither did anything else. That is a real
 result and this repository was built to record it rather than to tune until the number looked good.
 Most apparent short-horizon edge turns out to be round-trip cost that was never subtracted.
+
+The November paper profits do not change this: see
+[November 17 checks](#november-17-checks-where-the-paper-profit-comes-from).
 
 The durable value here is the engineering: scheduled collectors, append-only history, blind
 settlement, walk-forward evaluation, and calibrated prediction logging. That survives either outcome,
