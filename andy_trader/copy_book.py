@@ -54,7 +54,10 @@ POLL_SECONDS = 1800  # The copy book runs every 30 minutes.
 MAX_DELAY_SECONDS = POLL_SECONDS + 300
 VERDICT_THRESHOLD = 100
 SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale")
-WALLET_HEADER = SLICE_HEADER.replace("Slice |", "Wallet |", 1)
+WALLET_HEADER = (SLICE_HEADER.replace("Slice |", "Wallet |", 1)
+                 + " | Events | Bootstrap 95 percent interval for average pnl per event")
+EVENTS_NOTE = ("Note: Events group positions that settled on the same market, "
+               "so Events is the honest sample size.")
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
 BOOK_READS = 0
@@ -330,6 +333,23 @@ def _rows_to_dicts(cursor) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
+def event_totals(connection: sqlite3.Connection, wallet_name: str) -> list[float]:
+    """Total pnl of each settled event (condition_id) for one wallet."""
+    rows = connection.execute(
+        "SELECT SUM(pnl) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NOT NULL "
+        "GROUP BY condition_id ORDER BY condition_id",
+        (wallet_name,),
+    ).fetchall()
+    return [float(row[0]) for row in rows]
+
+
+def event_interval(totals: list[float]) -> str:
+    if len(totals) < 2:
+        return "n/a"
+    low, high = compute_bootstrap_interval(totals)
+    return f"[${low:+.2f}, ${high:+.2f}]"
+
+
 def format_report(connection: sqlite3.Connection) -> str:
     lines = [
         "Copy Book (paper only)",
@@ -372,8 +392,10 @@ def format_report(connection: sqlite3.Connection) -> str:
         for reason in SKIP_REASONS:
             lines.append(f"  {reason}: {skips.get(reason, 0)}")
 
+        totals = event_totals(connection, wallet_name)
         lines.append(WALLET_HEADER)
-        lines.append(report_row(wallet_name, settled_rows))
+        lines.append(f"{report_row(wallet_name, settled_rows)} | {len(totals)} | {event_interval(totals)}")
+        lines.append(EVENTS_NOTE)
 
         losses = [float(r["pnl"]) for r in settled_rows if not r["win"]]
         lines.append(f"Worst loss: {worst_loss(losses)}")

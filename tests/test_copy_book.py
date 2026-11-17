@@ -479,10 +479,62 @@ def test_format_report(db):
 def test_format_report_wallet_row_has_wallet_heading(db):
     rep = copy.format_report(db)
     lines = rep.splitlines()
-    wallet_row = lines.index("sharky6999 | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a")
+    wallet_row = lines.index("sharky6999 | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a | 0 | n/a")
     assert lines[wallet_row - 1].startswith("Wallet | Settled | Wins |")
     assert lines[lines.index("By strategy slice") + 1].startswith("Slice | Settled | Wins |")
-    assert copy.WALLET_HEADER == copy.SLICE_HEADER.replace("Slice |", "Wallet |", 1)
+
+
+def insert_settled(db, wallet_name, tx, cid, pnl):
+    with db:
+        db.execute("""
+            INSERT INTO copy_book_positions (
+                wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
+                their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds,
+                settled_at, win, pnl
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            wallet_name, copy.WALLETS[wallet_name], tx, "tok1", cid,
+            "Will BTC reach 100k?", "Yes", 0.50, 1000, 0.50, 0.0, 100, NOW.isoformat(), 5.0,
+            NOW.isoformat(), int(pnl > 0), pnl,
+        ))
+
+
+def wallet_row(db, wallet_name):
+    lines = copy.format_report(db).splitlines()
+    return next(line for line in lines if line.startswith(f"{wallet_name} | ")).split(" | ")
+
+
+def test_positions_on_same_condition_id_are_one_event(db):
+    insert_settled(db, "dromedaryy", "tx1", "c1", 50.0)
+    insert_settled(db, "dromedaryy", "tx2", "c1", 50.0)
+    insert_settled(db, "dromedaryy", "tx3", "c2", -50.0)
+    insert_settled(db, "sharky6999", "tx4", "c3", 7.0)
+
+    assert copy.event_totals(db, "dromedaryy") == [100.0, -50.0]
+
+    low, high = copy.compute_bootstrap_interval([100.0, -50.0])
+    row = wallet_row(db, "dromedaryy")
+    assert row[1] == "3"
+    assert row[9:] == ["2", f"[${low:+.2f}, ${high:+.2f}]"]
+
+
+def test_wallet_with_one_event_shows_no_event_interval(db):
+    insert_settled(db, "dromedaryy", "tx1", "c1", 50.0)
+    insert_settled(db, "dromedaryy", "tx2", "c1", -50.0)
+
+    row = wallet_row(db, "dromedaryy")
+    assert row[1] == "2"
+    assert row[9:] == ["1", "n/a"]
+
+
+def test_report_has_events_column_after_position_columns(db):
+    lines = copy.format_report(db).splitlines()
+    header = next(i for i, line in enumerate(lines) if line.startswith("Wallet | "))
+    assert lines[header].split(" | ")[1] == "Settled"
+    assert lines[header].split(" | ")[9] == "Events"
+    assert lines[header + 2] == (
+        "Note: Events group positions that settled on the same market, so Events is the honest sample size."
+    )
 
 
 def test_runner_journal_and_lock(db, network, tmp_path, monkeypatch, capsys):
