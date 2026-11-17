@@ -251,7 +251,7 @@ def test_board_with_copy_book_positions(tmp_path):
             parts = [p.strip() for p in line.split("|")]
             rows_by_strat[parts[0]] = parts
 
-    assert set(rows_by_strat) == {"copy_sharky6999", "copy_dromedaryy", "copy_lpgb"}
+    assert set(rows_by_strat) == {f"copy_{name}" for name in copy.WALLETS}
 
     sharky = rows_by_strat["copy_sharky6999"]
     assert sharky[1] == "1"  # settled
