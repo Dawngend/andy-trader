@@ -23,6 +23,11 @@ WALLETS = {
     "lpgb": "0x1f5f9fa318fbda8350ac143b4df657287df850fa",
     # Forward test candidate from the 2026-11-16 scout run; drop if no edge after VERDICT_THRESHOLD settled positions.
     "bigggggggg": "0x511f9c771449162349795d17becf8b37031acbe1",
+    # Forward test candidates from the 2026-11-17 scout run (research/candidates_price_mix_check.md);
+    # drop either one if it shows no edge after VERDICT_THRESHOLD settled positions.
+    # The first has no user name, so its address is its name.
+    "0x448861155279dbf833d041b963e3ac854599e319": "0x448861155279dbf833d041b963e3ac854599e319",
+    "paddaa": "0x60a92c8620846d81f5ea17b0564e0d4b7c545a71",
 }
 
 # 2026-11-15: sharky6999 has 60 settled, 85% wins, average entry 0.83,

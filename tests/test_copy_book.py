@@ -89,6 +89,8 @@ def positions(db):
 def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
     assert copy.WALLETS["lpgb"] == "0x1f5f9fa318fbda8350ac143b4df657287df850fa"
     assert copy.WALLETS["bigggggggg"] == "0x511f9c771449162349795d17becf8b37031acbe1"
+    assert copy.WALLETS["0x448861155279dbf833d041b963e3ac854599e319"] == "0x448861155279dbf833d041b963e3ac854599e319"
+    assert copy.WALLETS["paddaa"] == "0x60a92c8620846d81f5ea17b0564e0d4b7c545a71"
     network["activity"][copy.WALLETS["sharky6999"]] = [
         make_trade(tx="tx1", ts=1000),
         make_trade(tx="tx2", ts=900),
@@ -103,13 +105,22 @@ def test_first_pass_copies_nothing_and_stores_starting_point(db, network):
     network["activity"][copy.WALLETS["bigggggggg"]] = [
         make_trade(tx="tx6", ts=1300),
     ]
+    network["activity"][copy.WALLETS["0x448861155279dbf833d041b963e3ac854599e319"]] = [
+        make_trade(tx="tx7", ts=1400),
+    ]
+    network["activity"][copy.WALLETS["paddaa"]] = [
+        make_trade(tx="tx8", ts=1500),
+    ]
 
     errors = copy.run_once(db, now=NOW)
     assert errors == []
     assert positions(db) == []
 
     cursors = dict(db.execute("SELECT wallet_name, newest_timestamp FROM copy_book_cursor"))
-    assert cursors == {"sharky6999": 1000, "dromedaryy": 800, "lpgb": 1200, "bigggggggg": 1300}
+    assert cursors == {
+        "sharky6999": 1000, "dromedaryy": 800, "lpgb": 1200, "bigggggggg": 1300,
+        "0x448861155279dbf833d041b963e3ac854599e319": 1400, "paddaa": 1500,
+    }
 
 
 def test_parsing_activity_and_no_duplicates(db, network, monkeypatch):
@@ -449,6 +460,7 @@ def test_format_report(db):
     assert "Copy Book (paper only)" in rep
     assert {line for line in rep.splitlines() if line.startswith("Wallet: ")} == {
         "Wallet: sharky6999", "Wallet: dromedaryy", "Wallet: lpgb", "Wallet: bigggggggg",
+        "Wallet: 0x448861155279dbf833d041b963e3ac854599e319", "Wallet: paddaa",
     }
     assert "Open positions: 0" in rep
     assert "Settled positions: 2" in rep
