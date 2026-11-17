@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 import uuid
 
-from andy_trader import copy_book
+from andy_trader import acct500_copy, copy_book
 from andy_trader.copy_book import format_report, run_once
 from andy_trader.env import REPO_ROOT
 from andy_trader.store import connect, default_database_path
@@ -57,6 +57,13 @@ def main(argv: list[str] | None = None) -> int:
             errors = run_once(connection)
             for error in errors:
                 journal("error", **error)
+            account_equity = None
+            try:
+                account = acct500_copy.build_account(acct500_copy.eligible_positions(connection))
+                acct500_copy.record_snapshot(connection, account)
+                account_equity = round(account.equity, 2)
+            except Exception as exc:
+                journal("error", error=f"acct500_copy: {type(exc).__name__}: {exc}")
             if args.report:
                 print(format_report(connection))
         journal(
@@ -65,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             seconds=round(time.monotonic() - started, 3),
             book_reads=copy_book.BOOK_READS,
             requests=copy_book.REQUEST_COUNT,
+            account_equity=account_equity,
         )
         return 1 if errors else 0
     except Exception as exc:
