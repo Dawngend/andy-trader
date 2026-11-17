@@ -135,7 +135,8 @@ def percentile(values, fraction):
 
 
 def strategy_label(profile):
-    if "inventory_heavy" in profile["flags"] or profile["maker_rebate_count"]:
+    # Rebate rows are not used: their count follows how long the activity window is, not market making.
+    if "inventory_heavy" in profile["flags"]:
         return "market_maker"
     if (profile["high_entry_cost_share"] or 0) >= BOND_COST_SHARE and (profile["win_rate"] or 0) >= BOND_WIN_RATE:
         return "bond"

@@ -198,7 +198,7 @@ def test_flags_from_rows():
 
 @pytest.mark.parametrize("closed,activity,label", [
     ([position(.5)], [], "market_maker"),
-    ([position(.9)], [dict(type="MAKER_REBATE", timestamp=0)], "market_maker"),
+    ([position(.9)], [dict(type="MAKER_REBATE", timestamp=0)], "bond"),
     ([position(.9)], [], "bond"),
     ([position(.2)], [], "longshot"),
     ([position(.9, -1, title="Will X hit 10?")], [], "price_target_no"),
@@ -210,7 +210,7 @@ def test_labels_from_rows(closed, activity, label):
 
 @pytest.mark.parametrize("changes,label", [
     ({"flags": ["inventory_heavy"]}, "market_maker"),
-    ({"maker_rebate_count": 1}, "market_maker"),
+    ({"maker_rebate_count": 1}, "bond"),
     ({}, "bond"),
     ({"win_rate": .899}, "longshot"),
     ({"high_entry_cost_share": .599}, "longshot"),
