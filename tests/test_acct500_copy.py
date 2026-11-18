@@ -6,8 +6,8 @@ from andy_trader import acct500_copy as acct
 from andy_trader.copy_book import SHARES, initialize_copy_book
 from andy_trader.store import connect
 
-AFTER = "2026-11-17T16:00:00+00:00"
-LATER = "2026-11-17T17:00:00+00:00"
+AFTER = acct.ACCOUNT_START
+LATER = "2026-11-18T09:00:00+00:00"
 BEFORE = "2026-11-17T10:00:00+00:00"
 
 

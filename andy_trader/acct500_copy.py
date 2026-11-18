@@ -13,8 +13,11 @@ from typing import Callable
 
 from andy_trader.copy_book import PAUSED_WALLETS, SHARES, fetch_book
 
-ACCOUNT_NAME = "acct500_copy"
-ACCOUNT_START = "2026-11-17T15:45:00+00:00"
+ACCOUNT_NAME = "acct500_copy_v2"
+# The first account (acct500_copy, 2026-11-17 15:45 to 2026-11-18 02:00 UTC, ended at 433.65) keeps its own table.
+# This one starts after the event cap was added to the copy book.
+ACCOUNT_START = "2026-11-18T02:20:00+00:00"
+EQUITY_TABLE = "acct500_copy_v2_equity"
 STARTING_CASH = 500.0
 COST_PER_POSITION = 25.0
 
@@ -40,8 +43,8 @@ class Account:
 
 
 def initialize_account_tables(connection: sqlite3.Connection) -> None:
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS acct500_copy_equity (
+    connection.execute(f"""
+        CREATE TABLE IF NOT EXISTS {EQUITY_TABLE} (
             recorded_at TEXT NOT NULL,
             cash REAL NOT NULL,
             open_value REAL NOT NULL,
@@ -122,7 +125,7 @@ def record_snapshot(connection: sqlite3.Connection, account: Account, now: datet
     moment = (now or datetime.now(UTC)).isoformat()
     with connection:
         connection.execute(
-            "INSERT INTO acct500_copy_equity VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO {EQUITY_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)",
             (moment, account.cash, account.open_value, account.equity,
              account.open_count, account.settled_count, "; ".join(account.notes)),
         )
@@ -132,7 +135,7 @@ def format_account(connection: sqlite3.Connection) -> str:
     initialize_account_tables(connection)
     rows = connection.execute(
         "SELECT recorded_at, cash, open_value, equity, open_positions, settled_positions, note "
-        "FROM acct500_copy_equity ORDER BY recorded_at DESC LIMIT 24"
+        f"FROM {EQUITY_TABLE} ORDER BY recorded_at DESC LIMIT 24"
     ).fetchall()
     if not rows:
         return f"{ACCOUNT_NAME}: no snapshots yet"
