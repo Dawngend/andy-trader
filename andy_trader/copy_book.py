@@ -55,12 +55,15 @@ MAX_OPEN = 60
 # 2026-11-17: wallets scale into a token with many buys, so copying every buy makes one
 # large position out of one idea. See research/copy_book_token_concentration.md.
 MAX_COPIES_PER_TOKEN = 1
+# 2026-11-18: different tokens of one event (spreads of one game, date variants of one
+# question) move together, so a wallet gets one copy per event.
+MAX_COPIES_PER_EVENT = 1
 POLL_SECONDS = 1800  # The copy book runs every 30 minutes.
 # Do not copy stale trades at current order book prices.
 # One poll interval plus slack, so a trade made just after a pass is still fresh on the next.
 MAX_DELAY_SECONDS = POLL_SECONDS + 300
 VERDICT_THRESHOLD = 100
-SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale", "token_cap")
+SKIP_REASONS = ("thin_book", "fill_too_low", "fill_too_high", "max_open", "stale", "token_cap", "event_cap")
 WALLET_HEADER = (SLICE_HEADER.replace("Slice |", "Wallet |", 1)
                  + " | Events | Bootstrap 95 percent interval for average pnl per event")
 EVENTS_NOTE = ("Note: Events group positions that settled on the same market, "
@@ -99,9 +102,13 @@ def initialize_copy_book(connection: sqlite3.Connection) -> None:
             settled_at TEXT,
             win INTEGER,
             pnl REAL,
+            event_slug TEXT,
             UNIQUE (wallet, tx_hash, token_id)
         )
     """)
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(copy_book_positions)")]
+    if "event_slug" not in columns:
+        connection.execute("ALTER TABLE copy_book_positions ADD COLUMN event_slug TEXT")
     connection.execute("""
         CREATE TABLE IF NOT EXISTS copy_book_skips (
             day TEXT NOT NULL,
@@ -200,6 +207,17 @@ def already_copied_token(connection: sqlite3.Connection, wallet_name: str, token
     return copies >= MAX_COPIES_PER_TOKEN
 
 
+def already_copied_event(connection: sqlite3.Connection, wallet_name: str, event_slug: str | None) -> bool:
+    """True when the wallet's copies on this event, open or settled, have reached the limit."""
+    if not event_slug:
+        return False
+    copies = connection.execute(
+        "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND event_slug = ?",
+        (wallet_name, event_slug),
+    ).fetchone()[0]
+    return copies >= MAX_COPIES_PER_EVENT
+
+
 def copy_wallet_trades(
     connection: sqlite3.Connection,
     wallet_name: str,
@@ -266,6 +284,11 @@ def copy_wallet_trades(
             record_skip(connection, now or _utc_now(), wallet_name, "token_cap")
             mark_seen(connection, wallet_name, tx_hash, token_id)
             continue
+        event_slug = trade.get("event_slug") or None
+        if already_copied_event(connection, wallet_name, event_slug):
+            record_skip(connection, now or _utc_now(), wallet_name, "event_cap")
+            mark_seen(connection, wallet_name, tx_hash, token_id)
+            continue
 
         open_count = connection.execute(
             "SELECT COUNT(*) FROM copy_book_positions WHERE wallet_name = ? AND settled_at IS NULL",
@@ -306,13 +329,15 @@ def copy_wallet_trades(
             connection.execute("""
                 INSERT OR IGNORE INTO copy_book_positions (
                     wallet_name, wallet, tx_hash, token_id, condition_id, title, outcome,
-                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    their_price, their_timestamp, fill_price, fee, shares, opened_at, delay_seconds,
+                    event_slug
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 wallet_name, address, tx_hash, token_id, str(trade.get("condition_id", "")),
                 str(trade.get("title", "")), str(trade.get("outcome", "")),
                 float(trade["price"]), their_timestamp, fill_price, fill.fee_cost, SHARES,
                 fill_time.isoformat(), float(fill_time.timestamp() - their_timestamp),
+                event_slug,
             ))
         mark_seen(connection, wallet_name, tx_hash, token_id)
 

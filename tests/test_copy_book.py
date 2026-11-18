@@ -25,6 +25,7 @@ def make_trade(
     title="Will Bitcoin hit 100k?",
     outcome="Yes",
     size=10,
+    event_slug=None,
 ):
     return {
         "type": trade_type,
@@ -37,6 +38,7 @@ def make_trade(
         "title": title,
         "outcome": outcome,
         "size": size,
+        "event_slug": event_slug,
     }
 
 
@@ -330,6 +332,86 @@ def test_same_token_for_different_wallet_is_still_copied(db, network, monkeypatc
     assert db.execute("SELECT COUNT(*) FROM copy_book_skips").fetchone()[0] == 0
 
 
+def test_second_token_of_same_event_skipped_as_event_cap(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_first", asset="tok_spread_1", ts=1050, event_slug="game-1"),
+        make_trade(tx="tx_second", asset="tok_spread_2", ts=1100, event_slug="game-1"),
+    ]
+    copy.run_once(db, now=NOW)
+
+    row, = positions(db)
+    assert (row["tx_hash"], row["event_slug"]) == ("tx_first", "game-1")
+    skips = dict(db.execute("SELECT reason, count FROM copy_book_skips WHERE wallet_name='sharky6999'").fetchall())
+    assert skips == {"event_cap": 1}
+
+
+def test_same_event_for_different_wallet_is_still_copied(db, network, monkeypatch):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    for wallet_name in ("sharky6999", "dromedaryy"):
+        network["activity"][copy.WALLETS[wallet_name]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_sharky", asset="tok1", ts=1050, event_slug="game-1"),
+    ]
+    network["activity"][copy.WALLETS["dromedaryy"]] = [
+        make_trade(tx="tx_dromedaryy", asset="tok2", ts=1060, event_slug="game-1"),
+    ]
+    copy.run_once(db, now=NOW)
+
+    copied = {(row["wallet_name"], row["token_id"]) for row in positions(db)}
+    assert copied == {("sharky6999", "tok1"), ("dromedaryy", "tok2")}
+    assert db.execute("SELECT COUNT(*) FROM copy_book_skips").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("event_slug", [None, ""])
+def test_trades_without_event_slug_are_not_blocked(db, network, monkeypatch, event_slug):
+    monkeypatch.setattr(copy, "PAUSED_WALLETS", set())
+    network["activity"][copy.WALLETS["sharky6999"]] = [make_trade(tx="tx0", ts=1000)]
+    copy.run_once(db, now=NOW)
+
+    network["activity"][copy.WALLETS["sharky6999"]] = [
+        make_trade(tx="tx_a", asset="tok_a", ts=1050, event_slug=event_slug),
+        make_trade(tx="tx_b", asset="tok_b", ts=1100, event_slug=event_slug),
+    ]
+    copy.run_once(db, now=NOW)
+
+    assert [(row["token_id"], row["event_slug"]) for row in positions(db)] == [("tok_a", None), ("tok_b", None)]
+    assert db.execute("SELECT COUNT(*) FROM copy_book_skips").fetchone()[0] == 0
+
+
+def test_existing_database_gets_event_slug_column(tmp_path):
+    connection = connect(tmp_path / "old.db")
+    connection.execute("""
+        CREATE TABLE copy_book_positions (
+            wallet_name TEXT NOT NULL, wallet TEXT NOT NULL, tx_hash TEXT NOT NULL,
+            token_id TEXT NOT NULL, condition_id TEXT NOT NULL, title TEXT NOT NULL,
+            outcome TEXT NOT NULL, their_price REAL NOT NULL, their_timestamp INTEGER NOT NULL,
+            fill_price REAL NOT NULL, fee REAL NOT NULL, shares REAL NOT NULL,
+            opened_at TEXT NOT NULL, delay_seconds REAL NOT NULL,
+            settled_at TEXT, win INTEGER, pnl REAL,
+            UNIQUE (wallet, tx_hash, token_id)
+        )
+    """)
+    connection.execute(
+        "INSERT INTO copy_book_positions VALUES "
+        "('sharky6999', 'w', 'tx1', 'tok1', 'c1', 't', 'Yes', 0.5, 1, 0.5, 1.0, 100, 'now', 5, NULL, NULL, NULL)"
+    )
+    connection.commit()
+
+    copy.initialize_copy_book(connection)
+    copy.initialize_copy_book(connection)
+
+    row, = positions(connection)
+    assert row["tx_hash"] == "tx1"
+    assert row["event_slug"] is None
+    connection.close()
+
+
 def test_fetch_markets_requests_closed_markets(monkeypatch):
     cid = "0x51b660c5af128e515194be6da1d857f9a1ec758d0094956462c5d32d868e1096"
     http = Mock(return_value=[])
@@ -492,6 +574,7 @@ def test_format_report(db):
         copy.record_skip(db, NOW, "sharky6999", "thin_book")
         copy.record_skip(db, NOW, "sharky6999", "stale")
         copy.record_skip(db, NOW, "sharky6999", "token_cap")
+        copy.record_skip(db, NOW, "sharky6999", "event_cap")
 
     rep = copy.format_report(db)
     assert "Copy Book (paper only)" in rep
@@ -504,6 +587,7 @@ def test_format_report(db):
     assert "thin_book: 1" in rep
     assert "stale: 1" in rep
     assert "token_cap: 1" in rep
+    assert "event_cap: 1" in rep
     assert "Worst loss: $-90.63" in rep
     assert "Worst loss: $0.00" not in rep
     assert "Worst loss: n/a" in rep
